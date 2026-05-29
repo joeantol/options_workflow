@@ -42,6 +42,11 @@ import textwrap
 BASE_URL = "https://api.public.com"
 AUTH_URL = "https://api.public.com/userapiauthservice/personal/access-tokens"
 
+# Journal DB lives one level up from the script's directory
+JOURNAL_DB = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "option_trade_journal", "trades.db"
+)
+
 # CSV columns — one row per contract (call or put)
 CSV_COLUMNS = [
     "option_type",        # CALL or PUT
@@ -208,6 +213,91 @@ def contract_to_row(contract: dict, option_type: str, expiration_date: str) -> d
     }
 
 
+def read_open_position(ticker: str) -> list[dict]:
+    """
+    Return open positions for ticker from trades.db (read-only).
+
+    Joins positions + trades, aggregates per position:
+      net_qty    = SUM(sell qty) - SUM(buy qty)   [positive = net short]
+      avg_price  = net credit/debit per share
+      entry_date = earliest trade date
+
+    Excludes test trades (is_test = 1).
+    """
+    import sqlite3
+
+    db_path = os.path.normpath(JOURNAL_DB)
+    if not os.path.exists(db_path):
+        print(f"ERROR: Journal not found at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    sql = """
+        SELECT
+            p.id,
+            p.symbol,
+            p.option_type,
+            p.strike,
+            p.expiry,
+            p.notes,
+            -- net_qty: positive means net short (more sells than buys)
+            SUM(CASE WHEN t.action = 'sell' THEN  t.quantity
+                     WHEN t.action = 'buy'  THEN -t.quantity
+                     ELSE 0 END)                                    AS net_qty,
+            -- weighted average price (credit received or debit paid per share)
+            SUM(CASE WHEN t.action = 'sell' THEN  t.price * t.quantity
+                     WHEN t.action = 'buy'  THEN -t.price * t.quantity
+                     ELSE 0 END)
+            / NULLIF(ABS(SUM(CASE WHEN t.action = 'sell' THEN  t.quantity
+                                  WHEN t.action = 'buy'  THEN -t.quantity
+                                  ELSE 0 END)), 0)                  AS avg_price,
+            MIN(t.trade_date)                                       AS entry_date
+        FROM positions p
+        JOIN trades t ON t.position_id = p.id
+        WHERE UPPER(p.symbol) = UPPER(?)
+          AND p.status = 'open'
+          AND t.is_test = 0
+        GROUP BY p.id
+        ORDER BY p.id
+    """
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(sql, (ticker,)).fetchall()
+        con.close()
+    except sqlite3.OperationalError as exc:
+        print(f"ERROR: Could not read journal — {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    return [dict(row) for row in rows]
+
+
+def format_position(pos: dict) -> str:
+    """Return a one-line human-readable summary of a position row."""
+    net_qty = pos.get("net_qty") or 0
+    side    = "Short" if net_qty > 0 else "Long"
+    qty_abs = abs(net_qty)
+    avg     = pos.get("avg_price")
+    price_str = f"${avg:.2f}" if avg is not None else "N/A"
+    line = (
+        f"{side} {qty_abs}x {pos['symbol'].upper()} "
+        f"{pos['option_type'].upper()} "
+        f"${float(pos['strike']):.2f} exp {pos['expiry']} "
+        f"@ {price_str} (entered {pos['entry_date']})"
+    )
+    if pos.get("notes"):
+        line += f"  — {pos['notes']}"
+    return line
+
+
+def print_positions(ticker: str, positions: list[dict]) -> None:
+    """Display open positions in a formatted box."""
+    if not positions:
+        lines = [f"  No open positions found for {ticker} in the journal."]
+    else:
+        lines = [f"  {format_position(p)}" for p in positions]
+    print_box(lines, title=f"  {ticker} — Open Positions  ")
+
+
 def get_key_dates(ticker: str) -> dict:
     """
     Return the next earnings date and next dividend ex-date for ticker.
@@ -362,8 +452,9 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
 
 
 STRAT_LABELS = {
-    "CC":  "Covered Call",
-    "CSP": "Cash-Secured Put",
+    "CC":   "Covered Call",
+    "CSP":  "Cash-Secured Put",
+    "ROLL": "Roll",
 }
 
 
@@ -496,7 +587,13 @@ def print_box(lines: list[str], title: str = "") -> None:
     print(border)
 
 
-async def query_notebooklm(notebook_id: str, ticker: str, strat: str, dates: dict) -> None:
+async def query_notebooklm(
+    notebook_id: str,
+    ticker: str,
+    strat: str,
+    dates: dict,
+    positions: list[dict] | None = None,
+) -> None:
     """Ask NotebookLM for the best CC or CSP choice given the ticker source."""
     try:
         from notebooklm import NotebookLMClient
@@ -521,12 +618,40 @@ async def query_notebooklm(notebook_id: str, ticker: str, strat: str, dates: dic
         f"the next ex-dividend date is {dates['exdiv_date']} "
         f"({dates['exdiv_source']}, {dates['dividend_amount']} per share)"
     )
-    question = (
-        f"Given the {ticker} source, what is the best {strat_label} choice, "
-        f"taking into consideration the economic calendar releases, "
-        f"upcoming dividends and/or earnings releases? "
-        f"Note that {earnings_note} and {exdiv_note}."
-    )
+
+    if strat == "ROLL":
+        # Summarise current open positions for context
+        if positions:
+            pos_summary = "; ".join(format_position(p) for p in positions)
+            pos_context = f"The current open position(s) are: {pos_summary}. "
+            # Total contracts across all open positions (absolute net qty)
+            total_contracts = sum(abs(p.get("net_qty") or 0) for p in positions)
+        else:
+            pos_context = "No open positions were found in the journal for this ticker. "
+            total_contracts = 1  # fallback so the formula still appears
+
+        pnl_instruction = (
+            f"In the Execution Instructions section, add as the final bullet point "
+            f"the potential PnL if the recommended rolled-to option is bought back at "
+            f"40% of its sale price. Use this formula and show the working: "
+            f"PnL = Sale Price × 0.60 × 100 × {total_contracts} contract(s). "
+            f"Label it 'Target 40% Profit (buy-back at 40% of premium)'."
+        )
+        question = (
+            f"Based on the updated {ticker} source, the latest economic release calendar, "
+            f"and the latest PLAN and REVIEW sources, determine the best roll or "
+            f"do nothing strategy. "
+            f"{pos_context}"
+            f"Note that {earnings_note} and {exdiv_note}. "
+            f"{pnl_instruction}"
+        )
+    else:
+        question = (
+            f"Given the {ticker} source, what is the best {strat_label} choice, "
+            f"taking into consideration the economic calendar releases, "
+            f"upcoming dividends and/or earnings releases? "
+            f"Note that {earnings_note} and {exdiv_note}."
+        )
 
     print(f"\nQuerying NotebookLM...")
 
@@ -588,6 +713,18 @@ EXAMPLES
   Full pipeline — fetch, upload, then get a CSP recommendation:
     python get_option_chain.py --ticker IBM --num 5 --upload --strat CSP
 
+  Roll analysis — fetch fresh chain, upload, read journal, query for roll/hold:
+    python get_option_chain.py --ticker IBM --num 5 --upload --strat ROLL
+
+  Roll analysis using existing CSV (no re-fetch):
+    python get_option_chain.py --ticker IBM --onlyload --strat ROLL
+
+JOURNAL
+  Open positions are read (read-only) from:
+    ../option_trade_journal/trades.db
+  Tables used: positions (symbol, option_type, strike, expiry, status)
+               trades    (action, quantity, price, trade_date, is_test)
+
 NOTEBOOKLM SETUP (one-time)
   pip install "notebooklm-py[browser]"
   playwright install chromium
@@ -631,11 +768,13 @@ def main():
     )
     parser.add_argument(
         "--strat",
-        choices=["CC", "CSP"],
-        metavar="CC|CSP",
+        choices=["CC", "CSP", "ROLL"],
+        metavar="CC|CSP|ROLL",
         help="Query NotebookLM for the best strategy:\n"
-             "  CC  = Covered Call\n"
-             "  CSP = Cash-Secured Put",
+             "  CC   = Covered Call\n"
+             "  CSP  = Cash-Secured Put\n"
+             "  ROLL = Roll or hold — reads open position from the journal,\n"
+             "         downloads/loads the chain, then queries NotebookLM",
     )
     args = parser.parse_args()
 
@@ -643,7 +782,13 @@ def main():
     num = args.num
     output_file = f"{ticker}.csv"
 
-    if args.onlyload:
+    # If only --ticker + --strat are given (no fetch/upload flags), skip straight
+    # to key dates + NotebookLM — no option chain work needed.
+    strat_only = args.strat and not args.upload and not args.onlyload
+
+    if strat_only:
+        pass  # fall through to NotebookLM steps below
+    elif args.onlyload:
         # Skip all API fetching — just upload the existing file
         if not os.path.exists(output_file):
             print(f"ERROR: {output_file} not found. Run without --onlyload first to generate it.", file=sys.stderr)
@@ -721,20 +866,29 @@ def main():
             )
             sys.exit(1)
 
-    # Step 6 — Fetch and display key dates (always, if strat or standalone)
+    # Step 6 — For ROLL: read open positions from journal
+    open_positions = None
+    if args.strat == "ROLL":
+        print(f"\nReading open positions for {ticker} from journal...")
+        open_positions = read_open_position(ticker)
+        print_positions(ticker, open_positions)
+        if not open_positions:
+            print("  (No open positions found — proceeding with ROLL query anyway.)")
+
+    # Step 7 — Fetch and display key dates (when --strat is used)
     key_dates = None
     if args.strat:
         print(f"\nLooking up key dates for {ticker}...")
         key_dates = get_key_dates(ticker)
         print_key_dates(ticker, key_dates)
 
-    # Step 7 — Optionally upload to NotebookLM
-    if args.upload or args.onlyload:
+    # Step 8 — Optionally upload to NotebookLM
+    if not strat_only and (args.upload or args.onlyload):
         asyncio.run(upload_to_notebooklm(output_file, notebook_id))
 
-    # Step 8 — Optionally query NotebookLM for strategy recommendation
+    # Step 9 — Optionally query NotebookLM for strategy recommendation
     if args.strat:
-        asyncio.run(query_notebooklm(notebook_id, ticker, args.strat, key_dates))
+        asyncio.run(query_notebooklm(notebook_id, ticker, args.strat, key_dates, open_positions))
 
 
 if __name__ == "__main__":
