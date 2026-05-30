@@ -271,6 +271,459 @@ def read_open_position(ticker: str) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_all_open_positions(ticker: str | None = None) -> list[dict]:
+    """
+    Return all open positions from trades.db, optionally filtered by ticker.
+
+    Joins positions + trades, aggregates per position:
+      net_qty    = SUM(sell qty) - SUM(buy qty)   [positive = net short]
+      avg_price  = net credit/debit per share
+      entry_date = earliest trade date
+
+    Excludes test trades (is_test = 1).
+    """
+    import sqlite3
+
+    db_path = os.path.normpath(JOURNAL_DB)
+    if not os.path.exists(db_path):
+        print(f"ERROR: Journal not found at {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    ticker_clause = "AND UPPER(p.symbol) = UPPER(:ticker)" if ticker else ""
+    params: dict = {"ticker": ticker} if ticker else {}
+
+    sql = f"""
+        SELECT
+            p.id,
+            p.symbol,
+            p.option_type,
+            p.strike,
+            p.expiry,
+            p.notes,
+            SUM(CASE WHEN t.action = 'sell' THEN  t.quantity
+                     WHEN t.action = 'buy'  THEN -t.quantity
+                     ELSE 0 END)                                    AS net_qty,
+            SUM(CASE WHEN t.action = 'sell' THEN  t.price * t.quantity
+                     WHEN t.action = 'buy'  THEN -t.price * t.quantity
+                     ELSE 0 END)
+            / NULLIF(ABS(SUM(CASE WHEN t.action = 'sell' THEN  t.quantity
+                                  WHEN t.action = 'buy'  THEN -t.quantity
+                                  ELSE 0 END)), 0)                  AS avg_price,
+            MIN(t.trade_date)                                       AS entry_date
+        FROM positions p
+        JOIN trades t ON t.position_id = p.id
+        WHERE p.status = 'open'
+          AND t.is_test = 0
+          {ticker_clause}
+        GROUP BY p.id
+        ORDER BY p.symbol, p.expiry, p.strike
+    """
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(sql, params).fetchall()
+        con.close()
+    except sqlite3.OperationalError as exc:
+        print(f"ERROR: Could not read journal — {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    return [dict(row) for row in rows]
+
+
+# Cache underlying prices within a session to avoid redundant yfinance calls
+_price_cache: dict[str, float | None] = {}
+
+
+def get_underlying_price(ticker: str) -> float | None:
+    """Return the current underlying stock price via yfinance (cached per run)."""
+    if ticker in _price_cache:
+        return _price_cache[ticker]
+    price: float | None = None
+    try:
+        import yfinance as yf
+        fi = yf.Ticker(ticker).fast_info
+        price = float(fi.last_price) if getattr(fi, "last_price", None) else None
+        if not price:
+            info = yf.Ticker(ticker).info
+            raw = (
+                info.get("currentPrice")
+                or info.get("regularMarketPrice")
+                or info.get("previousClose")
+            )
+            price = float(raw) if raw else None
+    except Exception:
+        pass
+    _price_cache[ticker] = price
+    return price
+
+
+def get_vix() -> float | None:
+    """Return the current VIX level via yfinance."""
+    try:
+        import yfinance as yf
+        fi = yf.Ticker("^VIX").fast_info
+        val = getattr(fi, "last_price", None)
+        return float(val) if val else None
+    except Exception:
+        return None
+
+
+def get_atr(ticker: str, period: int = 14) -> float | None:
+    """
+    Calculate the Average True Range for *ticker* over *period* trading days.
+
+    True Range = max(High-Low, |High-PrevClose|, |Low-PrevClose|)
+    ATR = simple average of TR over the last *period* bars.
+    Returns None if insufficient data.
+    """
+    try:
+        import yfinance as yf
+        # Fetch enough bars to guarantee `period` complete TRs
+        hist = yf.Ticker(ticker).history(period=f"{period + 5}d")
+        if hist is None or len(hist) < period + 1:
+            return None
+        highs  = hist["High"].values
+        lows   = hist["Low"].values
+        closes = hist["Close"].values
+        trs = []
+        for i in range(1, len(closes)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i]  - closes[i - 1]),
+            )
+            trs.append(tr)
+        if len(trs) < period:
+            return None
+        return sum(trs[-period:]) / period
+    except Exception:
+        return None
+
+
+# Percentage distance from strike that counts as "near ATM"
+ATM_THRESHOLD_PCT = 3.0
+
+
+def build_osi_symbol(ticker: str, expiry: str, option_type: str, strike: float) -> str:
+    """
+    Build the OSI (OCC) normalised option symbol.
+    Format: {root}{YYMMDD}{C|P}{strike*1000:>08d}  (ticker not space-padded)
+    Example: IBM $190.00 Put 2025-06-20  →  "IBM250620P00190000"
+    """
+    import datetime
+    root = ticker.upper()
+    dt   = datetime.date.fromisoformat(expiry)
+    cp   = "C" if option_type.upper() == "CALL" else "P"
+    strike_int = round(float(strike) * 1000)
+    return f"{root}{dt.strftime('%y%m%d')}{cp}{strike_int:08d}"
+
+
+def get_option_quotes(token: str, account_id: str, positions: list[dict]) -> dict[str, dict]:
+    """
+    Fetch quotes (price + greeks) for a list of positions in a single API call.
+
+    Uses POST /userapigateway/marketdata/{accountId}/quotes with type=OPTION.
+    Returns a dict keyed by OSI symbol → quote dict.
+    Silently skips positions whose OSI symbol cannot be constructed.
+    """
+    import requests
+
+    instruments = []
+    for pos in positions:
+        try:
+            osi = build_osi_symbol(
+                pos["symbol"], pos["expiry"],
+                pos["option_type"], float(pos["strike"]),
+            )
+            instruments.append({"symbol": osi, "type": "OPTION"})
+        except Exception:
+            pass
+
+    if not instruments:
+        return {}
+
+    url = f"{BASE_URL}/userapigateway/marketdata/{account_id}/quotes"
+    response = requests.post(
+        url,
+        headers=get_headers(token),
+        json={"instruments": instruments},
+    )
+    if response.status_code != 200:
+        print(
+            f"WARNING: Quotes fetch failed — HTTP {response.status_code}: {response.text}",
+            file=sys.stderr,
+        )
+        return {}
+
+    result: dict[str, dict] = {}
+    for q in response.json().get("quotes", []):
+        sym = (q.get("instrument") or {}).get("symbol", "")
+        if sym:
+            result[sym.replace(" ", "")] = q   # normalise: strip any padding
+    return result
+
+
+def get_option_greeks_batch(token: str, account_id: str, osi_symbols: list[str]) -> dict[str, dict]:
+    """
+    Fetch greeks for a list of OSI symbols in one GET request.
+    GET /userapigateway/option-details/{accountId}/greeks?osiSymbols=...
+    Returns dict: normalised_osi → greeks dict  (delta, gamma, theta, vega, rho, impliedVolatility)
+    """
+    import requests
+
+    if not osi_symbols:
+        return {}
+
+    url = f"{BASE_URL}/userapigateway/option-details/{account_id}/greeks"
+    # osiSymbols is a repeated query parameter
+    params = [("osiSymbols", sym) for sym in osi_symbols]
+    response = requests.get(url, headers=get_headers(token), params=params)
+    if response.status_code != 200:
+        print(
+            f"WARNING: Greeks fetch failed — HTTP {response.status_code}: {response.text}",
+            file=sys.stderr,
+        )
+        return {}
+
+    result: dict[str, dict] = {}
+    for item in response.json().get("greeks", []):
+        sym = item.get("symbol", "").replace(" ", "")
+        if sym:
+            result[sym] = item.get("greeks") or {}
+    return result
+
+
+def eval_open_positions(token: str, account_id: str, ticker: str | None = None) -> None:
+    """
+    Fetch live option data for every open position and flag those that meet
+    any of the following criteria:
+        • abs(delta) >= 0.40
+        • DTE <= 21
+        • Near ATM  (underlying within ATM_THRESHOLD_PCT % of strike)
+        • ITM       (call: underlying > strike; put: underlying < strike)
+        • Within 1.5× ATR buffer of the strike
+    Uses a single POST /quotes call for all positions instead of one
+    option-chain fetch per expiry date.
+    """
+    import datetime
+
+    positions = get_all_open_positions(ticker)
+    if not positions:
+        label = f"{ticker} positions" if ticker else "positions"
+        print_box([f"  No open {label} found in the journal."], title="  Portfolio Evaluation  ")
+        return
+
+    today = datetime.date.today()
+    unique_tickers = {pos["symbol"].upper() for pos in positions}
+    print(
+        f"\nEvaluating {len(positions)} open position(s) across "
+        f"{len(unique_tickers)} ticker(s)..."
+    )
+
+    # Pre-filter expired / unparseable positions
+    active: list[dict] = []
+    skipped: list[str] = []
+    for pos in positions:
+        sym = pos["symbol"].upper()
+        expiry = pos["expiry"]
+        try:
+            expiry_date = datetime.date.fromisoformat(expiry)
+        except ValueError:
+            skipped.append(
+                f"{sym} {pos['option_type'].upper()} ${pos['strike']} {expiry}"
+                f" — unparseable expiry date"
+            )
+            continue
+        dte = (expiry_date - today).days
+        if dte < 0:
+            skipped.append(
+                f"{sym} {pos['option_type'].upper()} ${pos['strike']} {expiry}"
+                f" — expired {abs(dte)}d ago"
+            )
+            continue
+        active.append({**pos, "dte": dte})
+
+    if not active:
+        print_box(["  No active (non-expired) open positions found."], title="  Portfolio Evaluation  ")
+        return
+
+    # ── Batch API calls: quotes (price) + greeks (delta) ─────────────────────
+    osi_list = [
+        build_osi_symbol(p["symbol"].upper(), p["expiry"], p["option_type"].upper(), float(p["strike"]))
+        for p in active
+    ]
+    print(f"  Fetching quotes for {len(active)} contract(s)...", end=" ", flush=True)
+    quotes = get_option_quotes(token, account_id, active)
+    print(f"{len(quotes)} received.")
+    print(f"  Fetching greeks for {len(osi_list)} contract(s)...", end=" ", flush=True)
+    greeks_data = get_option_greeks_batch(token, account_id, osi_list)
+    print(f"{len(greeks_data)} received.")
+
+    # ── Per-ticker caches (underlying price + ATR) ────────────────────────────
+    price_cache_local: dict[str, float | None] = {}
+    atr_cache: dict[str, tuple[float | None, float | None]] = {}
+
+    def _to_f(v: object) -> float | None:
+        try:
+            return float(v) if v not in (None, "") else None
+        except (ValueError, TypeError):
+            return None
+
+    flagged: list[dict] = []
+
+    for pos in active:
+        sym      = pos["symbol"].upper()
+        expiry   = pos["expiry"]
+        dte      = pos["dte"]
+        opt_type = pos["option_type"].upper()
+        strike   = float(pos["strike"])
+
+        # Underlying price
+        if sym not in price_cache_local:
+            price_cache_local[sym] = get_underlying_price(sym)
+        underlying = price_cache_local[sym]
+
+        # 14-day ATR buffer
+        if sym not in atr_cache:
+            atr_val = get_atr(sym, period=14)
+            atr_cache[sym] = (atr_val, atr_val * 1.5 if atr_val else None)
+        atr_val, buffer = atr_cache[sym]
+
+        osi   = build_osi_symbol(sym, expiry, opt_type, strike).replace(" ", "")
+
+        # Delta from greeks endpoint
+        greeks = greeks_data.get(osi, {})
+        delta: float | None = _to_f(greeks.get("delta"))
+
+        # Current price from quotes endpoint: prefer mid=(bid+ask)/2, then last
+        quote = quotes.get(osi, {})
+        current_price: float | None = None
+        bid  = _to_f(quote.get("bid"))
+        ask  = _to_f(quote.get("ask"))
+        last = _to_f(quote.get("last"))
+        if bid is not None and ask is not None:
+            current_price = (bid + ask) / 2
+        elif last is not None and last > 0:
+            current_price = last
+
+        # ── PnL ───────────────────────────────────────────────────────────────
+        # net_qty > 0  →  net short  (collected premium; profit when price ↓)
+        # net_qty < 0  →  net long   (paid premium;      profit when price ↑)
+        avg_price: float | None = pos.get("avg_price")
+        net_qty: int = pos.get("net_qty") or 0
+        abs_pnl: float | None = None
+        pct_pnl: float | None = None
+        if current_price is not None and avg_price is not None and avg_price != 0:
+            qty = abs(net_qty)
+            abs_pnl = (
+                (avg_price - current_price) if net_qty > 0 else (current_price - avg_price)
+            ) * 100 * qty
+            pct_pnl = abs_pnl / (avg_price * 100 * qty) * 100
+
+        reasons: list[str] = []
+
+        # ── Condition 1: DTE ≤ 21 ────────────────────────────────────────────
+        if dte <= 21:
+            reasons.append(f"DTE = {dte}  (≤ 21 days to expiry)")
+
+        # ── Condition 2: |delta| ≥ 0.40 ──────────────────────────────────────
+        if delta is not None and abs(delta) >= 0.40:
+            reasons.append(f"delta = {delta:+.3f}  (|Δ| ≥ 0.40)")
+
+        # ── Condition 3: ITM ──────────────────────────────────────────────────
+        if underlying is not None:
+            if opt_type == "CALL" and underlying > strike:
+                reasons.append(f"ITM: u/l ${underlying:.2f} > call strike ${strike:.2f}")
+            elif opt_type == "PUT" and underlying < strike:
+                reasons.append(f"ITM: u/l ${underlying:.2f} < put strike ${strike:.2f}")
+
+        # ── Condition 4: Near ATM ─────────────────────────────────────────────
+        if underlying is not None:
+            pct = abs(underlying - strike) / strike * 100
+            if pct <= ATM_THRESHOLD_PCT:
+                reasons.append(
+                    f"Near ATM: u/l ${underlying:.2f} vs strike ${strike:.2f}"
+                    f" ({pct:.1f}% away)"
+                )
+
+        # ── Condition 5: Within 1.5× ATR buffer ──────────────────────────────
+        if underlying is not None and buffer is not None:
+            if opt_type == "PUT":
+                gap = underlying - strike
+                if gap < buffer:
+                    reasons.append(
+                        f"Within ATR buffer (put): "
+                        f"u/l ${underlying:.2f} − strike ${strike:.2f} "
+                        f"= ${gap:.2f}  <  buffer ${buffer:.2f}  "
+                        f"(1.5 × ATR ${atr_val:.2f})"
+                    )
+            elif opt_type == "CALL":
+                gap = strike - underlying
+                if gap < buffer:
+                    reasons.append(
+                        f"Within ATR buffer (call): "
+                        f"strike ${strike:.2f} − u/l ${underlying:.2f} "
+                        f"= ${gap:.2f}  <  buffer ${buffer:.2f}  "
+                        f"(1.5 × ATR ${atr_val:.2f})"
+                    )
+
+        if reasons:
+            flagged.append({
+                **pos,
+                "dte": dte,
+                "delta": delta,
+                "underlying": underlying,
+                "atr": atr_val,
+                "buffer": buffer,
+                "current_price": current_price,
+                "abs_pnl": abs_pnl,
+                "pct_pnl": pct_pnl,
+                "reasons": reasons,
+            })
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    if not flagged:
+        print_box(
+            ["  All open positions are within normal parameters. No action needed."],
+            title="  Portfolio Evaluation — No Alerts  ",
+        )
+    else:
+        lines: list[str] = [
+            f"  {len(flagged)} of {len(positions)} position(s) flagged for review:",
+            "",
+        ]
+        for item in flagged:
+            lines.append(f"  {format_position(item)}")
+            # Current price, delta, and PnL — always shown when data is available
+            cp = item.get("current_price")
+            dl = item.get("delta")
+            ap = item.get("abs_pnl")
+            pp = item.get("pct_pnl")
+            info_parts = []
+            if cp is not None:
+                info_parts.append(f"Current price: ${cp:.2f}")
+            if dl is not None:
+                info_parts.append(f"Δ = {dl:+.3f}")
+            if ap is not None and pp is not None:
+                sign = "+" if ap >= 0 else ""
+                info_parts.append(f"PnL = {sign}${ap:,.2f}  ({sign}{pp:.1f}%)")
+            if info_parts:
+                lines.append("  " + "  |  ".join(info_parts))
+            for r in item["reasons"]:
+                lines.append(f"      >> {r}")
+            lines.append("")
+        while lines and not lines[-1].strip():
+            lines.pop()
+        print_box(lines, title=f"  Portfolio Evaluation — {len(flagged)} Alert(s)  ")
+
+    if skipped:
+        print_box(
+            [f"  {s}" for s in skipped],
+            title="  Skipped Positions  ",
+        )
+
+
 def format_position(pos: dict) -> str:
     """Return a one-line human-readable summary of a position row."""
     net_qty = pos.get("net_qty") or 0
@@ -443,7 +896,7 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
 
     print(f"\nUploading {file_path} to NotebookLM notebook {notebook_id} ...")
     try:
-        async with await NotebookLMClient.from_storage() as client:
+        async with NotebookLMClient.from_storage() as client:
             await client.sources.add_file(notebook_id, file_path, wait=True)
         print("Upload complete.")
     except Exception as exc:
@@ -458,7 +911,7 @@ STRAT_LABELS = {
 }
 
 
-COL_WIDTH = 80  # total terminal width for the output box
+COL_WIDTH = 125  # total terminal width for the output box
 
 # Matches footnote references like [1], [6, 19], [3,6,20]
 _FOOTNOTE_RE = re.compile(r"\[\s*\d+(?:\s*,\s*\d+)*\s*\]")
@@ -593,6 +1046,7 @@ async def query_notebooklm(
     strat: str,
     dates: dict,
     positions: list[dict] | None = None,
+    vix: float | None = None,
 ) -> None:
     """Ask NotebookLM for the best CC or CSP choice given the ticker source."""
     try:
@@ -618,6 +1072,7 @@ async def query_notebooklm(
         f"the next ex-dividend date is {dates['exdiv_date']} "
         f"({dates['exdiv_source']}, {dates['dividend_amount']} per share)"
     )
+    vix_note = f"the current VIX is {vix:.2f}" if vix is not None else ""
 
     if strat == "ROLL":
         # Summarise current open positions for context
@@ -635,28 +1090,31 @@ async def query_notebooklm(
             f"the potential PnL if the recommended rolled-to option is bought back at "
             f"40% of its sale price. Use this formula and show the working: "
             f"PnL = Sale Price × 0.60 × 100 × {total_contracts} contract(s). "
-            f"Label it 'Target 40% Profit (buy-back at 40% of premium)'."
+            f"Label it 'Expected PnL (buy-back at 40% of premium)'."
         )
+        vix_clause = f", the VIX ({vix_note})," if vix_note else ""
         question = (
             f"Based on the updated {ticker} source, the latest economic release calendar, "
-            f"and the latest PLAN and REVIEW sources, determine the best roll or "
+            f"and the latest PLAN and REVIEW sources{vix_clause} determine the best roll or "
             f"do nothing strategy. "
             f"{pos_context}"
             f"Note that {earnings_note} and {exdiv_note}. "
             f"{pnl_instruction}"
         )
     else:
+        vix_clause = f", the VIX ({vix_note})," if vix_note else ""
         question = (
             f"Given the {ticker} source, what is the best {strat_label} choice, "
             f"taking into consideration the economic calendar releases, "
-            f"upcoming dividends and/or earnings releases? "
+            f"the latest PLAN and REVIEW sources{vix_clause} and the upcoming "
+            f"dividends and/or earnings releases? "
             f"Note that {earnings_note} and {exdiv_note}."
         )
 
     print(f"\nQuerying NotebookLM...")
 
     try:
-        async with await NotebookLMClient.from_storage() as client:
+        async with NotebookLMClient.from_storage() as client:
             result = await client.chat.ask(notebook_id, question)
     except Exception as exc:
         print(f"ERROR: Query failed — {exc}", file=sys.stderr)
@@ -719,6 +1177,12 @@ EXAMPLES
   Roll analysis using existing CSV (no re-fetch):
     python get_option_chain.py --ticker IBM --onlyload --strat ROLL
 
+  Evaluate ALL open positions for risk signals (delta, DTE, ATM, ITM):
+    python get_option_chain.py --eval
+
+  Evaluate only IBM open positions:
+    python get_option_chain.py --eval --ticker IBM
+
 JOURNAL
   Open positions are read (read-only) from:
     ../option_trade_journal/trades.db
@@ -745,9 +1209,19 @@ def main():
     )
     parser.add_argument(
         "--ticker",
-        required=True,
+        required=False,
         metavar="SYMBOL",
-        help="Stock ticker symbol, e.g. IBM  (required)",
+        help="Stock ticker symbol, e.g. IBM  (required unless using --eval)",
+    )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help=(
+            "Evaluate all open positions for risk signals: |delta| >= 0.40, "
+            f"DTE <= 21, near ATM (within {ATM_THRESHOLD_PCT:.0f}%%), or ITM. "
+            "Requires PUBLIC_API_SECRET. Combine with --ticker to filter "
+            "to one symbol."
+        ),
     )
     parser.add_argument(
         "--num",
@@ -777,6 +1251,28 @@ def main():
              "         downloads/loads the chain, then queries NotebookLM",
     )
     args = parser.parse_args()
+
+    # ── --eval: standalone portfolio evaluation mode ──────────────────────────
+    if args.eval:
+        secret = os.environ.get("PUBLIC_API_SECRET")
+        if not secret:
+            print(
+                "ERROR: PUBLIC_API_SECRET is required for --eval.\n"
+                "  1. Go to https://public.com (Settings → API)\n"
+                "  2. Generate a Secret Token\n"
+                "  3. Run:  export PUBLIC_API_SECRET=your_secret_here",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        token = get_access_token(secret)
+        account_id = get_account_id(token)
+        eval_ticker = args.ticker.upper() if args.ticker else None
+        eval_open_positions(token, account_id, eval_ticker)
+        sys.exit(0)
+
+    # All non-eval modes require --ticker
+    if not args.ticker:
+        parser.error("--ticker is required unless using --eval")
 
     ticker = args.ticker.upper()
     num = args.num
@@ -882,13 +1378,27 @@ def main():
         key_dates = get_key_dates(ticker)
         print_key_dates(ticker, key_dates)
 
+    # Step 7b — Fetch VIX (when --strat is used)
+    current_vix = None
+    if args.strat:
+        print("Fetching VIX...", end=" ", flush=True)
+        current_vix = get_vix()
+        if current_vix is not None:
+            print(f"VIX = {current_vix:.2f}")
+        else:
+            print("unavailable")
+
     # Step 8 — Optionally upload to NotebookLM
     if not strat_only and (args.upload or args.onlyload):
         asyncio.run(upload_to_notebooklm(output_file, notebook_id))
 
     # Step 9 — Optionally query NotebookLM for strategy recommendation
     if args.strat:
-        asyncio.run(query_notebooklm(notebook_id, ticker, args.strat, key_dates, open_positions))
+        asyncio.run(
+            query_notebooklm(
+                notebook_id, ticker, args.strat, key_dates, open_positions, current_vix
+            )
+        )
 
 
 if __name__ == "__main__":
