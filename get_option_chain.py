@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import csv
 import datetime
+import logging
 import os
 import re
 import sys
@@ -46,6 +47,59 @@ AUTH_URL = "https://api.public.com/userapiauthservice/personal/access-tokens"
 JOURNAL_DB = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "option_trade_journal", "trades.db"
 )
+
+# Logs directory sits alongside the script
+_LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+# Module-level logger — call setup_logging() to activate file output
+log = logging.getLogger("options")
+
+
+def setup_logging(level: int = logging.DEBUG) -> str:
+    """
+    Configure logging to both console and a timestamped log file.
+
+    Creates  logs/options_YYYYMMDD_HHMMSS.log  on every call (i.e. every
+    server bounce) and updates the  logs/latest.log  symlink to point at it.
+
+    Returns the path to the new log file.
+    """
+    os.makedirs(_LOGS_DIR, exist_ok=True)
+
+    stamp    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(_LOGS_DIR, f"options_{stamp}.log")
+    link     = os.path.join(_LOGS_DIR, "latest.log")
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d [%(levelname)-5s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # File handler — new file every bounce
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
+
+    # Console handler — WARN and above only
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.WARNING)
+    ch.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.addHandler(fh)
+    root.addHandler(ch)
+
+    # Symlink latest.log → options_YYYYMMDD_HHMMSS.log
+    try:
+        if os.path.islink(link) or os.path.exists(link):
+            os.remove(link)
+        os.symlink(os.path.basename(log_file), link)
+    except OSError as exc:
+        log.warning("Could not create latest.log symlink: %s", exc)
+
+    log.info("Logging started — %s", log_file)
+    return log_file
 
 # CSV columns — one row per contract (call or put)
 CSV_COLUMNS = [
@@ -83,25 +137,25 @@ def get_access_token(secret: str, validity_minutes: int = 60) -> str:
         json={"secret": secret, "validityInMinutes": validity_minutes},
     )
     if response.status_code == 401:
-        print(
-            "ERROR: Unauthorized. Your PUBLIC_API_SECRET is invalid or revoked.\n"
-            "  Generate a Secret Token at: https://public.com/settings (API section)",
-            file=sys.stderr,
+        msg = (
+            "Unauthorized — PUBLIC_API_SECRET is invalid or revoked. "
+            "Generate a new one at https://public.com/settings (API section)."
         )
-        sys.exit(1)
+        print(f"ERROR: {msg}", file=sys.stderr)
+        raise RuntimeError(msg)
     if response.status_code == 429:
-        print("ERROR: Rate limited by Public.com auth endpoint. Try again shortly.", file=sys.stderr)
-        sys.exit(1)
+        msg = "Rate limited by Public.com auth endpoint. Try again shortly."
+        print(f"ERROR: {msg}", file=sys.stderr)
+        raise RuntimeError(msg)
     if response.status_code != 200:
-        print(
-            f"ERROR: Failed to obtain access token — HTTP {response.status_code}: {response.text}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        msg = f"Failed to obtain access token — HTTP {response.status_code}: {response.text[:200]}"
+        print(f"ERROR: {msg}", file=sys.stderr)
+        raise RuntimeError(msg)
     access_token = response.json().get("accessToken")
     if not access_token:
-        print("ERROR: No accessToken in auth response.", file=sys.stderr)
-        sys.exit(1)
+        msg = "No accessToken in auth response."
+        print(f"ERROR: {msg}", file=sys.stderr)
+        raise RuntimeError(msg)
     print(f"Access token obtained (valid {validity_minutes} min).")
     return access_token
 
@@ -119,16 +173,15 @@ def get_account_id(token: str) -> str:
     url = f"{BASE_URL}/userapigateway/trading/account"
     response = requests.get(url, headers=get_headers(token))
     if response.status_code == 401:
-        print("ERROR: Unauthorized. Check your PUBLIC_API_TOKEN.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("Unauthorized fetching account — check PUBLIC_API_SECRET.")
     if response.status_code != 200:
-        print(f"ERROR: Failed to fetch accounts — HTTP {response.status_code}: {response.text}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(
+            f"Failed to fetch accounts — HTTP {response.status_code}: {response.text[:200]}"
+        )
     data = response.json()
     accounts = data.get("accounts", [])
     if not accounts:
-        print("ERROR: No accounts found for this token.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("No accounts found for this token.")
     account_id = accounts[0]["accountId"]
     print(f"Using account ID: {account_id}")
     return account_id
@@ -146,11 +199,10 @@ def get_expirations(token: str, account_id: str, ticker: str) -> list[str]:
     }
     response = requests.post(url, headers=get_headers(token), json=payload)
     if response.status_code != 200:
-        print(
-            f"ERROR: Failed to fetch expirations for {ticker} — HTTP {response.status_code}: {response.text}",
-            file=sys.stderr,
+        raise RuntimeError(
+            f"Failed to fetch expirations for {ticker} — "
+            f"HTTP {response.status_code}: {response.text[:200]}"
         )
-        sys.exit(1)
     data = response.json()
     expirations = data.get("expirations", [])
     if not expirations:
@@ -300,6 +352,7 @@ def get_all_open_positions(ticker: str | None = None) -> list[dict]:
             p.strike,
             p.expiry,
             p.notes,
+            p.spread_id,
             SUM(CASE WHEN t.action = 'sell' THEN  t.quantity
                      WHEN t.action = 'buy'  THEN -t.quantity
                      ELSE 0 END)                                    AS net_qty,
@@ -329,6 +382,68 @@ def get_all_open_positions(ticker: str | None = None) -> list[dict]:
         sys.exit(1)
 
     return [dict(row) for row in rows]
+
+
+def get_chain_net_cash(spread_id, fallback_ticker: str | None = None) -> dict:
+    """
+    Return a breakdown of net cash for all positions sharing the same spread_id.
+    If spread_id is NULL, falls back to all positions for fallback_ticker.
+
+    Returns dict with:
+        net_cash     : float  — (collected − paid) × 100
+        collected    : float  — total sell proceeds × 100
+        paid         : float  — total buy costs × 100
+        num_positions: int    — number of positions in the chain
+        scoped_by    : str    — 'spread_id' or 'symbol' (indicates which filter was used)
+    Positive net_cash means net credit received.
+    """
+    import sqlite3
+
+    db_path = os.path.normpath(JOURNAL_DB)
+    if not os.path.exists(db_path):
+        return {"net_cash": 0.0, "collected": 0.0, "paid": 0.0, "num_positions": 0, "scoped_by": "none"}
+
+    if spread_id is not None:
+        where  = "p.spread_id = ?"
+        param  = spread_id
+        scoped = "spread_id"
+        log.debug("get_chain_net_cash: using spread_id=%r", spread_id)
+    elif fallback_ticker:
+        where  = "UPPER(p.symbol) = UPPER(?)"
+        param  = fallback_ticker
+        scoped = "symbol"
+        log.debug("get_chain_net_cash: spread_id is NULL, falling back to symbol=%r", fallback_ticker)
+    else:
+        return {"net_cash": 0.0, "collected": 0.0, "paid": 0.0, "num_positions": 0, "scoped_by": "none"}
+
+    sql = f"""
+        SELECT
+            SUM(CASE WHEN t.action = 'sell' THEN  t.price * t.quantity ELSE 0 END) AS gross_collected,
+            SUM(CASE WHEN t.action = 'buy'  THEN  t.price * t.quantity ELSE 0 END) AS gross_paid,
+            COUNT(DISTINCT p.id) AS num_positions
+        FROM positions p
+        JOIN trades t ON t.position_id = p.id
+        WHERE {where}
+          AND t.is_test = 0
+    """
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        row = con.execute(sql, (param,)).fetchone()
+        con.close()
+        collected = round(float(row[0] or 0.0) * 100, 2)
+        paid      = round(float(row[1] or 0.0) * 100, 2)
+        n_pos     = int(row[2] or 0)
+        log.debug("get_chain_net_cash: collected=%.2f paid=%.2f positions=%d", collected, paid, n_pos)
+        return {
+            "net_cash":      round(collected - paid, 2),
+            "collected":     collected,
+            "paid":          paid,
+            "num_positions": n_pos,
+            "scoped_by":     scoped,
+        }
+    except sqlite3.OperationalError as exc:
+        log.error("get_chain_net_cash query failed: %s", exc)
+        return {"net_cash": 0.0, "collected": 0.0, "paid": 0.0, "num_positions": 0, "scoped_by": "error"}
 
 
 # Cache underlying prices within a session to avoid redundant yfinance calls
@@ -494,38 +609,59 @@ def get_option_greeks_batch(token: str, account_id: str, osi_symbols: list[str])
     return result
 
 
-def eval_open_positions(token: str, account_id: str, ticker: str | None = None) -> None:
+def get_eval_data(
+    token: str,
+    account_id: str,
+    ticker: str | None = None,
+    verbose: bool = True,
+) -> dict:
     """
-    Fetch live option data for every open position and flag those that meet
-    any of the following criteria:
-        • abs(delta) >= 0.40
-        • DTE <= 21
-        • Near ATM  (underlying within ATM_THRESHOLD_PCT % of strike)
-        • ITM       (call: underlying > strike; put: underlying < strike)
-        • Within 1.5× ATR buffer of the strike
-    Uses a single POST /quotes call for all positions instead of one
-    option-chain fetch per expiry date.
+    Fetch live market data for every open position and evaluate risk criteria.
+    Returns a dict with keys:
+        positions     : list[dict]  — ALL active positions, each enriched with
+                        dte, delta, underlying, atr, buffer, current_price,
+                        abs_pnl, pct_pnl, reasons (list[str]), flagged (bool)
+        skipped       : list[str]   — positions skipped (expired / bad data)
+        flagged_count : int
+        total_count   : int         — total from DB (including skipped)
+        vix           : float | None
+        fetched_at    : str         — ISO-8601 timestamp
     """
     import datetime
 
-    positions = get_all_open_positions(ticker)
-    if not positions:
-        label = f"{ticker} positions" if ticker else "positions"
-        print_box([f"  No open {label} found in the journal."], title="  Portfolio Evaluation  ")
-        return
+    def _log(msg: str, **kwargs) -> None:
+        if verbose:
+            print(msg, **kwargs)
+
+    def _to_f(v: object) -> float | None:
+        try:
+            return float(v) if v not in (None, "") else None
+        except (ValueError, TypeError):
+            return None
+
+    raw_positions = get_all_open_positions(ticker)
+    if not raw_positions:
+        return {
+            "positions": [],
+            "skipped": [],
+            "flagged_count": 0,
+            "total_count": 0,
+            "vix": get_vix(),
+            "fetched_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
 
     today = datetime.date.today()
-    unique_tickers = {pos["symbol"].upper() for pos in positions}
-    print(
-        f"\nEvaluating {len(positions)} open position(s) across "
+    unique_tickers = {pos["symbol"].upper() for pos in raw_positions}
+    _log(
+        f"\nEvaluating {len(raw_positions)} open position(s) across "
         f"{len(unique_tickers)} ticker(s)..."
     )
 
     # Pre-filter expired / unparseable positions
     active: list[dict] = []
     skipped: list[str] = []
-    for pos in positions:
-        sym = pos["symbol"].upper()
+    for pos in raw_positions:
+        sym    = pos["symbol"].upper()
         expiry = pos["expiry"]
         try:
             expiry_date = datetime.date.fromisoformat(expiry)
@@ -545,32 +681,34 @@ def eval_open_positions(token: str, account_id: str, ticker: str | None = None) 
         active.append({**pos, "dte": dte})
 
     if not active:
-        print_box(["  No active (non-expired) open positions found."], title="  Portfolio Evaluation  ")
-        return
+        return {
+            "positions": [],
+            "skipped": skipped,
+            "flagged_count": 0,
+            "total_count": len(raw_positions),
+            "vix": get_vix(),
+            "fetched_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
 
     # ── Batch API calls: quotes (price) + greeks (delta) ─────────────────────
     osi_list = [
-        build_osi_symbol(p["symbol"].upper(), p["expiry"], p["option_type"].upper(), float(p["strike"]))
+        build_osi_symbol(
+            p["symbol"].upper(), p["expiry"], p["option_type"].upper(), float(p["strike"])
+        )
         for p in active
     ]
-    print(f"  Fetching quotes for {len(active)} contract(s)...", end=" ", flush=True)
+    _log(f"  Fetching quotes for {len(active)} contract(s)...", end=" ", flush=True)
     quotes = get_option_quotes(token, account_id, active)
-    print(f"{len(quotes)} received.")
-    print(f"  Fetching greeks for {len(osi_list)} contract(s)...", end=" ", flush=True)
+    _log(f"{len(quotes)} received.")
+    _log(f"  Fetching greeks for {len(osi_list)} contract(s)...", end=" ", flush=True)
     greeks_data = get_option_greeks_batch(token, account_id, osi_list)
-    print(f"{len(greeks_data)} received.")
+    _log(f"{len(greeks_data)} received.")
 
     # ── Per-ticker caches (underlying price + ATR) ────────────────────────────
     price_cache_local: dict[str, float | None] = {}
     atr_cache: dict[str, tuple[float | None, float | None]] = {}
 
-    def _to_f(v: object) -> float | None:
-        try:
-            return float(v) if v not in (None, "") else None
-        except (ValueError, TypeError):
-            return None
-
-    flagged: list[dict] = []
+    result_positions: list[dict] = []
 
     for pos in active:
         sym      = pos["symbol"].upper()
@@ -590,13 +728,13 @@ def eval_open_positions(token: str, account_id: str, ticker: str | None = None) 
             atr_cache[sym] = (atr_val, atr_val * 1.5 if atr_val else None)
         atr_val, buffer = atr_cache[sym]
 
-        osi   = build_osi_symbol(sym, expiry, opt_type, strike).replace(" ", "")
+        osi = build_osi_symbol(sym, expiry, opt_type, strike).replace(" ", "")
 
         # Delta from greeks endpoint
         greeks = greeks_data.get(osi, {})
         delta: float | None = _to_f(greeks.get("delta"))
 
-        # Current price from quotes endpoint: prefer mid=(bid+ask)/2, then last
+        # Current price: prefer mid=(bid+ask)/2, then last
         quote = quotes.get(osi, {})
         current_price: float | None = None
         bid  = _to_f(quote.get("bid"))
@@ -640,11 +778,11 @@ def eval_open_positions(token: str, account_id: str, ticker: str | None = None) 
 
         # ── Condition 4: Near ATM ─────────────────────────────────────────────
         if underlying is not None:
-            pct = abs(underlying - strike) / strike * 100
-            if pct <= ATM_THRESHOLD_PCT:
+            pct_away = abs(underlying - strike) / strike * 100
+            if pct_away <= ATM_THRESHOLD_PCT:
                 reasons.append(
                     f"Near ATM: u/l ${underlying:.2f} vs strike ${strike:.2f}"
-                    f" ({pct:.1f}% away)"
+                    f" ({pct_away:.1f}% away)"
                 )
 
         # ── Condition 5: Within 1.5× ATR buffer ──────────────────────────────
@@ -668,19 +806,49 @@ def eval_open_positions(token: str, account_id: str, ticker: str | None = None) 
                         f"(1.5 × ATR ${atr_val:.2f})"
                     )
 
-        if reasons:
-            flagged.append({
-                **pos,
-                "dte": dte,
-                "delta": delta,
-                "underlying": underlying,
-                "atr": atr_val,
-                "buffer": buffer,
-                "current_price": current_price,
-                "abs_pnl": abs_pnl,
-                "pct_pnl": pct_pnl,
-                "reasons": reasons,
-            })
+        result_positions.append({
+            **pos,
+            "dte": dte,
+            "delta": delta,
+            "underlying": underlying,
+            "atr": atr_val,
+            "buffer": buffer,
+            "current_price": current_price,
+            "abs_pnl": abs_pnl,
+            "pct_pnl": pct_pnl,
+            "reasons": reasons,
+            "flagged": bool(reasons),
+        })
+
+    flagged_count = sum(1 for p in result_positions if p["flagged"])
+    vix = get_vix()
+    return {
+        "positions": result_positions,
+        "skipped": skipped,
+        "flagged_count": flagged_count,
+        "total_count": len(raw_positions),
+        "vix": vix,
+        "fetched_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def eval_open_positions(token: str, account_id: str, ticker: str | None = None) -> None:
+    """CLI output for portfolio evaluation. Calls get_eval_data() and prints."""
+    raw_positions = get_all_open_positions(ticker)
+    if not raw_positions:
+        label = f"{ticker} positions" if ticker else "positions"
+        print_box([f"  No open {label} found in the journal."], title="  Portfolio Evaluation  ")
+        return
+
+    data = get_eval_data(token, account_id, ticker, verbose=True)
+    positions   = data["positions"]
+    skipped     = data["skipped"]
+    flagged     = [p for p in positions if p["flagged"]]
+    total_count = data["total_count"]
+
+    if not positions:
+        print_box(["  No active (non-expired) open positions found."], title="  Portfolio Evaluation  ")
+        return
 
     # ── Output ────────────────────────────────────────────────────────────────
     if not flagged:
@@ -690,12 +858,11 @@ def eval_open_positions(token: str, account_id: str, ticker: str | None = None) 
         )
     else:
         lines: list[str] = [
-            f"  {len(flagged)} of {len(positions)} position(s) flagged for review:",
+            f"  {len(flagged)} of {total_count} position(s) flagged for review:",
             "",
         ]
         for item in flagged:
             lines.append(f"  {format_position(item)}")
-            # Current price, delta, and PnL — always shown when data is available
             cp = item.get("current_price")
             dl = item.get("delta")
             ap = item.get("abs_pnl")
@@ -722,6 +889,1330 @@ def eval_open_positions(token: str, account_id: str, ticker: str | None = None) 
             [f"  {s}" for s in skipped],
             title="  Skipped Positions  ",
         )
+
+
+def _parse_recommended_option(text: str, chain_rows: list[dict]) -> dict | None:
+    """
+    Try to extract the recommended strike and expiry from NotebookLM response text
+    and return the matching chain row, or None if not found.
+    """
+    # Extract strike: $12.50, $12, 12.50 strike, strike of 12.50, etc.
+    strike_match = re.search(
+        r'\$\s*(\d+(?:\.\d+)?)\s*strike'
+        r'|strike\s+(?:of\s+|price\s+(?:of\s+)?)?\$?\s*(\d+(?:\.\d+)?)'
+        r'|\$\s*(\d+(?:\.\d+)?)\s+(?:put|call|strike)'
+        r'|\b(\d+(?:\.\d+)?)\s+(?:call|put)\b',
+        text, re.IGNORECASE
+    )
+    if not strike_match:
+        return None
+    strike_str = next(g for g in strike_match.groups() if g is not None)
+    try:
+        target_strike = float(strike_str)
+    except ValueError:
+        return None
+
+    # Extract expiry: YYYY-MM-DD, or Month DD YYYY, or Month DD, YYYY
+    date_match = re.search(
+        r'(\d{4}-\d{2}-\d{2})'
+        r'|(\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?'
+        r'|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
+        r'\s+\d{1,2},?\s+\d{4})',
+        text, re.IGNORECASE
+    )
+    target_expiry = None
+    if date_match:
+        raw_date = date_match.group(1) or date_match.group(2)
+        for fmt in ("%Y-%m-%d", "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y"):
+            try:
+                target_expiry = datetime.datetime.strptime(raw_date.replace(",", ", ").strip(), fmt).strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                continue
+
+    # Find best matching row: exact strike + expiry if possible, else nearest strike
+    best = None
+    best_dist = float("inf")
+    for row in chain_rows:
+        try:
+            row_strike = float(row.get("strike") or 0)
+        except (TypeError, ValueError):
+            continue
+        dist = abs(row_strike - target_strike)
+        expiry_match = (target_expiry is None or row.get("expiry") == target_expiry)
+        # Prefer exact expiry match; use distance as tiebreaker
+        score = dist + (0 if expiry_match else 1000)
+        if score < best_dist:
+            best_dist = score
+            best = row
+    return best
+
+
+def _parse_ideal_entry(text: str) -> str | None:
+    """
+    Extract a short 'when to enter' note from NotebookLM response text.
+    Returns something like 'Mon/Tue AM – low IV' or 'Thu PM – pre-div' or None.
+    """
+    # Day abbreviations
+    DAY_MAP = {
+        "monday": "Mon", "tuesday": "Tue", "wednesday": "Wed",
+        "thursday": "Thu", "friday": "Fri",
+        "mon": "Mon", "tue": "Tue", "wed": "Wed", "thu": "Thu", "fri": "Fri",
+    }
+    # Time-of-day
+    TIME_MAP = {
+        r'\bmorning\b': "AM", r'\bopen(?:ing)?\b': "open",
+        r'\bafternoon\b': "PM", r'\bclose\b': "close",
+        r'\bend\s+of\s+(?:the\s+)?(?:trading\s+)?day\b': "EOD",
+        r'\bmid.?day\b': "mid",
+    }
+
+    # Look for sentences containing entry timing cues
+    timing_sentences = []
+    for sent in re.split(r'(?<=[.!?])\s+', text):
+        low = sent.lower()
+        if re.search(r'enter|sell|open\s+(?:the\s+)?(?:position|trade)|initiat|place\s+(?:the\s+)?trade', low):
+            timing_sentences.append(sent)
+    if not timing_sentences:
+        # Broaden: any sentence with a day of week
+        for sent in re.split(r'(?<=[.!?])\s+', text):
+            if re.search(r'\b(?:mon|tue|wed|thu|fri)(?:day)?\b', sent, re.IGNORECASE):
+                timing_sentences.append(sent)
+
+    target = ' '.join(timing_sentences) if timing_sentences else text
+
+    # Extract days
+    days_found = []
+    for word, abbr in DAY_MAP.items():
+        if re.search(r'\b' + word + r'\b', target, re.IGNORECASE):
+            if abbr not in days_found:
+                days_found.append(abbr)
+    # Keep day order Mon→Fri
+    order = ["Mon","Tue","Wed","Thu","Fri"]
+    days_found = [d for d in order if d in days_found]
+
+    # Extract time of day
+    time_found = None
+    for pattern, label in TIME_MAP.items():
+        if re.search(pattern, target, re.IGNORECASE):
+            time_found = label
+            break
+
+    # Extract a short reason (IV, earnings, dividend, volatility spike, etc.)
+    reason = None
+    reason_patterns = [
+        (r'\blow\s+(?:implied\s+)?(?:volatility|IV)\b', "low IV"),
+        (r'\bhigh\s+(?:implied\s+)?(?:volatility|IV)\b', "high IV"),
+        (r'\bIV\s+(?:spike|crush|expansion)\b', "IV spike"),
+        (r'\bearning(?:s)?\b', "pre-earn"),
+        (r'\bdividend\b', "pre-div"),
+        (r'\bex.?div\b', "ex-div"),
+        (r'\bvolatility\s+(?:spike|surge|expansion)\b', "vol spike"),
+        (r'\bpre.?market\b', "pre-mkt"),
+        (r'\bafter.?(?:hours|market)\b', "AH"),
+        (r'\bweekly\s+(?:high|low)\b', "wkly lvl"),
+    ]
+    for pat, label in reason_patterns:
+        if re.search(pat, target, re.IGNORECASE):
+            reason = label
+            break
+
+    # Compose result
+    parts = []
+    if days_found:
+        parts.append("/".join(days_found))
+    if time_found:
+        parts.append(time_found)
+    timing = " ".join(parts) if parts else None
+
+    if timing and reason:
+        return f"{timing} – {reason}"
+    if timing:
+        return timing
+    if reason:
+        return reason
+    return None
+
+
+def _detect_recommendation(text: str) -> str:
+    """Parse a NotebookLM ROLL response and return ROLL, HOLD, or ASSIGNMENT."""
+    low = text.lower()
+    if re.search(r"accept.{0,20}assignment|take.{0,20}assignment|let.{0,10}assign|allow.{0,10}assignment", low):
+        return "ASSIGNMENT"
+    # Check for explicit "do nothing" / hold before checking for "roll"
+    # (a roll recommendation will often mention "do nothing" as the rejected option)
+    first_heading_match = re.search(
+        r"(?:recommendation|strategy|action)[:\s]+([^\n.]+)", low
+    )
+    if first_heading_match:
+        snippet = first_heading_match.group(1)
+        if re.search(r"\bdo nothing\b|\bhold\b|\bno action\b|\bno roll\b", snippet):
+            return "HOLD"
+        if re.search(r"\broll\b", snippet):
+            return "ROLL"
+        if re.search(r"\bassignment\b", snippet):
+            return "ASSIGNMENT"
+    # Fallback: count occurrences
+    roll_n   = len(re.findall(r"\broll(?:ing|ed)?\b", low))
+    do_n     = len(re.findall(r"\bdo nothing\b|\bhold\b", low))
+    assign_n = len(re.findall(r"\bassignment\b", low))
+    if assign_n > roll_n and assign_n > do_n:
+        return "ASSIGNMENT"
+    if roll_n >= do_n:
+        return "ROLL"
+    return "HOLD"
+
+
+async def run_roll_for_position(
+    token: str,
+    account_id: str,
+    ticker: str,
+    open_positions: list[dict],
+    notebook_id: str,
+    pos_key: str | None = None,
+    num_expirations: int = 10,
+) -> dict:
+    """
+    Full ROLL workflow for one position (web mode):
+      1. Fetch & write option chain CSV
+      2. Upload CSV to NotebookLM
+      3. Get key dates + VIX
+      4. Query NotebookLM with ROLL strategy (silent — no terminal output)
+    Returns dict: {recommendation, text, ticker, error}
+    """
+    try:
+        all_expirations = get_expirations(token, account_id, ticker)
+        if not all_expirations:
+            return {
+                "error": f"No option expirations found for {ticker} on Public.com — "
+                         "the ticker may not support options or may not be available in your account.",
+                "recommendation": "HOLD",
+                "text": "",
+                "ticker": ticker,
+            }
+        expirations = all_expirations[:num_expirations]
+
+        all_rows: list[dict] = []
+        for exp_date in expirations:
+            chain = get_option_chain(token, account_id, ticker, exp_date)
+            if not chain:
+                continue
+            for contract in chain.get("calls", []):
+                all_rows.append(contract_to_row(contract, "CALL", exp_date))
+            for contract in chain.get("puts", []):
+                all_rows.append(contract_to_row(contract, "PUT", exp_date))
+
+        if not all_rows:
+            return {
+                "error": f"Option chain returned no contracts for {ticker} — "
+                         "data may be unavailable or markets may be closed.",
+                "recommendation": "HOLD",
+                "text": "",
+                "ticker": ticker,
+            }
+
+        output_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
+        )
+        with open(output_file, "w", newline="") as tmp:
+            writer = csv.DictWriter(tmp, fieldnames=CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerows(all_rows)
+
+        try:
+            await upload_to_notebooklm(output_file, notebook_id)
+        finally:
+            try:
+                os.unlink(output_file)
+            except OSError:
+                pass
+
+        key_dates = get_key_dates(ticker)
+        vix = get_vix()
+
+        text = await query_notebooklm(
+            notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
+            silent=True,
+        )
+        if not text:
+            return {"error": "Empty response from NotebookLM", "recommendation": "HOLD", "text": "", "ticker": ticker}
+
+        # Resolve spread_id from the open position matching this pos_key.
+        # Strike is a float in the DB but a bare number string in the JS pos_key,
+        # so compare as floats to avoid "5.0" != "5" mismatches.
+        spread_id = None
+        if pos_key:
+            pk_parts = pos_key.split("|")  # symbol|option_type|strike|expiry
+            pk_sym    = pk_parts[0].upper()  if len(pk_parts) > 0 else ""
+            pk_type   = pk_parts[1].upper()  if len(pk_parts) > 1 else ""
+            pk_expiry = pk_parts[3]          if len(pk_parts) > 3 else ""
+            try:
+                pk_strike = float(pk_parts[2]) if len(pk_parts) > 2 else None
+            except ValueError:
+                pk_strike = None
+            matched_pos = None
+            for p in open_positions:
+                try:
+                    p_strike = float(p.get("strike", ""))
+                except (TypeError, ValueError):
+                    p_strike = None
+                if (str(p.get("symbol","")).upper() == pk_sym
+                        and str(p.get("option_type","")).upper() == pk_type
+                        and p_strike == pk_strike
+                        and str(p.get("expiry","")) == pk_expiry):
+                    spread_id  = p.get("spread_id")
+                    matched_pos = p
+                    log.debug("Matched pos_key=%r → spread_id=%r", pos_key, spread_id)
+                    break
+            else:
+                log.warning("No position matched pos_key=%r in open_positions", pos_key)
+        chain = get_chain_net_cash(spread_id, fallback_ticker=ticker)
+
+        # Expected PnL: close current position at 40% of sale price (keep 60%)
+        pos_avg_price = float(matched_pos["avg_price"]) if matched_pos and matched_pos.get("avg_price") is not None else None
+        pos_qty       = abs(int(matched_pos["net_qty"])) if matched_pos and matched_pos.get("net_qty") is not None else None
+        return {
+            "recommendation": _detect_recommendation(text),
+            "text": text,
+            "ticker": ticker,
+            "chain_cash":      chain["net_cash"],       # for dashboard badge
+            "chain_collected": chain["collected"],
+            "chain_paid":      chain["paid"],
+            "chain_positions": chain["num_positions"],
+            "pos_avg_price":   pos_avg_price,
+            "pos_qty":         pos_qty,
+            "error": None,
+        }
+
+    except Exception as exc:
+        return {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker}
+
+
+async def run_unborn_for_ticker(
+    token: str,
+    account_id: str,
+    ticker: str,
+    qty: int,
+    strat: str,
+    notebook_id: str,
+    num_expirations: int = 10,
+) -> dict:
+    """
+    CC/CSP analysis for a ticker with no existing open position ('unborn').
+      1. Fetch & write option chain CSV
+      2. Upload to NotebookLM
+      3. Query NotebookLM with CC or CSP strategy
+    Returns dict: {recommendation, text, ticker, strat, error}
+    """
+    try:
+        all_expirations = get_expirations(token, account_id, ticker)
+        if not all_expirations:
+            return {
+                "error": f"No option expirations found for {ticker} on Public.com.",
+                "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat,
+            }
+        expirations = all_expirations[:num_expirations]
+
+        all_rows: list[dict] = []
+        for exp_date in expirations:
+            chain = get_option_chain(token, account_id, ticker, exp_date)
+            if not chain:
+                continue
+            for contract in chain.get("calls", []):
+                all_rows.append(contract_to_row(contract, "CALL", exp_date))
+            for contract in chain.get("puts", []):
+                all_rows.append(contract_to_row(contract, "PUT", exp_date))
+
+        if not all_rows:
+            return {
+                "error": f"Option chain returned no contracts for {ticker}.",
+                "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat,
+            }
+
+        # Get underlying price for DTE and delta enrichment
+        ul_price = get_underlying_price(ticker)
+        today = datetime.date.today()
+
+        # Build display rows: relevant type only, enriched with DTE
+        opt_type_filter = "CALL" if strat == "CC" else "PUT"
+        display_rows = []
+        for row in all_rows:
+            if row.get("option_type", "").upper() != opt_type_filter:
+                continue
+            try:
+                expiry_dt = datetime.date.fromisoformat(row["expiration_date"])
+                dte = (expiry_dt - today).days
+            except (KeyError, ValueError):
+                dte = None
+            display_rows.append({
+                "symbol":      ticker,
+                "option_type": opt_type_filter,
+                "strike":      row.get("strike_price"),
+                "expiry":      row.get("expiration_date"),
+                "side":        "Short",
+                "dte":         dte,
+                "delta":       row.get("delta"),
+                "ul_price":    ul_price,
+                "opt_price":   row.get("mid_price") or row.get("last"),
+            })
+
+        output_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
+        )
+        with open(output_file, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerows(all_rows)
+
+        try:
+            await upload_to_notebooklm(output_file, notebook_id)
+        finally:
+            try:
+                os.unlink(output_file)
+            except OSError:
+                pass
+
+        key_dates = get_key_dates(ticker)
+        vix = get_vix()
+
+        # Synthetic position representing the intended trade size
+        synthetic_positions = [{"symbol": ticker, "option_type": strat, "net_qty": -qty,
+                                 "avg_price": None, "strike": None, "expiry": None}]
+
+        text = await query_notebooklm(
+            notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
+            silent=True,
+        )
+        if not text:
+            return {"error": "Empty response from NotebookLM", "recommendation": "HOLD",
+                    "text": "", "ticker": ticker, "strat": strat, "chain": display_rows}
+
+        rec = _detect_recommendation(text)
+        chosen = _parse_recommended_option(text, display_rows)
+        if chosen is None and display_rows:
+            # Fallback: pick option closest to 30 DTE and 0.30 delta
+            target_delta = 0.30 if strat == "CC" else -0.30
+            def _score(r):
+                try:
+                    d_dist = abs(float(r.get("delta") or 0) - target_delta)
+                except (TypeError, ValueError):
+                    d_dist = 1.0
+                try:
+                    dte_dist = abs((r.get("dte") or 30) - 30)
+                except (TypeError, ValueError):
+                    dte_dist = 30
+                return dte_dist * 0.5 + d_dist * 50
+            chosen = min(display_rows, key=_score)
+        if chosen is not None:
+            chosen = dict(chosen)
+            chosen["ideal_entry"] = _parse_ideal_entry(text)
+        return {
+            "recommendation": rec,
+            "text": text,
+            "ticker": ticker,
+            "strat": strat,
+            "chain": [chosen] if chosen else [],
+            "error": None,
+        }
+
+    except Exception as exc:
+        return {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat}
+
+
+# ── HTML template for --web dashboard ────────────────────────────────────────
+_WEB_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Portfolio Eval</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+    --text: #e2e8f0; --muted: #8892a4; --accent: #4f8ef7;
+    --ok: #22c55e; --warn: #f59e0b; --danger: #ef4444;
+    --ok-bg: #052e16; --warn-bg: #451a03; --danger-bg: #450a0a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 14px 24px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; font-weight: 600; color: var(--accent); letter-spacing: 0.05em; }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+  .stat-value { font-size: 15px; font-weight: 600; }
+  .ok    { color: var(--ok); }
+  .warn  { color: var(--warn); }
+  .danger { color: var(--danger); }
+  .muted { color: var(--muted); }
+  .actions { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  button { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 12px; font-family: inherit; }
+  button:hover { opacity: 0.85; }
+  #countdown { font-size: 11px; color: var(--muted); }
+  main { padding: 20px 24px; }
+  .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 10px; margin-top: 20px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { background: var(--surface); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; white-space: nowrap; position: sticky; top: 0; z-index: 10; }
+  th:hover { color: var(--text); }
+  th.sorted-asc::after  { content: " ▲"; }
+  th.sorted-desc::after { content: " ▼"; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; white-space: nowrap; }
+  tr.ok-row   td { background: transparent; }
+  tr.warn-row td { background: #1f1a0a; }
+  tr.danger-row td { background: #1f0a0a; }
+  tr:hover td { filter: brightness(1.15); }
+  .badge { display: inline-block; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 600; letter-spacing: 0.05em; }
+  .badge-ok     { background: var(--ok-bg);   color: var(--ok);   }
+  .badge-warn   { background: var(--warn-bg); color: var(--warn); }
+  .badge-danger { background: var(--danger-bg); color: var(--danger); }
+  .reasons { font-size: 11px; color: var(--muted); white-space: normal; max-width: 360px; }
+  .err-tip { position: relative; display: inline-block; cursor: default; }
+  .err-tip .err-msg {
+    display: none; position: absolute; z-index: 100; bottom: calc(100% + 6px); left: 50%;
+    transform: translateX(-50%); background: #1e1e2e; color: #f87171; border: 1px solid #f87171;
+    border-radius: 6px; padding: 7px 10px; font-size: 11px; white-space: pre-wrap;
+    max-width: 340px; min-width: 140px; word-break: break-word; box-shadow: 0 4px 16px #0008;
+    pointer-events: none;
+  }
+  .err-tip:hover .err-msg { display: block; }
+  .reasons li { margin-top: 3px; }
+  .pnl-pos { color: var(--ok); }
+  .pnl-neg { color: var(--danger); }
+  .skipped-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin-top: 16px; }
+  .skipped-box li { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .unborn-bar { display:flex; align-items:center; gap:10px; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px 14px; margin-bottom:18px; flex-wrap:wrap; }
+  .unborn-bar label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .unborn-bar input[type=text], .unborn-bar input[type=number], .unborn-bar select {
+    background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px;
+    padding:4px 8px; font-size:12px; font-family:inherit; width:80px;
+  }
+  .unborn-bar input[type=text] { width:90px; }
+  .unborn-bar select { width:80px; }
+  #unborn-result { margin-left:6px; }
+  #unborn-chain { margin-top:12px; overflow-x:auto; }
+  #unborn-chain table { border-collapse:collapse; font-size:12px; width:100%; }
+  #unborn-chain th { background:var(--surface); color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.05em; padding:5px 10px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
+  #unborn-chain td { padding:5px 10px; border-bottom:1px solid var(--border); white-space:nowrap; color:var(--text); }
+  #spinner { display: none; font-size: 11px; color: var(--muted); margin-left: 10px; }
+  #spinner.active { display: inline; }
+  #error-bar { display: none; background: var(--danger-bg); color: var(--danger); padding: 8px 16px; font-size: 12px; border-bottom: 1px solid var(--danger); }
+</style>
+</head>
+<body>
+<div id="error-bar"></div>
+<header>
+  <h1>&#9660; Portfolio Eval</h1>
+  <div class="stat"><span class="stat-label">Total</span><span class="stat-value" id="h-total">—</span></div>
+  <div class="stat"><span class="stat-label">Flagged</span><span class="stat-value" id="h-flagged">—</span></div>
+  <div class="stat"><span class="stat-label">VIX</span><span class="stat-value" id="h-vix">—</span></div>
+  <div class="stat"><span class="stat-label">As of</span><span class="stat-value muted" id="h-time" style="font-size:12px">—</span></div>
+  <div class="actions">
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted)">
+      <input type="checkbox" id="collapse-ok" onchange="applyCollapseOk()" style="cursor:pointer;accent-color:var(--accent)">
+      Collapse OK
+    </label>
+    <span id="spinner">&#8635; refreshing…</span>
+    <button onclick="fetchData()">&#8635; Refresh</button>
+  </div>
+</header>
+<main>
+  <div class="unborn-bar">
+    <label for="ub-ticker">Ticker</label>
+    <input type="text" id="ub-ticker" placeholder="IBM" maxlength="10" style="text-transform:uppercase">
+    <label for="ub-qty">Qty</label>
+    <input type="number" id="ub-qty" placeholder="1" min="1" value="1" style="width:60px">
+    <label for="ub-strat">Strategy</label>
+    <select id="ub-strat">
+      <option value="CC" selected>CC</option>
+      <option value="CSP">CSP</option>
+    </select>
+    <button onclick="findUnborn()">Find</button>
+    <span id="unborn-result"></span>
+  </div>
+  <div id="unborn-chain"></div>
+  <div class="section-title">Open Positions</div>
+  <table id="pos-table">
+    <thead>
+      <tr>
+        <th onclick="sortTable(0)">Symbol</th>
+        <th onclick="sortTable(1)">Type</th>
+        <th onclick="sortTable(2)">Strike</th>
+        <th onclick="sortTable(3)">Expiry</th>
+        <th onclick="sortTable(4)">Side</th>
+        <th onclick="sortTable(5)">Qty</th>
+        <th onclick="sortTable(6)">DTE</th>
+        <th onclick="sortTable(7)">Δ</th>
+        <th onclick="sortTable(8)">U/L Price</th>
+        <th onclick="sortTable(9)">Opt Price</th>
+        <th onclick="sortTable(10)">PnL $</th>
+        <th onclick="sortTable(11)">PnL %</th>
+        <th>Status / Flags</th>
+        <th>Action<br><button onclick="resetRecommendations()" style="font-size:10px;padding:2px 7px;margin-top:4px;font-weight:normal">Reset</button></th>
+      </tr>
+    </thead>
+    <tbody id="pos-body"></tbody>
+  </table>
+  <div id="skipped-section"></div>
+</main>
+<script>
+let _data = [];
+let _sortCol = 3, _sortDir = 1;
+
+async function fetchData() {
+  document.getElementById('spinner').classList.add('active');
+  try {
+    const r = await fetch('/api/eval');
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    document.getElementById('error-bar').style.display = 'none';
+    applyData(d);
+  } catch(e) {
+    const bar = document.getElementById('error-bar');
+    bar.textContent = 'Refresh failed: ' + e.message;
+    bar.style.display = 'block';
+  } finally {
+    document.getElementById('spinner').classList.remove('active');
+  }
+}
+
+function applyData(d) {
+  _data = d.positions || [];
+  // Restore any server-cached analysis results so badges survive refresh
+  const serverRecs = d.cached_recommendations || {};
+  let changed = false;
+  for (const [key, val] of Object.entries(serverRecs)) {
+    if (!_recommendations[key] && val.recommendation) {
+      _recommendations[key] = {rec: val.recommendation};
+      changed = true;
+    }
+  }
+  if (changed) _saveRecs(_recommendations);
+  const fc = d.flagged_count || 0;
+  document.getElementById('h-total').textContent = d.total_count ?? _data.length;
+  const fEl = document.getElementById('h-flagged');
+  fEl.textContent = fc;
+  fEl.className = 'stat-value ' + (fc === 0 ? 'ok' : fc <= 3 ? 'warn' : 'danger');
+  const vix = d.vix;
+  const vEl = document.getElementById('h-vix');
+  if (vix != null) {
+    vEl.textContent = vix.toFixed(2);
+    vEl.className = 'stat-value ' + (vix < 20 ? 'ok' : vix < 30 ? 'warn' : 'danger');
+  } else {
+    vEl.textContent = 'N/A'; vEl.className = 'stat-value muted';
+  }
+  document.getElementById('h-time').textContent = (d.fetched_at || '').replace('T', ' ');
+  renderTable();
+  renderSkipped(d.skipped || []);
+}
+
+function fmt(v, digits, prefix='') {
+  return v == null ? '—' : prefix + v.toFixed(digits);
+}
+
+function renderTable() {
+  const rows = [..._data];
+  rows.sort((a, b) => {
+    const cols = [
+      r => r.symbol, r => r.option_type, r => parseFloat(r.strike||0),
+      r => r.expiry, r => (r.net_qty > 0 ? 'Short' : 'Long'),
+      r => Math.abs(r.net_qty||0), r => r.dte??999, r => r.delta??-99,
+      r => r.underlying??0, r => r.current_price??0,
+      r => r.abs_pnl??-999999, r => r.pct_pnl??-999999,
+    ];
+    const fn = cols[_sortCol] || (r => 0);
+    const av = fn(a), bv = fn(b);
+    return _sortDir * (av < bv ? -1 : av > bv ? 1 : 0);
+  });
+
+  const tbody = document.getElementById('pos-body');
+  tbody.innerHTML = '';
+  for (const p of rows) {
+    const flagged = p.flagged;
+    const nFlags  = (p.reasons||[]).length;
+    const rowCls  = flagged ? (nFlags >= 3 ? 'danger-row' : 'warn-row') : 'ok-row';
+    const badge   = flagged
+      ? (nFlags >= 3
+          ? '<span class="badge badge-danger">&#9888; ' + nFlags + ' flags</span>'
+          : '<span class="badge badge-warn">&#9888; ' + nFlags + ' flag' + (nFlags>1?'s':'') + '</span>')
+      : '<span class="badge badge-ok">&#10003; OK</span>';
+
+    const side = (p.net_qty||0) > 0 ? 'Short' : 'Long';
+    const qty  = Math.abs(p.net_qty||0);
+    const pnlAbs = p.abs_pnl;
+    const pnlPct = p.pct_pnl;
+    const pnlAbsStr = pnlAbs == null ? '—'
+      : '<span class="' + (pnlAbs>=0?'pnl-pos':'pnl-neg') + '">'
+        + (pnlAbs>=0?'+':'') + '$' + pnlAbs.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',') + '</span>';
+    const pnlPctStr = pnlPct == null ? '—'
+      : '<span class="' + (pnlPct>=0?'pnl-pos':'pnl-neg') + '">'
+        + (pnlPct>=0?'+':'') + pnlPct.toFixed(1) + '%</span>';
+
+    const reasons = (p.reasons||[]).length === 0 ? '' :
+      '<ul class="reasons">' + p.reasons.map(r => '<li>' + esc(r) + '</li>').join('') + '</ul>';
+
+    const posKey = [p.symbol, p.option_type, String(p.strike||''), p.expiry||''].join('|');
+    const cached = _recommendations[posKey];
+    const actionCell = cached
+      ? recBadge(cached.rec, posKey, cached.chainCash)
+      : `<button onclick="analyzePosition('${posKey.replace(/'/g,"\\'")}', this)" style="font-size:11px;padding:4px 10px">Analyze</button>`;
+    const actionTdAttr = ` data-poskey="${posKey.replace(/"/g,'&quot;')}"`;
+
+
+    const tr = document.createElement('tr');
+    tr.className = rowCls;
+    tr.innerHTML = `
+      <td><b>${esc(p.symbol)}</b></td>
+      <td>${esc((p.option_type||'').toUpperCase())}</td>
+      <td>$${parseFloat(p.strike||0).toFixed(2)}</td>
+      <td>${esc(p.expiry||'')}</td>
+      <td>${side}</td>
+      <td>${qty}</td>
+      <td>${p.dte??'—'}</td>
+      <td>${p.delta!=null ? (p.delta>=0?'+':'')+p.delta.toFixed(3) : '—'}</td>
+      <td>${p.underlying!=null ? '$'+p.underlying.toFixed(2) : '—'}</td>
+      <td>${p.current_price!=null ? '$'+p.current_price.toFixed(2) : '—'}</td>
+      <td>${pnlAbsStr}</td>
+      <td>${pnlPctStr}</td>
+      <td>${badge}${reasons}</td>
+      <td${actionTdAttr}>${actionCell}</td>`;
+    tbody.appendChild(tr);
+  }
+  applyCollapseOk();
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function renderSkipped(skipped) {
+  const el = document.getElementById('skipped-section');
+  if (!skipped.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="section-title" style="margin-top:24px">Skipped</div>'
+    + '<div class="skipped-box"><ul>'
+    + skipped.map(s => '<li>' + esc(s) + '</li>').join('')
+    + '</ul></div>';
+}
+
+function applyCollapseOk() {
+  const hide = document.getElementById('collapse-ok').checked;
+  document.querySelectorAll('#pos-body tr.ok-row').forEach(tr => {
+    tr.style.display = hide ? 'none' : '';
+  });
+}
+
+// Persist recommendations across browser refreshes via localStorage
+const _LS_KEY = 'optionsRecs';
+function _loadRecs() {
+  try { return JSON.parse(localStorage.getItem(_LS_KEY) || '{}'); } catch { return {}; }
+}
+function _saveRecs(recs) {
+  try { localStorage.setItem(_LS_KEY, JSON.stringify(recs)); } catch {}
+}
+const _recommendations = _loadRecs(); // posKey -> {rec}
+
+// Proposed trades accumulator — persists across bounces/refreshes via localStorage
+const _LS_UNBORN = 'optionsUnborn';
+function _loadUnborn() { try { return JSON.parse(localStorage.getItem(_LS_UNBORN) || '{}'); } catch { return {}; } }
+function _saveUnborn(rows) { try { localStorage.setItem(_LS_UNBORN, JSON.stringify(rows)); } catch {} }
+const _unbornRows = _loadUnborn(); // key: "TICKER|STRAT" -> row object
+
+function _renderUnbornTable() {
+  const el = document.getElementById('unborn-chain');
+  const keys = Object.keys(_unbornRows).sort();
+  if (!keys.length) { el.innerHTML = ''; return; }
+  const fv = (v, d, p='') => v == null ? '—' : p + parseFloat(v).toFixed(d);
+  const rows = keys.map(k => {
+    const c = _unbornRows[k];
+    const qty = c._qty || 1;
+    const detailHref = c._ubKey ? `/unborn/${c._ubKey}` : null;
+    const symCell = detailHref
+      ? `<a href="${detailHref}" target="_blank" style="color:var(--accent);text-decoration:none"><b>${esc(c.symbol)}</b></a>`
+      : `<b>${esc(c.symbol)}</b>`;
+    return `<tr>
+      <td>${symCell}</td>
+      <td>${esc((c.option_type||'').toUpperCase())}</td>
+      <td>${fv(c.strike,2,'$')}</td>
+      <td>${esc(c.expiry||'—')}</td>
+      <td>${esc(c.side||'Short')}</td>
+      <td>${qty}</td>
+      <td>${c.dte??'—'}</td>
+      <td>${c.delta!=null?(c.delta>=0?'+':'')+parseFloat(c.delta).toFixed(3):'—'}</td>
+      <td>${fv(c.ul_price,2,'$')}</td>
+      <td>${fv(c.opt_price,2,'$')}</td>
+      <td style="color:var(--muted);font-size:11px;white-space:normal;max-width:130px">${esc(c.ideal_entry||'—')}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<table>
+    <thead><tr>
+      <th>Symbol</th><th>Type</th><th>Strike</th><th>Expiry</th>
+      <th>Side</th><th>Qty</th><th>DTE</th><th>Δ</th>
+      <th>U/L Price</th><th>Opt Price</th><th>Ideal Entry</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+// Render any persisted unborn rows on page load
+_renderUnbornTable();
+
+function recBadge(rec, key, chainCash) {
+  const cls = rec === 'ROLL' ? 'warn' : rec === 'ASSIGNMENT' ? 'danger' : 'ok';
+  const label = rec === 'HOLD' ? 'HOLD' : rec;
+  const cashLine = (rec === 'ROLL' && chainCash != null)
+    ? `<div style="font-size:10px;margin-top:3px;color:var(--${chainCash >= 0 ? 'ok' : 'danger'})">`
+      + `Net chain: ${chainCash >= 0 ? '+' : ''}$${chainCash.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}</div>`
+    : '';
+  return `<div style="display:inline-block;text-align:center">
+    <a href="/analyze/${encodeURIComponent(key)}" target="_blank"
+      class="badge badge-${cls}" style="text-decoration:none;cursor:pointer">${label}</a>${cashLine}
+  </div>`;
+}
+
+function _actionCell(key) {
+  return document.querySelector(`[data-poskey]`) &&
+    [...document.querySelectorAll('[data-poskey]')].find(el => el.dataset.poskey === key);
+}
+
+async function analyzePosition(key, btn) {
+  btn.disabled = true;
+  btn.textContent = '⟳ Analyzing…';
+  console.log('[analyze] starting:', key);
+  try {
+    let d;
+    // Poll until the server finishes (handles concurrent in-progress queries)
+    while (true) {
+      const r = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({position_key: key})
+      });
+      let raw;
+      try {
+        raw = await r.text();
+        d = JSON.parse(raw);
+      } catch(parseErr) {
+        throw new Error('Server returned non-JSON: ' + raw.slice(0, 200));
+      }
+      if (r.status === 202 && d.status === 'in_progress') {
+        await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
+        continue;
+      }
+      break;
+    }
+    console.log('[analyze] result:', d);
+    if (d.error) throw new Error(d.error);
+    _recommendations[key] = {rec: d.recommendation, chainCash: d.chain_cash ?? null};
+    _saveRecs(_recommendations);
+    const cell = _actionCell(key);
+    if (cell) cell.innerHTML = recBadge(d.recommendation, key, d.chain_cash ?? null);
+  } catch(e) {
+    console.error('[analyze] error for', key, ':', e.message);
+    const cell = _actionCell(key);
+    if (cell) {
+      cell.innerHTML = `<span class="err-tip" style="color:var(--danger);font-size:11px">&#9888; Error<span class="err-msg">${esc(e.message)}</span></span>
+        <button onclick="analyzePosition('${key.replace(/'/g,"\\'")}', this)" style="font-size:10px;padding:2px 6px;margin-left:4px">Retry</button>`;
+    } else {
+      btn.disabled = false;
+      btn.textContent = 'Retry';
+      btn.title = e.message;
+      btn.style.color = 'var(--danger)';
+    }
+  }
+}
+
+async function findUnborn() {
+  const ticker   = document.getElementById('ub-ticker').value.trim().toUpperCase();
+  const qty      = parseInt(document.getElementById('ub-qty').value) || 1;
+  const strat    = document.getElementById('ub-strat').value;
+  const resultEl = document.getElementById('unborn-result');
+  if (!ticker) { resultEl.innerHTML = '<span style="color:var(--danger);font-size:12px">Enter a ticker.</span>'; return; }
+
+  resultEl.innerHTML = '<span style="color:var(--muted);font-size:12px">⟳ Analyzing…</span>';
+  try {
+    const r = await fetch('/api/unborn', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ticker, qty, strat})
+    });
+    let raw, d;
+    try { raw = await r.text(); d = JSON.parse(raw); }
+    catch { throw new Error('Server returned non-JSON: ' + (raw||'').slice(0,200)); }
+    if (d.error) throw new Error(d.error);
+
+    // Recommendation badge
+    const cls   = d.recommendation === 'ROLL' ? 'warn' : d.recommendation === 'ASSIGNMENT' ? 'danger' : 'ok';
+    const ubKey = encodeURIComponent(ticker + '|' + strat + '|' + qty);
+    resultEl.innerHTML = `<a href="/unborn/${ubKey}" target="_blank"
+      class="badge badge-${cls}" style="text-decoration:none;cursor:pointer;font-size:12px;padding:4px 10px">
+      Details</a>`;
+
+    // Accumulate proposed trades — add/update this ticker|strat entry, keep others
+    const chain = d.chain || [];
+    if (chain.length) {
+      const row = Object.assign({}, chain[0], {_qty: qty, _ubKey: ubKey});
+      _unbornRows[ticker + '|' + strat] = row;
+      _saveUnborn(_unbornRows);
+      _renderUnbornTable();
+      // Clear inputs after successful display
+      document.getElementById('ub-ticker').value = '';
+      document.getElementById('ub-qty').value = '1';
+      document.getElementById('ub-strat').value = 'CC';
+      resultEl.innerHTML = '';
+    }
+  } catch(e) {
+    resultEl.innerHTML = `<span class="err-tip" style="color:var(--danger);font-size:12px">&#9888; Error<span class="err-msg">${esc(e.message)}</span></span>`;
+  }
+}
+
+function resetRecommendations() {
+  if (!confirm('Reset all action statuses back to Analyze?')) return;
+  Object.keys(_recommendations).forEach(k => delete _recommendations[k]);
+  _saveRecs({});
+  renderTable();
+}
+
+function sortTable(col) {
+  const ths = document.querySelectorAll('th');
+  ths.forEach(th => th.classList.remove('sorted-asc','sorted-desc'));
+  if (_sortCol === col) { _sortDir *= -1; }
+  else { _sortCol = col; _sortDir = 1; }
+  ths[col].classList.add(_sortDir === 1 ? 'sorted-asc' : 'sorted-desc');
+  renderTable();
+}
+
+// Sort by expiry by default (col 5, ascending)
+document.querySelectorAll('th')[3].classList.add('sorted-asc');
+fetchData();
+</script>
+</body>
+</html>"""
+
+
+def run_web_dashboard(token: str, account_id: str) -> None:
+    """Start a Flask web dashboard showing all open positions with live data."""
+    setup_logging()
+
+    try:
+        from flask import Flask, Response, request as flask_request
+    except ImportError:
+        log.error("Flask is required for --web mode. Install with: pip install flask")
+        sys.exit(1)
+
+    import html as html_mod
+    import json
+    import urllib.parse
+    import webbrowser
+    import threading
+
+    app = Flask(__name__)
+    app.config["JSON_SORT_KEYS"] = False
+
+    # In-memory cache: posKey -> {recommendation, text, ticker, error}
+    _analysis_cache:    dict[str, dict] = {}   # posKey -> result
+    _analysis_inflight: set[str]        = set() # posKeys currently being queried
+    _cache_lock = threading.Lock()
+
+    def _serial(obj):
+        if obj is None:
+            return None
+        raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
+
+    @app.route("/")
+    def index():
+        return Response(_WEB_DASHBOARD_HTML, mimetype="text/html")
+
+    @app.route("/api/eval")
+    def api_eval():
+        data = get_eval_data(token, account_id, ticker=None, verbose=False)
+        # Include server-side analysis cache so the client can restore
+        # recommendation badges after a manual refresh
+        with _cache_lock:
+            data["cached_recommendations"] = {
+                k: {"recommendation": v.get("recommendation"), "error": v.get("error")}
+                for k, v in _analysis_cache.items()
+                if not v.get("error")
+            }
+        return Response(json.dumps(data, default=_serial), mimetype="application/json")
+
+    @app.route("/api/analyze", methods=["POST"])
+    def api_analyze():
+        body = flask_request.get_json(force=True, silent=True) or {}
+        pos_key = body.get("position_key", "")
+        if not pos_key:
+            return Response(json.dumps({"error": "Missing position_key"}), status=400, mimetype="application/json")
+
+        with _cache_lock:
+            # Already have a result — return it immediately
+            if pos_key in _analysis_cache:
+                return Response(json.dumps(_analysis_cache[pos_key]), mimetype="application/json")
+            # Already running — tell the client to retry
+            if pos_key in _analysis_inflight:
+                return Response(
+                    json.dumps({"status": "in_progress", "retry_after": 5}),
+                    status=202, mimetype="application/json",
+                )
+            _analysis_inflight.add(pos_key)
+
+        # Parse key: symbol|option_type|strike|expiry
+        parts = pos_key.split("|")
+        if len(parts) != 4:
+            return Response(json.dumps({"error": f"Bad position_key: {pos_key}"}), status=400, mimetype="application/json")
+        sym, opt_type, strike_str, expiry = parts
+        ticker = sym.upper()
+
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            return Response(
+                json.dumps({"error": "NOTEBOOKLM_NOTEBOOK_ID not set"}),
+                status=500, mimetype="application/json",
+            )
+
+        # Re-fetch the token (may have expired) and get open positions for this ticker
+        try:
+            secret = os.environ.get("PUBLIC_API_SECRET", "")
+            fresh_token = get_access_token(secret)
+            fresh_account_id = get_account_id(fresh_token)
+            open_positions = get_all_open_positions(ticker)
+        except Exception as exc:
+            with _cache_lock:
+                _analysis_inflight.discard(pos_key)
+            return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
+
+        log.info("[web] Running ROLL analysis for %s (%s %s exp %s)", ticker, opt_type, strike_str, expiry)
+        try:
+            result = asyncio.run(
+                run_roll_for_position(fresh_token, fresh_account_id, ticker, open_positions, notebook_id, pos_key=pos_key)
+            )
+            if result.get("error"):
+                log.error("[web] Analysis error for %s: %s", ticker, result["error"])
+            else:
+                log.info("[web] Analysis complete for %s → %s", ticker, result.get("recommendation"))
+        except Exception as exc:
+            log.exception("[web] Unhandled exception for %s", ticker)
+            result = {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker}
+        finally:
+            with _cache_lock:
+                _analysis_inflight.discard(pos_key)
+
+        with _cache_lock:
+            _analysis_cache[pos_key] = result
+        return Response(json.dumps(result, default=_serial), mimetype="application/json")
+
+    # ── Unborn routes ──────────────────────────────────────────────────────────
+    _unborn_cache: dict[str, dict] = {}   # "{TICKER}|{STRAT}|{QTY}" -> result
+    _unborn_inflight: set[str] = set()
+
+    @app.route("/api/unborn", methods=["POST"])
+    def api_unborn():
+        body   = flask_request.get_json(force=True, silent=True) or {}
+        ticker = body.get("ticker", "").upper().strip()
+        qty    = int(body.get("qty") or 1)
+        strat  = body.get("strat", "CC").upper()
+        if not ticker:
+            return Response(json.dumps({"error": "Missing ticker"}), status=400, mimetype="application/json")
+        if strat not in ("CC", "CSP"):
+            return Response(json.dumps({"error": f"Unknown strat: {strat}"}), status=400, mimetype="application/json")
+
+        ub_key = f"{ticker}|{strat}|{qty}"
+
+        with _cache_lock:
+            if ub_key in _unborn_cache:
+                return Response(json.dumps(_unborn_cache[ub_key]), mimetype="application/json")
+            if ub_key in _unborn_inflight:
+                return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                                status=202, mimetype="application/json")
+            _unborn_inflight.add(ub_key)
+
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            with _cache_lock: _unborn_inflight.discard(ub_key)
+            return Response(json.dumps({"error": "NOTEBOOKLM_NOTEBOOK_ID not set"}),
+                            status=500, mimetype="application/json")
+
+        try:
+            secret = os.environ.get("PUBLIC_API_SECRET", "")
+            fresh_token = get_access_token(secret)
+            fresh_account_id = get_account_id(fresh_token)
+        except Exception as exc:
+            with _cache_lock: _unborn_inflight.discard(ub_key)
+            return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
+
+        log.info("[unborn] Running %s analysis for %s qty=%d", strat, ticker, qty)
+        try:
+            result = asyncio.run(
+                run_unborn_for_ticker(fresh_token, fresh_account_id, ticker, qty, strat, notebook_id)
+            )
+            if result.get("error"):
+                log.error("[unborn] Error for %s: %s", ticker, result["error"])
+            else:
+                log.info("[unborn] %s → %s", ticker, result.get("recommendation"))
+        except Exception as exc:
+            log.exception("[unborn] Unhandled exception for %s", ticker)
+            result = {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat}
+        finally:
+            with _cache_lock:
+                _unborn_inflight.discard(ub_key)
+
+        with _cache_lock:
+            _unborn_cache[ub_key] = result
+        return Response(json.dumps(result, default=_serial), mimetype="application/json")
+
+    @app.route("/unborn/<path:ub_key>")
+    def unborn_detail(ub_key: str):
+        ub_key = urllib.parse.unquote(ub_key)
+        cached = _unborn_cache.get(ub_key)
+        parts  = ub_key.split("|")   # TICKER|STRAT|QTY
+        title_str = html_mod.escape(" · ".join(parts))
+
+        if not cached:
+            body_html = "<p style='color:var(--muted)'>Analysis not found. Click <b>Find</b> first.</p>"
+        elif cached.get("error"):
+            body_html = f"<p style='color:var(--danger)'>Error: {html_mod.escape(cached['error'])}</p>"
+        else:
+            rec      = cached.get("recommendation", "")
+            text     = cached.get("text", "")
+            rec_cls  = {"ROLL": "warn", "ASSIGNMENT": "danger", "HOLD": "ok"}.get(rec, "ok")
+            lines_out = []
+            for ln in text.splitlines():
+                ln_esc = html_mod.escape(ln)
+                if ln_esc.startswith("## "):   lines_out.append(f"<h2>{ln_esc[3:]}</h2>")
+                elif ln_esc.startswith("# "): lines_out.append(f"<h1>{ln_esc[2:]}</h1>")
+                elif ln_esc.startswith("- ") or ln_esc.startswith("• "): lines_out.append(f"<li>{ln_esc[2:]}</li>")
+                elif ln_esc.strip() == "":    lines_out.append("<br>")
+                else:
+                    ln_esc = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', ln_esc)
+                    lines_out.append(f"<p>{ln_esc}</p>")
+            body_html = (
+                f'<div style="margin-bottom:16px">'
+                f'<span class="badge badge-{rec_cls}" style="font-size:15px;padding:6px 16px">{html_mod.escape(rec)}</span>'
+                f'</div>'
+                f'<div class="rec-body">{"".join(lines_out)}</div>'
+            )
+
+        page = f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title_str} — Unborn</title>
+<style>
+  :root{{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3a;--text:#e2e8f0;--muted:#8892a4;
+    --accent:#4f8ef7;--ok:#22c55e;--warn:#f59e0b;--danger:#ef4444;
+    --ok-bg:#052e16;--warn-bg:#451a03;--danger-bg:#450a0a}}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:var(--bg);color:var(--text);font-family:'SF Mono','Fira Code',monospace;font-size:13px;line-height:1.6;padding:24px}}
+  header{{display:flex;align-items:center;gap:16px;margin-bottom:24px;flex-wrap:wrap}}
+  header h1{{font-size:15px;font-weight:600;color:var(--accent)}}
+  .pos-label{{color:var(--muted);font-size:12px}}
+  a.back{{color:var(--accent);text-decoration:none;font-size:12px}}
+  a.back:hover{{text-decoration:underline}}
+  .badge{{display:inline-block;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:600;letter-spacing:.05em}}
+  .badge-ok{{background:var(--ok-bg);color:var(--ok)}}
+  .badge-warn{{background:var(--warn-bg);color:var(--warn)}}
+  .badge-danger{{background:var(--danger-bg);color:var(--danger)}}
+  .rec-body h1,.rec-body h2{{color:var(--accent);margin:16px 0 6px;font-size:14px}}
+  .rec-body p{{margin:4px 0;max-width:860px}}
+  .rec-body li{{margin:2px 0 2px 20px;max-width:860px}}
+  .rec-body strong{{color:var(--text)}}
+  .rec-body br{{display:block;margin:6px 0;content:""}}
+</style></head><body>
+<header>
+  <a class="back" href="/" onclick="window.close();return false;">&#8592; Back</a>
+  <h1>&#9660; Unborn Analysis</h1>
+  <span class="pos-label">{title_str}</span>
+</header>
+{body_html}
+</body></html>"""
+        return Response(page, mimetype="text/html")
+
+    @app.route("/analyze/<path:pos_key>")
+    def analyze_detail(pos_key: str):
+        pos_key = urllib.parse.unquote(pos_key)
+        cached  = _analysis_cache.get(pos_key)
+
+        parts = pos_key.split("|")
+        title_str = " · ".join(parts) if parts else pos_key
+
+        if not cached:
+            body_html = (
+                "<p style='color:var(--muted)'>Analysis not found. "
+                "Click <b>Analyze</b> on the dashboard first.</p>"
+            )
+            rec = ""
+        elif cached.get("error"):
+            body_html = f"<p style='color:var(--danger)'>Error: {html_mod.escape(cached['error'])}</p>"
+            rec = ""
+        else:
+            rec  = cached.get("recommendation", "")
+            text = cached.get("text", "")
+            rec_cls = {"ROLL": "warn", "ASSIGNMENT": "danger", "HOLD": "ok"}.get(rec, "ok")
+            # Convert markdown-ish text to simple HTML
+            lines_out = []
+            for ln in text.splitlines():
+                ln_esc = html_mod.escape(ln)
+                if ln_esc.startswith("## "):
+                    lines_out.append(f"<h2>{ln_esc[3:]}</h2>")
+                elif ln_esc.startswith("# "):
+                    lines_out.append(f"<h1>{ln_esc[2:]}</h1>")
+                elif ln_esc.startswith("**") and ln_esc.endswith("**"):
+                    lines_out.append(f"<p><strong>{ln_esc[2:-2]}</strong></p>")
+                elif ln_esc.startswith("- ") or ln_esc.startswith("• "):
+                    lines_out.append(f"<li>{ln_esc[2:]}</li>")
+                elif ln_esc.strip() == "":
+                    lines_out.append("<br>")
+                else:
+                    # Bold inline **text**
+                    ln_esc = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', ln_esc)
+                    lines_out.append(f"<p>{ln_esc}</p>")
+            # Net Chain Cash PnL footer
+            chain_cash    = cached.get("chain_cash")
+            collected     = cached.get("chain_collected")
+            paid          = cached.get("chain_paid")
+            n_pos         = cached.get("chain_positions")
+            pos_avg_price = cached.get("pos_avg_price")
+            pos_qty       = cached.get("pos_qty")
+
+            if chain_cash is not None and collected is not None and paid is not None:
+                pos_lbl = f"{n_pos} position{'s' if n_pos != 1 else ''}" if n_pos else "positions"
+
+                has_pos = pos_avg_price is not None and pos_qty is not None and pos_qty > 0
+
+                if rec == "ROLL" and has_pos:
+                    # ROLL: close current leg at 40% of premium before rolling (keep 60%)
+                    buy_back_cost = round(pos_avg_price * 0.40 * 100 * pos_qty, 2)
+                    expected_pnl  = round(pos_avg_price * 0.60 * 100 * pos_qty, 2)
+                    final_pnl     = round(chain_cash - buy_back_cost, 2)
+                    final_sign    = "+" if final_pnl >= 0 else ""
+                    final_clr     = "var(--ok)" if final_pnl >= 0 else "var(--danger)"
+                    working = (
+                        f"${collected:,.2f} collected "
+                        f"− ${paid:,.2f} paid "
+                        f"− ${buy_back_cost:,.2f} close at 40% "
+                        f"(${pos_avg_price:.2f} x 0.40 x 100 x {pos_qty} contracts) "
+                        f"= <strong style='color:{final_clr}'>{final_sign}${final_pnl:,.2f}</strong>"
+                    )
+                    exp_note = f". Expected PnL if closed today: +${expected_pnl:,.2f}"
+
+                elif rec == "HOLD" and has_pos:
+                    # HOLD: position expected to expire worthless — keep full remaining premium
+                    remaining     = round(pos_avg_price * 100 * pos_qty, 2)
+                    final_pnl     = round(chain_cash, 2)   # chain_cash already includes open premium
+                    final_sign    = "+" if final_pnl >= 0 else ""
+                    final_clr     = "var(--ok)" if final_pnl >= 0 else "var(--danger)"
+                    working = (
+                        f"${collected:,.2f} collected "
+                        f"− ${paid:,.2f} paid "
+                        f"(${remaining:,.2f} remaining if expires worthless: "
+                        f"${pos_avg_price:.2f} x 100 x {pos_qty} contracts) "
+                        f"= <strong style='color:{final_clr}'>{final_sign}${final_pnl:,.2f}</strong>"
+                    )
+                    exp_note = ""
+
+                else:
+                    # No position data or ASSIGNMENT — show raw chain cash
+                    sign    = "+" if chain_cash >= 0 else ""
+                    clr     = "var(--ok)" if chain_cash >= 0 else "var(--danger)"
+                    working = (
+                        f"${collected:,.2f} collected "
+                        f"− ${paid:,.2f} paid "
+                        f"= <strong style='color:{clr}'>{sign}${chain_cash:,.2f}</strong>"
+                    )
+                    exp_note = ""
+
+                chain_html = (
+                    f'<div class="chain-pnl">'
+                    f'<span class="chain-label">Net Chain Cash PnL &nbsp;<span style="font-weight:normal;color:var(--muted)">({pos_lbl})</span></span>'
+                    f'<span class="chain-working">Working: {working}{html_mod.escape(exp_note)}</span>'
+                    + f'</div>'
+                )
+            else:
+                chain_html = ""
+
+            body_html = (
+                f'<div style="margin-bottom:16px">'
+                f'<span class="badge badge-{rec_cls}" style="font-size:15px;padding:6px 16px">{html_mod.escape(rec)}</span>'
+                f'</div>'
+                f'<div class="rec-body">{"".join(lines_out)}</div>'
+                f'{chain_html}'
+            )
+
+        page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html_mod.escape(title_str)} — Recommendation</title>
+<style>
+  :root {{
+    --bg:#0f1117;--surface:#1a1d27;--border:#2a2d3a;
+    --text:#e2e8f0;--muted:#8892a4;--accent:#4f8ef7;
+    --ok:#22c55e;--warn:#f59e0b;--danger:#ef4444;
+    --ok-bg:#052e16;--warn-bg:#451a03;--danger-bg:#450a0a;
+  }}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:var(--bg);color:var(--text);font-family:'SF Mono','Fira Code',monospace;font-size:13px;line-height:1.6;padding:24px}}
+  header{{display:flex;align-items:center;gap:16px;margin-bottom:24px;flex-wrap:wrap}}
+  header h1{{font-size:15px;font-weight:600;color:var(--accent)}}
+  .pos-label{{color:var(--muted);font-size:12px}}
+  a.back{{color:var(--accent);text-decoration:none;font-size:12px}}
+  a.back:hover{{text-decoration:underline}}
+  .badge{{display:inline-block;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:600;letter-spacing:.05em}}
+  .badge-ok{{background:var(--ok-bg);color:var(--ok)}}
+  .badge-warn{{background:var(--warn-bg);color:var(--warn)}}
+  .badge-danger{{background:var(--danger-bg);color:var(--danger)}}
+  .rec-body h1,.rec-body h2{{color:var(--accent);margin:16px 0 6px;font-size:14px}}
+  .rec-body p{{margin:4px 0;max-width:860px}}
+  .rec-body li{{margin:2px 0 2px 20px;max-width:860px}}
+  .rec-body strong{{color:var(--text)}}
+  .rec-body br{{display:block;margin:6px 0;content:""}}
+  .chain-pnl{{margin-top:28px;padding:14px 18px;background:var(--surface);border:1px solid var(--border);border-radius:8px;max-width:860px}}
+  .chain-label{{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px}}
+  .chain-working{{font-size:13px;color:var(--text)}}
+</style>
+</head>
+<body>
+<header>
+  <a class="back" href="/" onclick="window.close();return false;">&#8592; Back</a>
+  <h1>&#9660; Recommendation</h1>
+  <span class="pos-label">{html_mod.escape(title_str)}</span>
+</header>
+{body_html}
+</body>
+</html>"""
+        return Response(page, mimetype="text/html")
+
+    port = 5051
+    url  = f"http://127.0.0.1:{port}"
+    log.info("Starting portfolio dashboard at %s", url)
+    print(f"\nStarting portfolio dashboard at {url}")
+    print("Press Ctrl+C to stop.\n")
+
+    def _open_browser():
+        import time
+        time.sleep(0.8)
+        webbrowser.open(url)
+
+    import signal
+
+    def _sigterm_handler(signum, frame):
+        log.warning("SIGTERM received — restarting server...")
+        print("\nSIGTERM received — bouncing server...", flush=True)
+        # Spawn a lightweight detached process (close_fds=True so it does NOT
+        # inherit the Flask socket) that waits for us to release the port, then
+        # starts a fresh server. Parent exits immediately via os._exit().
+        import subprocess
+        cmd = (
+            f"import time, os, sys; "
+            f"time.sleep(1.5); "
+            f"os.execv({sys.executable!r}, {[sys.executable] + sys.argv!r})"
+        )
+        subprocess.Popen(
+            [sys.executable, "-c", cmd],
+            close_fds=True,
+            start_new_session=True,
+        )
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    threading.Thread(target=_open_browser, daemon=True).start()
+    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False, threaded=True)
 
 
 def format_position(pos: dict) -> str:
@@ -880,8 +2371,67 @@ def print_key_dates(ticker: str, dates: dict) -> None:
     print_box(lines, title=f"  {ticker} — Key Dates  ")
 
 
+async def _purge_stale_ticker_sources(client, notebook_id: str, uploading_ticker: str | None = None) -> None:
+    """
+    Delete notebook sources that look like ticker CSV uploads when either:
+      • The stem matches ``uploading_ticker`` exactly (always delete before re-upload), OR
+      • The source is ≥1 day old (routine age-based cleanup).
+
+    A "ticker source" is identified by:
+      • filename stem (left of the first '.') is all-uppercase
+      • filename stem is 1–5 characters long   (e.g. IBM, CLX, AAPL)
+    """
+    import datetime
+
+    now    = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(days=1)
+    target = (uploading_ticker or "").upper()
+
+    try:
+        sources = await client.sources.list(notebook_id)
+    except Exception as exc:
+        log.warning("[cleanup] Could not list sources: %s", exc)
+        return
+
+    for source in sources:
+        title = source.title or ""
+        stem  = title.split(".")[0]          # filename left of first '.'
+
+        if not (1 <= len(stem) <= 5):
+            continue
+        if not stem.isupper():
+            continue
+
+        # Always remove if this is the ticker we're about to upload
+        if target and stem == target:
+            try:
+                await client.sources.delete(notebook_id, source.id)
+                log.info("[cleanup] Replaced existing source: %r", title)
+            except Exception as exc:
+                log.error("[cleanup] Failed to delete %r: %s", title, exc)
+            continue
+
+        # Also remove any other ticker source that's gone stale (≥1 day old)
+        created_at = source.created_at
+        if created_at is None:
+            continue
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+        if created_at > cutoff:
+            continue                         # less than 1 day old — keep it
+
+        try:
+            await client.sources.delete(notebook_id, source.id)
+            log.info("[cleanup] Removed old source: %r (uploaded %s)", title, created_at.date())
+        except Exception as exc:
+            log.error("[cleanup] Failed to delete %r: %s", title, exc)
+
+
 async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
-    """Upload a file as a new source to the specified NotebookLM notebook."""
+    """Upload a file as a new source to the specified NotebookLM notebook.
+    Stale ticker CSV sources (≥1 day old, ALL-CAPS stem, 1–5 chars) are
+    removed first to keep the notebook tidy.
+    """
     try:
         from notebooklm import NotebookLMClient
     except ImportError:
@@ -894,11 +2444,17 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
         )
         sys.exit(1)
 
-    print(f"\nUploading {file_path} to NotebookLM notebook {notebook_id} ...")
+    # Extract ticker from the filename stem (e.g. "IBM.csv" → "IBM")
+    base = os.path.basename(file_path)
+    stem = base.split(".")[0].upper()
+    uploading_ticker = stem if (1 <= len(stem) <= 5 and stem.isupper()) else None
+
+    log.info("Uploading %s to NotebookLM notebook %s ...", file_path, notebook_id)
     try:
         async with NotebookLMClient.from_storage() as client:
+            await _purge_stale_ticker_sources(client, notebook_id, uploading_ticker)
             await client.sources.add_file(notebook_id, file_path, wait=True)
-        print("Upload complete.")
+        log.info("Upload complete: %s", os.path.basename(file_path))
     except Exception as exc:
         print(f"ERROR: Upload failed — {exc}", file=sys.stderr)
         sys.exit(1)
@@ -1047,7 +2603,8 @@ async def query_notebooklm(
     dates: dict,
     positions: list[dict] | None = None,
     vix: float | None = None,
-) -> None:
+    silent: bool = False,
+) -> str | None:
     """Ask NotebookLM for the best CC or CSP choice given the ticker source."""
     try:
         from notebooklm import NotebookLMClient
@@ -1111,34 +2668,49 @@ async def query_notebooklm(
             f"Note that {earnings_note} and {exdiv_note}."
         )
 
-    print(f"\nQuerying NotebookLM...")
+    if not silent:
+        print(f"\nQuerying NotebookLM...")
 
     try:
         async with NotebookLMClient.from_storage() as client:
             result = await client.chat.ask(notebook_id, question)
     except Exception as exc:
-        print(f"ERROR: Query failed — {exc}", file=sys.stderr)
-        sys.exit(1)
+        if not silent:
+            print(f"ERROR: Query failed — {exc}", file=sys.stderr)
+            sys.exit(1)
+        return None
 
     answer = getattr(result, "answer", None) or str(result)
+    # Strip LaTeX / math notation that NotebookLM sometimes emits
+    answer = re.sub(r'\\times', ' x ', answer)          # \times → x
+    answer = re.sub(r'\\cdot', ' x ', answer)            # \cdot → x
+    answer = re.sub(r'\\text\{([^}]*)\}', r'\1', answer) # \text{foo} → foo
+    answer = re.sub(r'\$([^$]+)\$', r'\1', answer)       # $...$ inline math → content
+    answer = re.sub(r'\\\$', '$', answer)                 # \$ → $
+    answer = re.sub(r'\\%', '%', answer)                  # \% → %
+    answer = re.sub(r'\\ ', ' ', answer)                  # \ (escaped space) → space
+    answer = re.sub(r'\\,', ' ', answer)                  # \, (thin space) → space
 
-    inner = COL_WIDTH - 2
-    output_lines = _markdown_to_lines(answer, inner_width=inner)
+    if not silent:
+        inner = COL_WIDTH - 2
+        output_lines = _markdown_to_lines(answer, inner_width=inner)
 
-    # Prepend ticker to the first non-empty, non-heading line
-    for idx, line in enumerate(output_lines):
-        if line.strip() and not line.startswith("-"):
-            output_lines[idx] = f"{ticker}: {line}"
-            break
+        # Prepend ticker to the first non-empty, non-heading line
+        for idx, line in enumerate(output_lines):
+            if line.strip() and not line.startswith("-"):
+                output_lines[idx] = f"{ticker}: {line}"
+                break
 
-    # Trim leading/trailing blank lines
-    while output_lines and not output_lines[0].strip():
-        output_lines.pop(0)
-    while output_lines and not output_lines[-1].strip():
-        output_lines.pop()
+        # Trim leading/trailing blank lines
+        while output_lines and not output_lines[0].strip():
+            output_lines.pop(0)
+        while output_lines and not output_lines[-1].strip():
+            output_lines.pop()
 
-    title = f"  {ticker} — {strat_label} Recommendation  "
-    print_box(output_lines, title=title)
+        title = f"  {ticker} — {strat_label} Recommendation  "
+        print_box(output_lines, title=title)
+
+    return answer
 
 
 _HELP_DESCRIPTION = """\
@@ -1224,6 +2796,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--web",
+        action="store_true",
+        help=(
+            "Launch a live web dashboard showing all open positions with risk "
+            "evaluation. Auto-refreshes every 5 minutes. Requires PUBLIC_API_SECRET. "
+            "Opens http://127.0.0.1:5051 in your browser."
+        ),
+    )
+    parser.add_argument(
         "--num",
         type=int,
         default=10,
@@ -1252,12 +2833,12 @@ def main():
     )
     args = parser.parse_args()
 
-    # ── --eval: standalone portfolio evaluation mode ──────────────────────────
-    if args.eval:
+    # ── --eval / --web: require PUBLIC_API_SECRET ─────────────────────────────
+    if args.eval or args.web:
         secret = os.environ.get("PUBLIC_API_SECRET")
         if not secret:
             print(
-                "ERROR: PUBLIC_API_SECRET is required for --eval.\n"
+                "ERROR: PUBLIC_API_SECRET is required for --eval / --web.\n"
                 "  1. Go to https://public.com (Settings → API)\n"
                 "  2. Generate a Secret Token\n"
                 "  3. Run:  export PUBLIC_API_SECRET=your_secret_here",
@@ -1266,13 +2847,19 @@ def main():
             sys.exit(1)
         token = get_access_token(secret)
         account_id = get_account_id(token)
+
+        if args.web:
+            run_web_dashboard(token, account_id)
+            sys.exit(0)
+
+        # --eval (CLI mode)
         eval_ticker = args.ticker.upper() if args.ticker else None
         eval_open_positions(token, account_id, eval_ticker)
         sys.exit(0)
 
     # All non-eval modes require --ticker
     if not args.ticker:
-        parser.error("--ticker is required unless using --eval")
+        parser.error("--ticker is required unless using --eval or --web")
 
     ticker = args.ticker.upper()
     num = args.num
@@ -1402,4 +2989,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
