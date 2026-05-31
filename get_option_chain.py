@@ -1502,6 +1502,7 @@ function applyData(d) {
   document.getElementById('h-time').textContent = (d.fetched_at || '').replace('T', ' ');
   renderTable();
   renderSkipped(d.skipped || []);
+  _renderUnbornTable();
 }
 
 function fmt(v, digits, prefix='') {
@@ -1650,9 +1651,6 @@ function _renderUnbornTable() {
     <tbody>${rows}</tbody>
   </table>`;
 }
-
-// Render any persisted unborn rows on page load
-_renderUnbornTable();
 
 function recBadge(rec, key, chainCash) {
   const cls = rec === 'ROLL' ? 'warn' : rec === 'ASSIGNMENT' ? 'danger' : 'ok';
