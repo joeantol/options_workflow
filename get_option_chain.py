@@ -38,6 +38,7 @@ import os
 import re
 import sys
 import textwrap
+import threading
 
 
 BASE_URL = "https://api.public.com"
@@ -1287,8 +1288,10 @@ async def run_unborn_for_ticker(
             return {"error": "Empty response from NotebookLM", "recommendation": "HOLD",
                     "text": "", "ticker": ticker, "strat": strat, "chain": display_rows}
 
+        log.info("[unborn] display_rows count: %d, first: %s", len(display_rows), display_rows[0] if display_rows else None)
         rec = _detect_recommendation(text)
         chosen = _parse_recommended_option(text, display_rows)
+        log.info("[unborn] chosen: %s", chosen)
         if chosen is None and display_rows:
             # Fallback: pick option closest to 30 DTE and 0.30 delta
             target_delta = 0.30 if strat == "CC" else -0.30
@@ -1502,7 +1505,6 @@ function applyData(d) {
   document.getElementById('h-time').textContent = (d.fetched_at || '').replace('T', ' ');
   renderTable();
   renderSkipped(d.skipped || []);
-  _renderUnbornTable();
 }
 
 function fmt(v, digits, prefix='') {
@@ -1610,11 +1612,28 @@ function _saveRecs(recs) {
 }
 const _recommendations = _loadRecs(); // posKey -> {rec}
 
-// Proposed trades accumulator — persists across bounces/refreshes via localStorage
-const _LS_UNBORN = 'optionsUnborn';
-function _loadUnborn() { try { return JSON.parse(localStorage.getItem(_LS_UNBORN) || '{}'); } catch { return {}; } }
-function _saveUnborn(rows) { try { localStorage.setItem(_LS_UNBORN, JSON.stringify(rows)); } catch {} }
-const _unbornRows = _loadUnborn(); // key: "TICKER|STRAT" -> row object
+// Proposed trades — server-side persistence via /api/unborn-rows
+const _unbornRows = {};   // populated on load from server
+
+async function _loadUnbornFromServer() {
+  try {
+    const r = await fetch('/api/unborn-rows');
+    if (!r.ok) return;
+    const d = await r.json();
+    Object.assign(_unbornRows, d);
+    _renderUnbornTable();
+  } catch(e) { /* silently ignore */ }
+}
+
+async function _saveUnbornToServer() {
+  try {
+    await fetch('/api/unborn-rows', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(_unbornRows)
+    });
+  } catch(e) { /* silently ignore */ }
+}
 
 function _renderUnbornTable() {
   const el = document.getElementById('unborn-chain');
@@ -1640,13 +1659,14 @@ function _renderUnbornTable() {
       <td>${fv(c.ul_price,2,'$')}</td>
       <td>${fv(c.opt_price,2,'$')}</td>
       <td style="color:var(--muted);font-size:11px;white-space:normal;max-width:130px">${esc(c.ideal_entry||'—')}</td>
+      <td><button data-key="${esc(k)}" onclick="placeTrade(this.dataset.key,this)" style="font-size:11px;padding:3px 8px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">Trade</button></td>
     </tr>`;
   }).join('');
   el.innerHTML = `<table>
     <thead><tr>
       <th>Symbol</th><th>Type</th><th>Strike</th><th>Expiry</th>
-      <th>Side</th><th>Qty</th><th>DTE</th><th>Δ</th>
-      <th>U/L Price</th><th>Opt Price</th><th>Ideal Entry</th>
+      <th>Side</th><th>Qty</th><th>DTE</th><th>&Delta;</th>
+      <th>U/L Price</th><th>Opt Price</th><th>Ideal Entry</th><th></th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
@@ -1748,7 +1768,7 @@ async function findUnborn() {
     if (chain.length) {
       const row = Object.assign({}, chain[0], {_qty: qty, _ubKey: ubKey});
       _unbornRows[ticker + '|' + strat] = row;
-      _saveUnborn(_unbornRows);
+      await _saveUnbornToServer();
       _renderUnbornTable();
       // Clear inputs after successful display
       document.getElementById('ub-ticker').value = '';
@@ -1759,6 +1779,102 @@ async function findUnborn() {
   } catch(e) {
     resultEl.innerHTML = `<span class="err-tip" style="color:var(--danger);font-size:12px">&#9888; Error<span class="err-msg">${esc(e.message)}</span></span>`;
   }
+}
+
+async function placeTrade(rowKey, btn) {
+  const c = _unbornRows[rowKey];
+  if (!c) { alert('Trade data not found for: ' + rowKey); return; }
+  btn.disabled = true;
+  btn.textContent = '⧗';
+  const trade = {
+    symbol: c.symbol, option_type: c.option_type, strike: c.strike,
+    expiry: c.expiry, qty: c._qty || 1, opt_price: c.opt_price
+  };
+  try {
+    const r = await fetch('/api/trade', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(trade)
+    });
+    const d = await r.json();
+    if (d.status === 'launched') {
+      btn.textContent = '✓';
+      btn.style.background = 'var(--ok)';
+      _showTradeModal(d.trade);
+    } else {
+      throw new Error(d.error || 'Unknown error');
+    }
+  } catch(e) {
+    btn.textContent = 'Err';
+    btn.style.background = 'var(--danger)';
+    btn.title = e.message;
+    btn.disabled = false;
+  }
+}
+
+function _cpBtn(val) {
+  return `<button onclick="navigator.clipboard.writeText('${val}');this.textContent='✓';setTimeout(()=>this.textContent='copy',1500)"
+    style="margin-left:6px;font-size:10px;padding:1px 6px;border-radius:3px;cursor:pointer;border:1px solid var(--muted);background:transparent;color:var(--fg)">copy</button>`;
+}
+function _showTradeModal(t) {
+  const existing = document.getElementById('trade-modal');
+  if (existing) existing.remove();
+  const cp     = (t.option_type||'').toUpperCase() === 'CALL' ? 'Call' : 'Put';
+  const strike = t.strike ? parseFloat(t.strike).toFixed(2) : '—';
+  const price  = t.opt_price ? parseFloat(t.opt_price).toFixed(2) : '—';
+  const expiry = t.expiry || '—';
+  const qty    = t.qty || 1;
+
+  // Make draggable
+  const div = document.createElement('div');
+  div.id = 'trade-modal';
+  div.style.cssText = 'position:fixed;top:70px;right:24px;z-index:9999;background:var(--surface);border:2px solid var(--accent);border-radius:10px;padding:0;min-width:310px;box-shadow:0 6px 32px #0008;font-size:13px;user-select:none';
+  div.innerHTML = `
+    <div id="trade-modal-hdr" style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px 10px;background:var(--accent);border-radius:8px 8px 0 0;cursor:grab">
+      <b style="color:#fff;font-size:13px">&#128203; Fidelity Trade Ticket</b>
+      <span onclick="document.getElementById('trade-modal').remove()" style="cursor:pointer;color:#fff;font-size:20px;line-height:1;padding:0 2px">&times;</span>
+    </div>
+    <div style="padding:14px 16px">
+      <table style="border-collapse:collapse;width:100%">
+        <tr><td style="color:var(--muted);padding:5px 14px 5px 0;white-space:nowrap">1. Action</td>
+            <td><b style="color:var(--ok)">Sell to Open</b></td></tr>
+        <tr><td style="color:var(--muted);padding:5px 14px 5px 0">2. Symbol</td>
+            <td><b>${esc(t.symbol)}</b>${_cpBtn(t.symbol)}</td></tr>
+        <tr><td style="color:var(--muted);padding:5px 14px 5px 0">3. Type</td>
+            <td>${cp}${_cpBtn(cp)}</td></tr>
+        <tr><td style="color:var(--muted);padding:5px 14px 5px 0">4. Expiry</td>
+            <td>${esc(expiry)}${_cpBtn(expiry)}</td></tr>
+        <tr><td style="color:var(--muted);padding:5px 14px 5px 0">5. Strike</td>
+            <td>$${strike}${_cpBtn(strike)}</td></tr>
+        <tr><td style="color:var(--muted);padding:5px 14px 5px 0">6. Qty</td>
+            <td>${qty}${_cpBtn(String(qty))}</td></tr>
+        <tr><td style="color:var(--muted);padding:5px 14px 5px 0">7. Order type</td>
+            <td>Limit / Day</td></tr>
+        <tr style="background:rgba(var(--accent-rgb,99,102,241),0.08);border-radius:4px">
+            <td style="color:var(--muted);padding:7px 14px 7px 0"><b>8. Limit $</b></td>
+            <td><b style="color:var(--accent);font-size:15px">$${price}</b>${_cpBtn(price)}</td></tr>
+      </table>
+      <div style="margin-top:10px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);padding-top:8px">
+        Fill each field in order → Preview → Place Order
+      </div>
+    </div>`;
+
+  // Drag support
+  const hdr = div.querySelector('#trade-modal-hdr');
+  let ox=0,oy=0,mx=0,my=0;
+  hdr.addEventListener('mousedown', e => {
+    ox = div.offsetLeft; oy = div.offsetTop;
+    mx = e.clientX;      my = e.clientY;
+    div.style.right = 'auto';
+    function onMove(e2) {
+      div.style.left = (ox + e2.clientX - mx) + 'px';
+      div.style.top  = (oy + e2.clientY - my) + 'px';
+    }
+    function onUp() { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  document.body.appendChild(div);
 }
 
 function resetRecommendations() {
@@ -1779,10 +1895,552 @@ function sortTable(col) {
 
 // Sort by expiry by default (col 5, ascending)
 document.querySelectorAll('th')[3].classList.add('sorted-asc');
+_loadUnbornFromServer();
 fetchData();
 </script>
 </body>
 </html>"""
+
+
+# ── Fidelity browser automation ──────────────────────────────────────────────
+_FIDELITY_SESSION_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".fidelity_session"
+)
+
+
+
+async def _fidelity_trade_async(trade: dict) -> None:  # kept for compat
+    """
+    Open Fidelity's options trade ticket in the user's existing Chrome session
+    (via CDP) or fall back to a persistent Playwright context.
+    Pre-fills all fields; user reviews and submits manually.
+    """
+    from playwright.async_api import async_playwright
+
+    symbol      = str(trade.get("symbol", "")).upper()
+    option_type = str(trade.get("option_type", "CALL")).upper()
+    strike      = trade.get("strike")
+    expiry      = trade.get("expiry", "")
+    qty         = int(trade.get("qty", 1))
+    opt_price   = trade.get("opt_price")
+
+    try:
+        exp_dt      = datetime.datetime.strptime(expiry, "%Y-%m-%d")
+        exp_display = exp_dt.strftime("%b %d, %Y")
+    except (ValueError, TypeError):
+        exp_display = expiry
+
+    log.info("[fidelity] Trade request: %s %s %s %s x%d", symbol, option_type, strike, expiry, qty)
+
+    _FIDELITY_TRADE_URL = "https://digital.fidelity.com/ftgw/digital/easy/investmentoptions"
+
+    async with async_playwright() as pw:
+        use_cdp = _cdp_available()
+        if use_cdp:
+            log.info("[fidelity] CDP available — opening tab in existing Chrome session")
+            # Open the Fidelity page via AppleScript so it uses the existing Chrome session
+            import subprocess as _sp
+            _sp.Popen([
+                "osascript", "-e",
+                f'tell application "Google Chrome" to open location "{_FIDELITY_TRADE_URL}"'
+            ])
+            await asyncio.sleep(4)   # let the tab open and load
+
+            # Connect via CDP and find the new Fidelity tab
+            browser = await pw.chromium.connect_over_cdp("http://localhost:9222")
+            page = None
+            for _ in range(15):
+                for ctx in browser.contexts:
+                    for p in ctx.pages:
+                        if "fidelity.com" in p.url and "login" not in p.url:
+                            page = p
+                            break
+                    if page:
+                        break
+                if page:
+                    break
+                await asyncio.sleep(1)
+            if page is None:
+                # fallback: grab most recently opened page
+                all_pages = [p for ctx in browser.contexts for p in ctx.pages]
+                page = all_pages[-1] if all_pages else None
+            if page is None:
+                raise RuntimeError("Could not find Fidelity tab in Chrome")
+            log.info("[fidelity] Found Fidelity tab: %s", page.url)
+        else:
+            log.warning("[fidelity] Chrome not running with --remote-debugging-port=9222. "
+                        "Restart Chrome with: open -a 'Google Chrome' --args --remote-debugging-port=9222")
+            os.makedirs(_FIDELITY_SESSION_DIR, exist_ok=True)
+            ctx  = await pw.chromium.launch_persistent_context(
+                _FIDELITY_SESSION_DIR, headless=False, channel="chrome",
+                viewport={"width": 1280, "height": 900},
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await page.goto("https://digital.fidelity.com/ftgw/digital/portfolio/summary",
+                            wait_until="domcontentloaded", timeout=30_000)
+            await page.wait_for_timeout(2000)
+            if any(x in page.url for x in ["login", "saa.fidelity", "nb.fidelity", "www.fidelity.com/"]):
+                log.info("[fidelity] Not logged in — waiting up to 3 min for user…")
+                await page.goto("https://digital.fidelity.com/ftgw/digital/login/full-page",
+                                wait_until="domcontentloaded")
+                try:
+                    await page.wait_for_url(
+                        re.compile(r"digital\.fidelity\.com/ftgw/digital/(?!login)"),
+                        timeout=180_000)
+                    await page.wait_for_timeout(2000)
+                except Exception:
+                    log.warning("[fidelity] Login wait timed out; continuing anyway…")
+            await page.goto(_FIDELITY_TRADE_URL, wait_until="domcontentloaded", timeout=30_000)
+
+        await page.wait_for_timeout(3000)
+
+        # ── 3. Fill Symbol ───────────────────────────────────────────────────
+        sym_selectors = [
+            'input[id*="symbol" i]',
+            'input[name*="symbol" i]',
+            'input[placeholder*="symbol" i]',
+            'input[aria-label*="symbol" i]',
+            '#eq-ticket-dest-symbol',
+        ]
+        for sel in sym_selectors:
+            try:
+                await page.fill(sel, symbol, timeout=3000)
+                await page.press(sel, "Tab")
+                await page.wait_for_timeout(1500)
+                log.info("[fidelity] Filled symbol with selector: %s", sel)
+                break
+            except Exception:
+                continue
+
+        # ── 4. Select Options tab if present ─────────────────────────────────
+        for label in ["Options", "Option"]:
+            try:
+                await page.click(f'[role="tab"]:has-text("{label}")', timeout=3000)
+                await page.wait_for_timeout(1000)
+                break
+            except Exception:
+                pass
+
+        # ── 5. Action = Sell to Open ─────────────────────────────────────────
+        action_texts = ["Sell to Open", "Sell To Open", "SELL TO OPEN"]
+        for txt in action_texts:
+            try:
+                # Try select element first
+                await page.select_option('select[id*="action" i], select[name*="action" i]', label=txt, timeout=2000)
+                log.info("[fidelity] Set action via select")
+                break
+            except Exception:
+                pass
+            try:
+                await page.click(f'option:has-text("{txt}")', timeout=1000)
+                break
+            except Exception:
+                pass
+        await page.wait_for_timeout(500)
+
+        # ── 6. Expiration date ───────────────────────────────────────────────
+        exp_selectors = [
+            'select[id*="expir" i]', 'select[name*="expir" i]',
+            'select[aria-label*="expir" i]',
+        ]
+        for sel in exp_selectors:
+            try:
+                await page.select_option(sel, label=re.compile(exp_display[:6], re.IGNORECASE), timeout=3000)
+                log.info("[fidelity] Set expiry: %s", exp_display)
+                await page.wait_for_timeout(1000)
+                break
+            except Exception:
+                continue
+
+        # ── 7. Call / Put ────────────────────────────────────────────────────
+        cp_label = "Call" if option_type == "CALL" else "Put"
+        cp_selectors = [
+            f'input[type="radio"][value*="{cp_label}" i]',
+            f'label:has-text("{cp_label}")',
+            f'[role="radio"]:has-text("{cp_label}")',
+            f'select[id*="type" i], select[name*="type" i]',
+        ]
+        for sel in cp_selectors:
+            try:
+                if "select" in sel:
+                    await page.select_option(sel, label=cp_label, timeout=2000)
+                else:
+                    await page.click(sel, timeout=2000)
+                log.info("[fidelity] Set call/put: %s", cp_label)
+                await page.wait_for_timeout(800)
+                break
+            except Exception:
+                continue
+
+        # ── 8. Strike ────────────────────────────────────────────────────────
+        strike_str = f"{float(strike):.2f}" if strike is not None else ""
+        strike_selectors = [
+            'select[id*="strike" i]', 'select[name*="strike" i]',
+            'select[aria-label*="strike" i]',
+        ]
+        for sel in strike_selectors:
+            try:
+                await page.select_option(sel, label=re.compile(r'\b' + re.escape(strike_str.lstrip('0') or strike_str)), timeout=3000)
+                log.info("[fidelity] Set strike: %s", strike_str)
+                await page.wait_for_timeout(800)
+                break
+            except Exception:
+                continue
+
+        # ── 9. Quantity ───────────────────────────────────────────────────────
+        qty_selectors = [
+            'input[id*="quant" i]', 'input[name*="quant" i]',
+            'input[aria-label*="quant" i]', 'input[id*="qty" i]',
+            'input[placeholder*="quant" i]',
+        ]
+        for sel in qty_selectors:
+            try:
+                await page.fill(sel, str(qty), timeout=2000)
+                log.info("[fidelity] Set qty: %d", qty)
+                await page.wait_for_timeout(500)
+                break
+            except Exception:
+                continue
+
+        # ── 10. Order type = Limit ────────────────────────────────────────────
+        for sel in ['select[id*="order" i]', 'select[name*="order" i]', 'select[aria-label*="order type" i]']:
+            try:
+                await page.select_option(sel, label=re.compile("limit", re.IGNORECASE), timeout=2000)
+                log.info("[fidelity] Set order type: Limit")
+                await page.wait_for_timeout(500)
+                break
+            except Exception:
+                continue
+
+        # ── 11. Limit price ───────────────────────────────────────────────────
+        if opt_price is not None:
+            price_str = f"{float(opt_price):.2f}"
+            price_selectors = [
+                'input[id*="limit" i]', 'input[name*="limit" i]',
+                'input[aria-label*="limit price" i]', 'input[id*="price" i]',
+            ]
+            for sel in price_selectors:
+                try:
+                    await page.fill(sel, price_str, timeout=2000)
+                    log.info("[fidelity] Set limit price: %s", price_str)
+                    await page.wait_for_timeout(500)
+                    break
+                except Exception:
+                    continue
+
+        # ── 12. Time in force = Day ───────────────────────────────────────────
+        for sel in ['select[id*="duration" i]', 'select[name*="duration" i]',
+                    'select[aria-label*="time in force" i]', 'select[id*="tif" i]']:
+            try:
+                await page.select_option(sel, label=re.compile(r'^day$', re.IGNORECASE), timeout=2000)
+                log.info("[fidelity] Set time in force: Day")
+                await page.wait_for_timeout(500)
+                break
+            except Exception:
+                continue
+
+        log.info("[fidelity] Form fill complete — browser left open for user review")
+        # Keep the page open; if CDP, leave Chrome running; if fallback, wait up to 10 min
+        if not use_cdp:
+            try:
+                await page.wait_for_timeout(600_000)
+            except Exception:
+                pass
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+
+
+def _angular_set(field_id: str, value: str) -> str:
+    """JS: set an Angular-bound <input> value and trigger change detection."""
+    v = value.replace("\\", "\\\\").replace("'", "\\'")
+    return (
+        f"(function(){{"
+        f"var el=document.getElementById('{field_id}');"
+        f"if(!el)return 'not found:{field_id}';"
+        f"var s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+        f"s.call(el,'{v}');"
+        f"el.dispatchEvent(new Event('input',{{bubbles:true}}));"
+        f"el.dispatchEvent(new Event('change',{{bubbles:true}}));"
+        f"return 'ok:{field_id}={v}';"
+        f"}})()"
+    )
+
+
+def _click_id(el_id: str) -> str:
+    """JS: click an element by id."""
+    return (
+        f"(function(){{"
+        f"var el=document.getElementById('{el_id}');"
+        f"if(!el)return 'not found:{el_id}';"
+        f"el.click();"
+        f"return 'clicked:{el_id}';"
+        f"}})()"
+    )
+
+
+def _click_dropdown_option(text: str) -> str:
+    """JS: click the first visible button/li/option whose text matches (case-insensitive)."""
+    t = text.replace("\\", "\\\\").replace("'", "\\'")
+    return (
+        f"(function(){{"
+        f"var needle='{t}'.toLowerCase();"
+        f"var els=[...document.querySelectorAll('button,li,[role=option],[role=menuitem]')];"
+        f"var el=els.find(e=>e.offsetParent!==null && e.textContent.trim().toLowerCase().includes(needle));"
+        f"if(!el)return 'not found:'+needle;"
+        f"el.click();"
+        f"return 'clicked option:'+el.textContent.trim().substring(0,60);"
+        f"}})()"
+    )
+
+
+def _click_nth_account(n: int) -> str:
+    """JS: open account dropdown then click the nth account item (1-based)."""
+    return (
+        f"(function(){{"
+        f"var btn=document.getElementById('account');"
+        f"if(!btn)return 'no #account btn';"
+        f"btn.click();"
+        f"return 'account-dropdown-opened';"
+        f"}})()"
+    )
+
+
+def _select_nth_account_item(n: int) -> str:
+    """JS: after account dropdown is open, click the item whose text contains '8097' (fallback: nth item)."""
+    idx = n - 1
+    return (
+        f"(function(){{"
+        f"var container=document.querySelector('ott-account-dropdown');"
+        f"if(!container)return 'no ott-account-dropdown';"
+        f"var items=[...container.querySelectorAll('li,button,[role=option],[role=menuitem],[class*=item]')]"
+        f".filter(e=>e.offsetParent!==null);"
+        f"var target=items.find(e=>/8097/i.test(e.textContent));"
+        f"if(!target){{"
+        f"  if(items.length<={idx})return 'only '+items.length+' items, no 8097 match — available: '+items.map(e=>e.textContent.trim().substring(0,30)).join(' | ');"
+        f"  target=items[{idx}];"
+        f"}}"
+        f"target.click();"
+        f"return 'selected: '+target.textContent.trim().substring(0,60);"
+        f"}})()"
+    )
+
+
+def _osascript_js(js: str) -> str:
+    """Wrap JS in an osascript AppleScript tell-block for Chrome's front tab."""
+    safe = js.replace("\\", "\\\\").replace('"', '\\"')
+    return f'tell application "Google Chrome" to execute front window\'s active tab javascript "{safe}"'
+
+
+def _run_js(js: str, label: str) -> str:
+    import subprocess as _sp
+    try:
+        r = _sp.run(["osascript", "-e", _osascript_js(js)],
+                    capture_output=True, text=True, timeout=12)
+        out = r.stdout.strip() or r.stderr.strip()
+        log.info("[fidelity] %s → %s", label, out)
+        return out
+    except Exception as exc:
+        log.warning("[fidelity] %s failed: %s", label, exc)
+        return str(exc)
+
+
+def _launch_fidelity_trade(trade: dict) -> None:
+    """Open Fidelity options trade page in Chrome and auto-fill via osascript JS injection."""
+    import subprocess as _sp
+    import time as _time
+    from datetime import datetime as _dt
+
+    symbol      = str(trade.get("symbol", ""))
+    option_type = str(trade.get("option_type", "call")).lower()
+    qty         = str(trade.get("qty", 1))
+    opt_price   = str(trade.get("opt_price", ""))
+    expiry_raw  = str(trade.get("expiry", ""))   # e.g. "2026-07-10"
+    strike_raw  = str(trade.get("strike", ""))   # e.g. "74.0"
+    limit_price = f"{float(opt_price):.2f}" if opt_price else ""
+    radio_id    = "call-put-0-call" if option_type == "call" else "call-put-0-put"
+
+    # Format expiry for Fidelity dropdown text, e.g. "Jul 10, 2026"
+    expiry_label = ""
+    if expiry_raw:
+        try:
+            expiry_label = _dt.strptime(expiry_raw, "%Y-%m-%d").strftime("%b %d, %Y").replace(" 0", " ")
+        except Exception:
+            expiry_label = expiry_raw
+
+    # Format strike for dropdown text match, e.g. "74" or "74.00"
+    strike_label = ""
+    if strike_raw:
+        try:
+            sv = float(strike_raw)
+            strike_label = str(int(sv)) if sv == int(sv) else f"{sv:.2f}"
+        except Exception:
+            strike_label = strike_raw
+
+    url = (
+        "https://digital.fidelity.com/ftgw/digital/trade-options"
+        "?&FULL_BANNER=Y&TIME_IN_FORCE=D&ORDER_TYPE=O&CURRENT_PAGE=TradeOption&DEST_TRADE=Y"
+    )
+    log.info("[fidelity] Opening trade page for %s %s %s %s", symbol, option_type, strike_label, expiry_label)
+    try:
+        _sp.Popen(["open", "-a", "Google Chrome", url])
+    except Exception as exc:
+        log.warning("[fidelity] open -a Chrome failed: %s — trying default", exc)
+        _sp.Popen(["open", url])
+
+    _time.sleep(5)   # wait for Angular to render
+
+    # ── 1. Select account: click button#account, wait, pick 3rd item (Babs IRA) ──
+    _run_js(_click_nth_account(3), "open-account-dropdown")
+    _time.sleep(1.2)
+    _run_js(_select_nth_account_item(3), "select-account-3")
+    _time.sleep(1.5)
+
+    # ── 2. Symbol — set value then pick from autocomplete dropdown ──
+    _run_js(_angular_set("symbol_search", symbol), "set-symbol")
+    _time.sleep(1.5)
+
+    # Poll for autocomplete suggestion list, then click the item matching our symbol
+    _sym_upper = symbol.upper()
+    _ac_poll = (
+        f"(function(){{"
+        f"var items=[...document.querySelectorAll("
+        f"  'ul li, [role=option], [role=listitem], [class*=suggestion], [class*=autocomplete], [class*=result]'"
+        f")].filter(e=>e.offsetParent!==null);"
+        f"var match=items.find(e=>e.textContent.trim().toUpperCase().startsWith('{_sym_upper}'));"
+        f"if(match){{match.click();return 'ac-clicked:'+match.textContent.trim().substring(0,40);}}"
+        f"if(items.length)return 'ac-no-match items:'+items.slice(0,3).map(e=>e.textContent.trim().substring(0,20)).join('|');"
+        f"return 'ac-no-items';"
+        f"}})()"
+    )
+    for _ac_attempt in range(10):   # up to 5s
+        _ac_result = _run_js(_ac_poll, f"pick-symbol-ac-{_ac_attempt}")
+        if _ac_result.startswith("ac-clicked:"):
+            log.info("[fidelity] symbol autocomplete picked: %s", _ac_result)
+            break
+        _time.sleep(0.5)
+    else:
+        # Fallback: press Enter on the symbol field to confirm
+        log.warning("[fidelity] no autocomplete found — pressing Enter on symbol field")
+        _run_js(
+            f"(function(){{"
+            f"var f=document.getElementById('symbol_search');"
+            f"if(f)f.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,bubbles:true}}));"
+            f"return 'enter-sent';"
+            f"}})()",
+            "symbol-enter"
+        )
+
+    # Wait for expiry/strike dropdowns to populate after symbol confirmation
+    _time.sleep(3.0)
+
+    # ── 3. Qty ──
+    _run_js(_angular_set("quantity-0", qty), "set-qty")
+    _time.sleep(0.5)
+
+    # ── 4. Action → Sell to Open ──
+    _run_js(_click_id("action_dropdown-0"), "open-action-dropdown")
+    _time.sleep(0.8)
+    _run_js(_click_dropdown_option("Sell to Open"), "select-sell-to-open")
+    _time.sleep(0.5)
+
+    # ── 5. Call / Put ──
+    _run_js(
+        f"(function(){{var r=document.getElementById('{radio_id}');if(!r)return 'not found:{radio_id}';"
+        f"r.click();r.dispatchEvent(new Event('change',{{bubbles:true}}));return 'ok:{radio_id}';}})() ",
+        "set-call-put"
+    )
+    _time.sleep(0.5)
+
+    # ── 6. Expiry dropdown ──
+    if expiry_label:
+        _run_js(_click_id("exp_dropdown-0"), "open-expiry-dropdown")
+        _time.sleep(1.5)
+        _run_js(_click_dropdown_option(expiry_label), "select-expiry")
+        _time.sleep(0.5)
+
+    # ── 7. Strike dropdown ──
+    if strike_label:
+        _run_js(_click_id("strike_dropdown-0"), "open-strike-dropdown")
+        _time.sleep(1.0)
+        result = _run_js(_click_dropdown_option(strike_label), "select-strike")
+        # Fallback: try alternate format (e.g. "72.5" vs "72.50" vs "72")
+        if "not found" in result:
+            try:
+                sv = float(strike_raw)
+                alts = {f"{sv}", f"{sv:.1f}", f"{int(sv)}", f"{sv:.2f}"}
+                alts.discard(strike_label)
+                for alt in alts:
+                    result2 = _run_js(_click_dropdown_option(alt), f"select-strike-alt-{alt}")
+                    if "not found" not in result2:
+                        break
+            except Exception:
+                pass
+        _time.sleep(0.5)
+
+    # ── 8. Order type → Limit ──
+    _run_js(_click_id("ordertype-dropdown"), "open-ordertype-dropdown")
+    _time.sleep(0.8)
+    _run_js(_click_dropdown_option("Limit"), "select-limit-order")
+    _time.sleep(0.5)
+
+    # ── 9. Limit price ──
+    # Poll until the field is enabled (Angular enables it once Limit order type is confirmed)
+    if limit_price:
+        _time.sleep(0.5)
+        _price_poll = (
+            "(function(){"
+            "var f=document.getElementById('dest-limitPrice');"
+            "if(!f)return 'no-field';"
+            "if(f.disabled)return 'disabled';"
+            "return 'enabled';"
+            "})()"
+        )
+        for _pi in range(14):   # up to 7s
+            _ps = _run_js(_price_poll, f"poll-price-{_pi}")
+            if _ps.strip() == "enabled":
+                break
+            _time.sleep(0.5)
+        else:
+            log.warning("[fidelity] price field never became enabled — forcing it")
+            _run_js(
+                "(function(){var f=document.getElementById('dest-limitPrice');"
+                "if(f){f.removeAttribute('disabled');f.removeAttribute('readonly');"
+                "f.dispatchEvent(new Event('focus',{bubbles:true}));} return 'forced';} )()",
+                "force-enable-price"
+            )
+            _time.sleep(0.3)
+
+        # Focus the field and insert value via execCommand (creates trusted input mutation)
+        _run_js(
+            f"(function(){{"
+            f"var f=document.getElementById('dest-limitPrice');"
+            f"if(!f)return 'no-field';"
+            f"f.focus();"
+            f"f.select();"
+            f"document.execCommand('selectAll');"
+            f"document.execCommand('insertText',false,'{limit_price}');"
+            f"return 'price-set:'+f.value;"
+            f"}})()",
+            "set-limit-price"
+        )
+        _time.sleep(0.3)
+        # Move focus to qty field — commits the price value and closes the dropdown panel
+        _run_js(
+            "(function(){"
+            "var q=document.getElementById('quantity-0');"
+            "if(q){q.focus();return 'focus-moved-to-qty';}"
+            "return 'qty-not-found';"
+            "})()",
+            "commit-price"
+        )
+        _time.sleep(0.3)
+
+    # TIF is pre-set to Day via the URL parameter TIME_IN_FORCE=D — no click needed.
+
+    log.info("[fidelity] Form fill complete — review and place order in Fidelity")
 
 
 def run_web_dashboard(token: str, account_id: str) -> None:
@@ -1953,6 +2611,38 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         with _cache_lock:
             _unborn_cache[ub_key] = result
         return Response(json.dumps(result, default=_serial), mimetype="application/json")
+
+    _UNBORN_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unborn_rows.json")
+
+    @app.route("/api/unborn-rows", methods=["GET"])
+    def api_unborn_rows_get():
+        try:
+            if os.path.exists(_UNBORN_ROWS_FILE):
+                with open(_UNBORN_ROWS_FILE, "r", encoding="utf-8") as f:
+                    return Response(f.read(), mimetype="application/json")
+        except Exception as exc:
+            log.warning("[unborn-rows] Read error: %s", exc)
+        return Response("{}", mimetype="application/json")
+
+    @app.route("/api/unborn-rows", methods=["POST"])
+    def api_unborn_rows_post():
+        try:
+            data = flask_request.get_json(force=True) or {}
+            with open(_UNBORN_ROWS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            log.info("[unborn-rows] Saved %d rows", len(data))
+        except Exception as exc:
+            log.warning("[unborn-rows] Write error: %s", exc)
+            return Response(json.dumps({"error": str(exc)}), mimetype="application/json", status=500)
+        return Response(json.dumps({"status": "ok"}), mimetype="application/json")
+
+    @app.route("/api/trade", methods=["POST"])
+    def api_trade():
+        trade = flask_request.get_json(force=True) or {}
+        log.info("[trade] Received trade request: %s", trade)
+        t = threading.Thread(target=_launch_fidelity_trade, args=(trade,), daemon=True)
+        t.start()
+        return Response(json.dumps({"status": "launched", "trade": trade}), mimetype="application/json")
 
     @app.route("/unborn/<path:ub_key>")
     def unborn_detail(ub_key: str):
