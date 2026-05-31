@@ -1459,6 +1459,11 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 let _data = [];
 let _sortCol = 3, _sortDir = 1;
+let _ubSortCol = 3, _ubSortDir = 1;
+function _ubSort(col) {
+  if (_ubSortCol === col) _ubSortDir *= -1; else { _ubSortCol = col; _ubSortDir = 1; }
+  _renderUnbornTable();
+}
 
 async function fetchData() {
   document.getElementById('spinner').classList.add('active');
@@ -1637,9 +1642,35 @@ async function _saveUnbornToServer() {
 
 function _renderUnbornTable() {
   const el = document.getElementById('unborn-chain');
-  const keys = Object.keys(_unbornRows).sort();
+  const keys = Object.keys(_unbornRows);
   if (!keys.length) { el.innerHTML = ''; return; }
   const fv = (v, d, p='') => v == null ? '—' : p + parseFloat(v).toFixed(d);
+
+  // Sort
+  const _ubCols = [
+    k => (_unbornRows[k].symbol||''),
+    k => ((_unbornRows[k].option_type||'').toUpperCase()),
+    k => parseFloat(_unbornRows[k].strike||0),
+    k => (_unbornRows[k].expiry||''),
+    k => (_unbornRows[k].side||''),
+    k => (_unbornRows[k]._qty||1),
+    k => (_unbornRows[k].dte??999),
+    k => (_unbornRows[k].delta??-99),
+    k => (_unbornRows[k].ul_price??0),
+    k => (_unbornRows[k].opt_price??0),
+    k => (_unbornRows[k].ideal_entry||''),
+  ];
+  if (_ubSortCol < _ubCols.length) {
+    const fn = _ubCols[_ubSortCol];
+    keys.sort((a,b) => { const av=fn(a),bv=fn(b); return _ubSortDir*(av<bv?-1:av>bv?1:0); });
+  }
+
+  const thStyle = 'cursor:pointer;user-select:none;';
+  const thHdr = (label, i) => {
+    const arrow = _ubSortCol===i ? (_ubSortDir===1?' ▲':' ▼') : '';
+    return `<th style="${thStyle}" onclick="_ubSort(${i})">${label}${arrow}</th>`;
+  };
+
   const rows = keys.map(k => {
     const c = _unbornRows[k];
     const qty = c._qty || 1;
@@ -1659,17 +1690,33 @@ function _renderUnbornTable() {
       <td>${fv(c.ul_price,2,'$')}</td>
       <td>${fv(c.opt_price,2,'$')}</td>
       <td style="color:var(--muted);font-size:11px;white-space:normal;max-width:130px">${esc(c.ideal_entry||'—')}</td>
-      <td><button data-key="${esc(k)}" onclick="placeTrade(this.dataset.key,this)" style="font-size:11px;padding:3px 8px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">Trade</button></td>
+      <td style="white-space:nowrap">
+        <button data-key="${esc(k)}" onclick="placeTrade(this.dataset.key,this)" style="font-size:11px;padding:3px 8px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">Trade</button>
+        <button data-key="${esc(k)}" onclick="deleteUnbornRow(this.dataset.key)" style="font-size:11px;padding:3px 6px;background:var(--danger-bg);color:var(--danger);border:1px solid var(--danger);border-radius:4px;cursor:pointer;margin-left:4px">&times;</button>
+      </td>
     </tr>`;
   }).join('');
   el.innerHTML = `<table>
     <thead><tr>
-      <th>Symbol</th><th>Type</th><th>Strike</th><th>Expiry</th>
-      <th>Side</th><th>Qty</th><th>DTE</th><th>&Delta;</th>
-      <th>U/L Price</th><th>Opt Price</th><th>Ideal Entry</th><th></th>
+      ${thHdr('Symbol',0)}${thHdr('Type',1)}${thHdr('Strike',2)}${thHdr('Expiry',3)}
+      ${thHdr('Side',4)}${thHdr('Qty',5)}${thHdr('DTE',6)}${thHdr('&Delta;',7)}
+      ${thHdr('U/L Price',8)}${thHdr('Opt Price',9)}${thHdr('Ideal Entry',10)}<th></th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+}
+
+async function deleteUnbornRow(key) {
+  delete _unbornRows[key];
+  await _saveUnbornToServer();
+  // Also purge the server-side analysis cache for this row
+  const c = _unbornRows[key];  // already deleted, but _ubKey may have been on it
+  await fetch('/api/unborn-cache-delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({row_key: key})
+  });
+  _renderUnbornTable();
 }
 
 function recBadge(rec, key, chainCash) {
@@ -1877,10 +1924,10 @@ function _showTradeModal(t) {
   document.body.appendChild(div);
 }
 
-function resetRecommendations() {
-  if (!confirm('Reset all action statuses back to Analyze?')) return;
+async function resetRecommendations() {
   Object.keys(_recommendations).forEach(k => delete _recommendations[k]);
   _saveRecs({});
+  await fetch('/api/reset-cache', {method:'POST'});
   renderTable();
 }
 
@@ -2462,10 +2509,26 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
-    # In-memory cache: posKey -> {recommendation, text, ticker, error}
-    _analysis_cache:    dict[str, dict] = {}   # posKey -> result
-    _analysis_inflight: set[str]        = set() # posKeys currently being queried
+    # Persistent cache: posKey -> {recommendation, text, ticker, error, qa_thread}
+    _CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".analysis_cache.json")
+    _analysis_inflight: set[str] = set()
     _cache_lock = threading.Lock()
+
+    def _load_cache() -> dict:
+        try:
+            with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_cache(cache: dict) -> None:
+        try:
+            with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cache, f, default=str)
+        except Exception as exc:
+            log.warning("Could not save analysis cache: %s", exc)
+
+    _analysis_cache: dict[str, dict] = _load_cache()
 
     def _serial(obj):
         if obj is None:
@@ -2551,10 +2614,27 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
         with _cache_lock:
             _analysis_cache[pos_key] = result
+            _save_cache(_analysis_cache)
         return Response(json.dumps(result, default=_serial), mimetype="application/json")
 
     # ── Unborn routes ──────────────────────────────────────────────────────────
-    _unborn_cache: dict[str, dict] = {}   # "{TICKER}|{STRAT}|{QTY}" -> result
+    _UNBORN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".unborn_cache.json")
+
+    def _load_unborn_cache() -> dict:
+        try:
+            with open(_UNBORN_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_unborn_cache(cache: dict) -> None:
+        try:
+            with open(_UNBORN_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cache, f, default=str)
+        except Exception as exc:
+            log.warning("Could not save unborn cache: %s", exc)
+
+    _unborn_cache: dict[str, dict] = _load_unborn_cache()
     _unborn_inflight: set[str] = set()
 
     @app.route("/api/unborn", methods=["POST"])
@@ -2610,6 +2690,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
         with _cache_lock:
             _unborn_cache[ub_key] = result
+            _save_unborn_cache(_unborn_cache)
         return Response(json.dumps(result, default=_serial), mimetype="application/json")
 
     _UNBORN_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unborn_rows.json")
@@ -2656,9 +2737,10 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         elif cached.get("error"):
             body_html = f"<p style='color:var(--danger)'>Error: {html_mod.escape(cached['error'])}</p>"
         else:
-            rec      = cached.get("recommendation", "")
+            strat    = cached.get("strat", "")
+            rec      = "SELL TO OPEN" if strat in ("CC", "CSP") else "OPEN"
             text     = cached.get("text", "")
-            rec_cls  = {"ROLL": "warn", "ASSIGNMENT": "danger", "HOLD": "ok"}.get(rec, "ok")
+            rec_cls  = "ok"   # unborn = new open trade, always shown as affirmative
             lines_out = []
             for ln in text.splitlines():
                 ln_esc = html_mod.escape(ln)
@@ -2699,6 +2781,19 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   .rec-body li{{margin:2px 0 2px 20px;max-width:860px}}
   .rec-body strong{{color:var(--text)}}
   .rec-body br{{display:block;margin:6px 0;content:""}}
+  .ask-section{{margin-top:36px;max-width:860px}}
+  .ask-thread{{margin-bottom:12px;display:flex;flex-direction:column;gap:12px}}
+  .ask-q{{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--muted)}}
+  .ask-q::before{{content:'You: ';color:var(--accent);font-weight:600}}
+  .ask-a{{background:#12151f;border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);white-space:pre-wrap;line-height:1.6}}
+  .ask-a::before{{content:'NotebookLM: ';color:var(--ok);font-weight:600}}
+  .ask-a.err{{color:var(--danger)}}
+  .ask-input{{display:flex;flex-direction:column;gap:8px}}
+  .ask-input textarea{{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;font-family:inherit;resize:vertical;min-height:64px;outline:none}}
+  .ask-input textarea:focus{{border-color:var(--accent)}}
+  .ask-input-row{{display:flex;gap:8px;align-items:center}}
+  .ask-input-row button{{padding:6px 16px}}
+  #ask-spinner{{font-size:11px;color:var(--muted);display:none}}
 </style></head><body>
 <header>
   <a class="back" href="/" onclick="window.close();return false;">&#8592; Back</a>
@@ -2706,8 +2801,132 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   <span class="pos-label">{title_str}</span>
 </header>
 {body_html}
+<div class="ask-section">
+  <div class="ask-thread" id="ask-thread"></div>
+  <div class="ask-input">
+    <textarea id="ask-q" rows="3" placeholder="Ask a follow-up question…"></textarea>
+    <div class="ask-input-row">
+      <button onclick="submitAsk()">Ask</button>
+      <span id="ask-spinner">&#8635; querying…</span>
+    </div>
+  </div>
+</div>
+<script>
+const _POS_KEY = {json.dumps(ub_key)};
+const _SAVED_QA = {json.dumps(cached.get("qa_thread", []) if cached else [])};
+(function() {{
+  const thread = document.getElementById('ask-thread');
+  for (const item of _SAVED_QA) {{
+    const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; thread.appendChild(qEl);
+    const aEl = document.createElement('div'); aEl.className='ask-a'; aEl.textContent=item.a; thread.appendChild(aEl);
+  }}
+}})();
+async function submitAsk() {{
+  const ta = document.getElementById('ask-q');
+  const q = ta.value.trim();
+  if (!q) return;
+  const thread = document.getElementById('ask-thread');
+  const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=q; thread.appendChild(qEl);
+  ta.value = '';
+  document.getElementById('ask-spinner').style.display = 'inline';
+  const aEl = document.createElement('div'); aEl.className='ask-a'; aEl.textContent='…'; thread.appendChild(aEl);
+  aEl.scrollIntoView({{behavior:'smooth'}});
+  try {{
+    const r = await fetch('/api/ask', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{position_key: _POS_KEY, question: q}})
+    }});
+    const d = await r.json();
+    if (d.error) {{ aEl.className='ask-a err'; aEl.textContent=d.error; }}
+    else {{ aEl.textContent=d.answer; }}
+  }} catch(e) {{ aEl.className='ask-a err'; aEl.textContent=e.message; }}
+  finally {{
+    document.getElementById('ask-spinner').style.display='none';
+    aEl.scrollIntoView({{behavior:'smooth'}});
+  }}
+}}
+document.getElementById('ask-q').addEventListener('keydown', e => {{
+  if (e.key==='Enter' && !e.shiftKey) {{ e.preventDefault(); submitAsk(); }}
+}});
+</script>
 </body></html>"""
         return Response(page, mimetype="text/html")
+
+    @app.route("/api/ask", methods=["POST"])
+    def api_ask():
+        body     = flask_request.get_json(force=True, silent=True) or {}
+        pos_key  = body.get("position_key", "")
+        question = (body.get("question") or "").strip()
+        if not pos_key or not question:
+            return Response(json.dumps({"error": "Missing position_key or question"}),
+                            status=400, mimetype="application/json")
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID", "")
+        if not notebook_id:
+            return Response(json.dumps({"error": "NOTEBOOKLM_NOTEBOOK_ID not set"}),
+                            status=500, mimetype="application/json")
+        try:
+            from notebooklm import NotebookLMClient
+            # Build full context: original recommendation + prior Q&A + new question
+            # Check both caches (analysis for open positions, unborn for new trades)
+            with _cache_lock:
+                cached_entry = _analysis_cache.get(pos_key) or _unborn_cache.get(pos_key) or {}
+                _in_unborn = pos_key in _unborn_cache and pos_key not in _analysis_cache
+            prior_qa = cached_entry.get("qa_thread", [])
+            rec_text = cached_entry.get("text", "")
+            context_parts = []
+            if rec_text:
+                snippet = rec_text[:1500] + ("…" if len(rec_text) > 1500 else "")
+                context_parts.append(f"=== Original Analysis ===\n{snippet}")
+            if prior_qa:
+                context_parts.append("=== Prior Q&A (recent) ===")
+                for item in prior_qa[-4:]:   # last 4 exchanges only
+                    context_parts.append(f"Q: {item['q']}\nA: {item['a'][:600]}")
+            context_parts.append(f"=== New Question ===\n{question}")
+            full_prompt = "\n\n".join(context_parts)
+            async def _ask():
+                async with NotebookLMClient.from_storage() as client:
+                    return await client.chat.ask(notebook_id, full_prompt)
+            result = asyncio.run(_ask())
+            answer = getattr(result, "answer", None) or str(result)
+            log.info("[ask] pos_key=%s q=%s… answer_len=%d", pos_key, question[:40], len(answer))
+            # Persist Q&A in the analysis cache so it survives page reloads
+            with _cache_lock:
+                if _in_unborn:
+                    entry = _unborn_cache.setdefault(pos_key, {})
+                    qa = entry.setdefault("qa_thread", [])
+                    qa.append({"q": question, "a": answer})
+                    _save_unborn_cache(_unborn_cache)
+                else:
+                    entry = _analysis_cache.setdefault(pos_key, {})
+                    qa = entry.setdefault("qa_thread", [])
+                    qa.append({"q": question, "a": answer})
+                    _save_cache(_analysis_cache)
+            return Response(json.dumps({"answer": answer}), mimetype="application/json")
+        except Exception as exc:
+            log.error("[ask] error: %s", exc)
+            return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
+
+    @app.route("/api/unborn-cache-delete", methods=["POST"])
+    def api_unborn_cache_delete():
+        body    = flask_request.get_json(force=True, silent=True) or {}
+        row_key = body.get("row_key", "")   # e.g. "SLB|CC"
+        # row_key is TICKER|STRAT; ub_key in cache is TICKER|STRAT|QTY — match by prefix
+        with _cache_lock:
+            to_delete = [k for k in _unborn_cache if k.startswith(row_key)]
+            for k in to_delete:
+                del _unborn_cache[k]
+            if to_delete:
+                _save_unborn_cache(_unborn_cache)
+        log.info("[unborn-cache-delete] removed %d entries for %s", len(to_delete), row_key)
+        return Response(json.dumps({"deleted": to_delete}), mimetype="application/json")
+
+    @app.route("/api/reset-cache", methods=["POST"])
+    def api_reset_cache():
+        with _cache_lock:
+            _analysis_cache.clear()
+            _save_cache(_analysis_cache)
+        log.info("[reset] analysis cache cleared")
+        return Response(json.dumps({"status": "ok"}), mimetype="application/json")
 
     @app.route("/analyze/<path:pos_key>")
     def analyze_detail(pos_key: str):
@@ -2852,6 +3071,19 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   .chain-pnl{{margin-top:28px;padding:14px 18px;background:var(--surface);border:1px solid var(--border);border-radius:8px;max-width:860px}}
   .chain-label{{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px}}
   .chain-working{{font-size:13px;color:var(--text)}}
+  .ask-section{{margin-top:36px;max-width:860px}}
+  .ask-thread{{margin-bottom:12px;display:flex;flex-direction:column;gap:12px}}
+  .ask-q{{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--muted)}}
+  .ask-q::before{{content:'You: ';color:var(--accent);font-weight:600}}
+  .ask-a{{background:#12151f;border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);white-space:pre-wrap;line-height:1.6}}
+  .ask-a::before{{content:'NotebookLM: ';color:var(--ok);font-weight:600}}
+  .ask-a.err{{color:var(--danger)}}
+  .ask-input{{display:flex;flex-direction:column;gap:8px}}
+  .ask-input textarea{{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;font-family:inherit;resize:vertical;min-height:64px;outline:none}}
+  .ask-input textarea:focus{{border-color:var(--accent)}}
+  .ask-input-row{{display:flex;gap:8px;align-items:center}}
+  .ask-input-row button{{padding:6px 16px}}
+  #ask-spinner{{font-size:11px;color:var(--muted);display:none}}
 </style>
 </head>
 <body>
@@ -2861,6 +3093,62 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   <span class="pos-label">{html_mod.escape(title_str)}</span>
 </header>
 {body_html}
+<div class="ask-section">
+  <div class="ask-thread" id="ask-thread"></div>
+  <div class="ask-input">
+    <textarea id="ask-q" rows="3" placeholder="Ask a follow-up question…"></textarea>
+    <div class="ask-input-row">
+      <button onclick="submitAsk()">Ask</button>
+      <span id="ask-spinner">&#8635; querying…</span>
+    </div>
+  </div>
+</div>
+<script>
+const _POS_KEY = {json.dumps(pos_key)};
+const _SAVED_QA = {json.dumps(cached.get("qa_thread", []) if cached else [])};
+(function() {{
+  const thread = document.getElementById('ask-thread');
+  for (const item of _SAVED_QA) {{
+    const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; thread.appendChild(qEl);
+    const aEl = document.createElement('div'); aEl.className='ask-a'; aEl.textContent=item.a; thread.appendChild(aEl);
+  }}
+}})();
+async function submitAsk() {{
+  const ta = document.getElementById('ask-q');
+  const q = ta.value.trim();
+  if (!q) return;
+  const thread = document.getElementById('ask-thread');
+  const qEl = document.createElement('div');
+  qEl.className = 'ask-q';
+  qEl.textContent = q;
+  thread.appendChild(qEl);
+  ta.value = '';
+  document.getElementById('ask-spinner').style.display = 'inline';
+  const aEl = document.createElement('div');
+  aEl.className = 'ask-a';
+  aEl.textContent = '…';
+  thread.appendChild(aEl);
+  aEl.scrollIntoView({{behavior:'smooth'}});
+  try {{
+    const r = await fetch('/api/ask', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{position_key: _POS_KEY, question: q}})
+    }});
+    const d = await r.json();
+    if (d.error) {{ aEl.className = 'ask-a err'; aEl.textContent = d.error; }}
+    else {{ aEl.textContent = d.answer; }}
+  }} catch(e) {{
+    aEl.className = 'ask-a err'; aEl.textContent = e.message;
+  }} finally {{
+    document.getElementById('ask-spinner').style.display = 'none';
+    aEl.scrollIntoView({{behavior:'smooth'}});
+  }}
+}}
+document.getElementById('ask-q').addEventListener('keydown', e => {{
+  if (e.key === 'Enter' && !e.shiftKey) {{ e.preventDefault(); submitAsk(); }}
+}});
+</script>
 </body>
 </html>"""
         return Response(page, mimetype="text/html")
