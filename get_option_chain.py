@@ -55,6 +55,10 @@ _LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 # Module-level logger — call setup_logging() to activate file output
 log = logging.getLogger("options")
 
+# Tracks when each ticker's CSV was last uploaded to NotebookLM {ticker: datetime}
+_last_upload_time: dict[str, datetime.datetime] = {}
+_UPLOAD_TTL_MINUTES = 45  # skip re-upload if source is fresher than this
+
 
 def setup_logging(level: int = logging.DEBUG) -> str:
     """
@@ -292,6 +296,7 @@ def read_open_position(ticker: str) -> list[dict]:
             p.strike,
             p.expiry,
             p.notes,
+            COALESCE(p.ul_cost_basis, 0)                           AS ul_cost_basis,
             -- net_qty: positive means net short (more sells than buys)
             SUM(CASE WHEN t.action = 'sell' THEN  t.quantity
                      WHEN t.action = 'buy'  THEN -t.quantity
@@ -354,6 +359,7 @@ def get_all_open_positions(ticker: str | None = None) -> list[dict]:
             p.expiry,
             p.notes,
             p.spread_id,
+            COALESCE(p.ul_cost_basis, 0)                           AS ul_cost_basis,
             SUM(CASE WHEN t.action = 'sell' THEN  t.quantity
                      WHEN t.action = 'buy'  THEN -t.quantity
                      ELSE 0 END)                                    AS net_qty,
@@ -370,6 +376,7 @@ def get_all_open_positions(ticker: str | None = None) -> list[dict]:
           AND t.is_test = 0
           {ticker_clause}
         GROUP BY p.id
+        HAVING net_qty != 0
         ORDER BY p.symbol, p.expiry, p.strike
     """
 
@@ -792,19 +799,13 @@ def get_eval_data(
                 gap = underlying - strike
                 if gap < buffer:
                     reasons.append(
-                        f"Within ATR buffer (put): "
-                        f"u/l ${underlying:.2f} − strike ${strike:.2f} "
-                        f"= ${gap:.2f}  <  buffer ${buffer:.2f}  "
-                        f"(1.5 × ATR ${atr_val:.2f})"
+                        f"Within ATR buffer of ${buffer:.2f} (1.5 × ATR ${atr_val:.2f})"
                     )
             elif opt_type == "CALL":
                 gap = strike - underlying
                 if gap < buffer:
                     reasons.append(
-                        f"Within ATR buffer (call): "
-                        f"strike ${strike:.2f} − u/l ${underlying:.2f} "
-                        f"= ${gap:.2f}  <  buffer ${buffer:.2f}  "
-                        f"(1.5 × ATR ${atr_val:.2f})"
+                        f"Within ATR buffer of ${buffer:.2f} (1.5 × ATR ${atr_val:.2f})"
                     )
 
         result_positions.append({
@@ -931,7 +932,7 @@ def _parse_recommended_option(text: str, chain_rows: list[dict]) -> dict | None:
             except ValueError:
                 continue
 
-    # Find best matching row: exact strike + expiry if possible, else nearest strike
+    # Find best matching row: must match strike exactly; prefer exact expiry too
     best = None
     best_dist = float("inf")
     for row in chain_rows:
@@ -941,11 +942,42 @@ def _parse_recommended_option(text: str, chain_rows: list[dict]) -> dict | None:
             continue
         dist = abs(row_strike - target_strike)
         expiry_match = (target_expiry is None or row.get("expiry") == target_expiry)
-        # Prefer exact expiry match; use distance as tiebreaker
         score = dist + (0 if expiry_match else 1000)
         if score < best_dist:
             best_dist = score
             best = row
+
+    # If no close match found (e.g. recommended expiry not in fetched chain),
+    # synthesize a row directly from the parsed text so we show the right option
+    if best is None or best_dist >= 1000:
+        if target_strike and target_expiry:
+            # Extract price from text: @ $X.XX or premium of $X.XX
+            price_match = re.search(
+                r'(?:@|premium\s+of|price\s+of|at)\s*\$?\s*(\d+(?:\.\d+)?)',
+                text, re.IGNORECASE
+            )
+            opt_price = price_match.group(1) if price_match else None
+            # Use ul_price from chain if available
+            ul_price = chain_rows[0].get("ul_price") if chain_rows else None
+            opt_type = chain_rows[0].get("option_type", "CALL") if chain_rows else "CALL"
+            try:
+                today = datetime.date.today()
+                dte = (datetime.date.fromisoformat(target_expiry) - today).days
+            except ValueError:
+                dte = None
+            return {
+                "symbol":      chain_rows[0].get("symbol", "") if chain_rows else "",
+                "option_type": opt_type,
+                "strike":      str(target_strike),
+                "expiry":      target_expiry,
+                "side":        "Short",
+                "dte":         dte,
+                "delta":       None,
+                "ul_price":    ul_price,
+                "opt_price":   opt_price,
+                "_synthesized": True,
+            }
+
     return best
 
 
@@ -1036,30 +1068,88 @@ def _parse_ideal_entry(text: str) -> str | None:
 
 
 def _detect_recommendation(text: str) -> str:
-    """Parse a NotebookLM ROLL response and return ROLL, HOLD, or ASSIGNMENT."""
+    """Parse a NotebookLM ROLL response and return ROLL, HOLD, or ASSIGNMENT.
+
+    Priority order:
+      1. Explicit assignment language anywhere
+      2. First "primary recommendation" / bold heading in the text
+      3. First "recommendation/strategy/action:" heading
+      4. Negative-roll signals near the top (do not roll, no need to roll, …)
+      5. Weighted word-count fallback (HOLD wins ties; "roll" mentions inside
+         secondary/alternative sections are discounted)
+    """
     low = text.lower()
-    if re.search(r"accept.{0,20}assignment|take.{0,20}assignment|let.{0,10}assign|allow.{0,10}assignment", low):
+
+    # ── 1. Assignment always wins ────────────────────────────────────────────
+    if re.search(
+        r"accept.{0,20}assignment|take.{0,20}assignment"
+        r"|let.{0,10}assign|allow.{0,10}assignment",
+        low
+    ):
         return "ASSIGNMENT"
-    # Check for explicit "do nothing" / hold before checking for "roll"
-    # (a roll recommendation will often mention "do nothing" as the rejected option)
-    first_heading_match = re.search(
-        r"(?:recommendation|strategy|action)[:\s]+([^\n.]+)", low
+
+    # ── 2. Explicit "primary recommendation" label ───────────────────────────
+    primary_match = re.search(
+        r"primary\s+recommendation[:\s\*]+([^\n.]{1,80})", low
     )
-    if first_heading_match:
-        snippet = first_heading_match.group(1)
-        if re.search(r"\bdo nothing\b|\bhold\b|\bno action\b|\bno roll\b", snippet):
+    if primary_match:
+        snippet = primary_match.group(1)
+        if re.search(r"\bhold\b|\bdo nothing\b|\bno action\b|\bno roll\b", snippet):
             return "HOLD"
         if re.search(r"\broll\b", snippet):
             return "ROLL"
         if re.search(r"\bassignment\b", snippet):
             return "ASSIGNMENT"
-    # Fallback: count occurrences
-    roll_n   = len(re.findall(r"\broll(?:ing|ed)?\b", low))
-    do_n     = len(re.findall(r"\bdo nothing\b|\bhold\b", low))
-    assign_n = len(re.findall(r"\bassignment\b", low))
+
+    # ── 3. First bold/heading "recommendation / strategy / action" line ──────
+    first_heading_match = re.search(
+        r"(?:\*{1,2})?(?:recommendation|strategy|action|verdict)"
+        r"(?:\*{1,2})?[:\s\*]+([^\n.]{1,120})",
+        low
+    )
+    if first_heading_match:
+        snippet = first_heading_match.group(1)
+        # Strip stars/punctuation
+        snippet = re.sub(r"[\*#]", "", snippet).strip()
+        if re.search(r"\bhold\b|\bdo nothing\b|\bno action\b|\bno roll\b", snippet):
+            return "HOLD"
+        if re.search(r"\broll\b", snippet):
+            return "ROLL"
+        if re.search(r"\bassignment\b", snippet):
+            return "ASSIGNMENT"
+
+    # ── 4. Negative-roll phrases near the top (first 600 chars) ─────────────
+    top = low[:600]
+    if re.search(
+        r"\bdo not roll\b|\bshould not roll\b|\bno need to roll\b"
+        r"|\bnot roll\b|\bavoid rolling\b|\bno roll\b",
+        top
+    ):
+        return "HOLD"
+
+    # ── 5. Weighted word-count fallback ─────────────────────────────────────
+    # Discount "roll" mentions that appear inside secondary/alternative clauses
+    # by removing those sub-sentences before counting.
+    # Patterns like "alternatively … roll", "secondary … roll", "if you want to roll"
+    cleaned = re.sub(
+        r"(?:alternatively|secondary\s+option|as\s+an?\s+alternative"
+        r"|you\s+could\s+also|if\s+you\s+(?:prefer|want|choose)\s+to\s+roll"
+        r"|consider\s+rolling)[^.!?\n]{0,200}",
+        " ",
+        low
+    )
+    strong_hold = len(re.findall(
+        r"\bhold\s+(?:to\s+)?expir|\blet\s+it\s+expir|\bno\s+action\b|\bdo\s+nothing\b"
+        r"|\bhold\s+(?:the\s+)?position\b|\bhold\s+(?:the\s+)?trade\b",
+        cleaned
+    ))
+    roll_n   = len(re.findall(r"\broll(?:ing|ed)?\b", cleaned))
+    do_n     = len(re.findall(r"\bdo nothing\b|\bhold\b", cleaned)) + strong_hold * 2
+    assign_n = len(re.findall(r"\bassignment\b", cleaned))
+
     if assign_n > roll_n and assign_n > do_n:
         return "ASSIGNMENT"
-    if roll_n >= do_n:
+    if roll_n > do_n:   # strictly greater — ties go to HOLD
         return "ROLL"
     return "HOLD"
 
@@ -1131,17 +1221,13 @@ async def run_roll_for_position(
         key_dates = get_key_dates(ticker)
         vix = get_vix()
 
-        text = await query_notebooklm(
-            notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
-            silent=True,
-        )
-        if not text:
-            return {"error": "Empty response from NotebookLM", "recommendation": "HOLD", "text": "", "ticker": ticker}
-
-        # Resolve spread_id from the open position matching this pos_key.
+        # Resolve spread_id and ul_cost_basis from the matched open position BEFORE querying,
+        # so the cost basis context is included in the prompt.
         # Strike is a float in the DB but a bare number string in the JS pos_key,
         # so compare as floats to avoid "5.0" != "5" mismatches.
-        spread_id = None
+        spread_id    = None
+        matched_pos  = None
+        ul_cost_basis = 0.0
         if pos_key:
             pk_parts = pos_key.split("|")  # symbol|option_type|strike|expiry
             pk_sym    = pk_parts[0].upper()  if len(pk_parts) > 0 else ""
@@ -1151,7 +1237,6 @@ async def run_roll_for_position(
                 pk_strike = float(pk_parts[2]) if len(pk_parts) > 2 else None
             except ValueError:
                 pk_strike = None
-            matched_pos = None
             for p in open_positions:
                 try:
                     p_strike = float(p.get("strike", ""))
@@ -1161,17 +1246,29 @@ async def run_roll_for_position(
                         and str(p.get("option_type","")).upper() == pk_type
                         and p_strike == pk_strike
                         and str(p.get("expiry","")) == pk_expiry):
-                    spread_id  = p.get("spread_id")
-                    matched_pos = p
-                    log.debug("Matched pos_key=%r → spread_id=%r", pos_key, spread_id)
+                    spread_id     = p.get("spread_id")
+                    matched_pos   = p
+                    ul_cost_basis = float(p.get("ul_cost_basis") or 0)
+                    log.debug("Matched pos_key=%r → spread_id=%r ul_cost_basis=%.2f",
+                              pos_key, spread_id, ul_cost_basis)
                     break
             else:
                 log.warning("No position matched pos_key=%r in open_positions", pos_key)
+
+        text = await query_notebooklm(
+            notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
+            silent=True,
+            ul_cost_basis=ul_cost_basis,
+        )
+        if not text:
+            return {"error": "Empty response from NotebookLM", "recommendation": "HOLD", "text": "", "ticker": ticker}
+
         chain = get_chain_net_cash(spread_id, fallback_ticker=ticker)
 
         # Expected PnL: close current position at 40% of sale price (keep 60%)
         pos_avg_price = float(matched_pos["avg_price"]) if matched_pos and matched_pos.get("avg_price") is not None else None
         pos_qty       = abs(int(matched_pos["net_qty"])) if matched_pos and matched_pos.get("net_qty") is not None else None
+
         return {
             "recommendation": _detect_recommendation(text),
             "text": text,
@@ -1182,6 +1279,7 @@ async def run_roll_for_position(
             "chain_positions": chain["num_positions"],
             "pos_avg_price":   pos_avg_price,
             "pos_qty":         pos_qty,
+            "ul_cost_basis":   ul_cost_basis,
             "error": None,
         }
 
@@ -1196,7 +1294,8 @@ async def run_unborn_for_ticker(
     qty: int,
     strat: str,
     notebook_id: str,
-    num_expirations: int = 10,
+    num_expirations: int = 20,
+    ul_cost_basis: float = 0.0,
 ) -> dict:
     """
     CC/CSP analysis for a ticker with no existing open position ('unborn').
@@ -1283,6 +1382,7 @@ async def run_unborn_for_ticker(
         text = await query_notebooklm(
             notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
             silent=True,
+            ul_cost_basis=ul_cost_basis,
         )
         if not text:
             return {"error": "Empty response from NotebookLM", "recommendation": "HOLD",
@@ -1333,8 +1433,8 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   :root {
     --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
     --text: #e2e8f0; --muted: #8892a4; --accent: #4f8ef7;
-    --ok: #22c55e; --warn: #f59e0b; --danger: #ef4444;
-    --ok-bg: #052e16; --warn-bg: #451a03; --danger-bg: #450a0a;
+    --ok: #22c55e; --warn: #facc15; --danger: #ef4444;
+    --ok-bg: #052e16; --warn-bg: #3a2e00; --danger-bg: #450a0a;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
@@ -1365,6 +1465,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   tr:hover td { filter: brightness(1.15); }
   .badge { display: inline-block; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 600; letter-spacing: 0.05em; }
   .badge-ok     { background: var(--ok-bg);   color: var(--ok);   }
+  .badge-hold   { background: #0c1a2e; color: var(--accent); border: 1px solid var(--accent); }
   .badge-warn   { background: var(--warn-bg); color: var(--warn); }
   .badge-danger { background: var(--danger-bg); color: var(--danger); }
   .reasons { font-size: 11px; color: var(--muted); white-space: normal; max-width: 360px; }
@@ -1413,6 +1514,23 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
       <input type="checkbox" id="collapse-ok" onchange="applyCollapseOk()" style="cursor:pointer;accent-color:var(--accent)">
       Collapse OK
     </label>
+    <div style="display:flex;flex-direction:column;gap:3px">
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)">
+        Auto-refresh
+        <select id="auto-refresh-sel" onchange="setAutoRefresh(this.value)"
+          style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px;font-family:inherit;cursor:pointer">
+          <option value="0">Off</option>
+          <option value="300">5 min</option>
+          <option value="600">10 min</option>
+          <option value="900">15 min</option>
+          <option value="1800">30 min</option>
+          <option value="3600">60 min</option>
+          <option value="7200">2 hours</option>
+          <option value="14400">4 hours</option>
+        </select>
+      </label>
+      <span id="last-run" style="font-size:10px;color:var(--muted);padding-left:2px">Last Run: —</span>
+    </div>
     <span id="spinner">&#8635; refreshing…</span>
     <button onclick="fetchData()">&#8635; Refresh</button>
   </div>
@@ -1428,6 +1546,8 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
       <option value="CC" selected>CC</option>
       <option value="CSP">CSP</option>
     </select>
+    <label for="ub-cost" title="Cost basis of the underlying shares">Cost Basis $</label>
+    <input type="number" id="ub-cost" placeholder="0.00" min="0" step="0.01" style="width:80px" title="Your cost basis per share for the underlying">
     <button onclick="findUnborn()">Find</button>
     <span id="unborn-result"></span>
   </div>
@@ -1450,6 +1570,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
         <th onclick="sortTable(11)">PnL %</th>
         <th>Status / Flags</th>
         <th>Action<br><button onclick="resetRecommendations()" style="font-size:10px;padding:2px 7px;margin-top:4px;font-weight:normal">Reset</button></th>
+        <th style="text-align:center;cursor:pointer" onclick="unhideAll()" title="Click to unhide all">Hide</th>
       </tr>
     </thead>
     <tbody id="pos-body"></tbody>
@@ -1458,7 +1579,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
 </main>
 <script>
 let _data = [];
-let _sortCol = 3, _sortDir = 1;
+let _sortCol = 0, _sortDir = 1;
 let _ubSortCol = 3, _ubSortDir = 1;
 function _ubSort(col) {
   if (_ubSortCol === col) _ubSortDir *= -1; else { _ubSortCol = col; _ubSortDir = 1; }
@@ -1473,6 +1594,9 @@ async function fetchData() {
     const d = await r.json();
     document.getElementById('error-bar').style.display = 'none';
     applyData(d);
+    const ts = new Date().toLocaleTimeString('en-US', {hour12: false});
+    document.getElementById('last-run').textContent = 'Last Run: ' + ts;
+    localStorage.setItem(_LS_AR_LAST, String(Date.now()));
   } catch(e) {
     const bar = document.getElementById('error-bar');
     bar.textContent = 'Refresh failed: ' + e.message;
@@ -1558,31 +1682,72 @@ function renderTable() {
       '<ul class="reasons">' + p.reasons.map(r => '<li>' + esc(r) + '</li>').join('') + '</ul>';
 
     const posKey = [p.symbol, p.option_type, String(p.strike||''), p.expiry||''].join('|');
+    const fingerprint = _flagFingerprint(p);
+    const flagChanged = posKey in _prevFlags && _prevFlags[posKey] !== fingerprint;
     const cached = _recommendations[posKey];
     const actionCell = cached
       ? recBadge(cached.rec, posKey, cached.chainCash)
       : `<button onclick="analyzePosition('${posKey.replace(/'/g,"\\'")}', this)" style="font-size:11px;padding:4px 10px">Analyze</button>`;
     const actionTdAttr = ` data-poskey="${posKey.replace(/"/g,'&quot;')}"`;
 
+    // ── Moneyness color for symbol ──
+    const underlying = p.underlying;
+    const strike = parseFloat(p.strike || 0);
+    const optType = (p.option_type || '').toUpperCase();
+    let symColor = '';
+    if (underlying != null && strike > 0) {
+      const isITM = (optType === 'CALL' && underlying > strike) || (optType === 'PUT' && underlying < strike);
+      if (isITM) {
+        symColor = 'color:var(--danger)';
+      } else {
+        const pctAway = Math.abs(underlying - strike) / underlying * 100;
+        symColor = pctAway <= 3.0 ? 'color:var(--warn)' : 'color:var(--ok)';
+      }
+    }
+
+    // ── Hide row logic ──
+    const snapshot = _rowSnapshot(p);
+    const hideEntry = _hiddenRows[posKey];
+    let isHidden = false;
+    if (hideEntry) {
+      const prevSnap = hideEntry.snapshot || '';
+      if (prevSnap === snapshot) {
+        isHidden = true; // data unchanged — keep hidden
+      } else {
+        // data changed — unhide and update snapshot
+        delete _hiddenRows[posKey];
+        _saveHidden();
+      }
+    }
+
+    const safeKey = posKey.replace(/'/g, "\\'");
+    const checkboxCell = `<td style="text-align:center">
+      <input type="checkbox" ${isHidden ? 'checked' : ''}
+        onchange="_toggleHide('${safeKey}', this.checked, '${snapshot.replace(/'/g,"\\'")}', this.closest('tr'))"
+        style="cursor:pointer;accent-color:var(--accent);width:14px;height:14px">
+    </td>`;
 
     const tr = document.createElement('tr');
     tr.className = rowCls;
+    if (isHidden) tr.style.display = 'none';
     tr.innerHTML = `
-      <td><b>${esc(p.symbol)}</b></td>
+      <td><b style="${symColor}">${esc(p.symbol)}</b></td>
       <td>${esc((p.option_type||'').toUpperCase())}</td>
       <td>$${parseFloat(p.strike||0).toFixed(2)}</td>
       <td>${esc(p.expiry||'')}</td>
       <td>${side}</td>
       <td>${qty}</td>
-      <td>${p.dte??'—'}</td>
-      <td>${p.delta!=null ? (p.delta>=0?'+':'')+p.delta.toFixed(3) : '—'}</td>
+      <td>${p.dte==null ? '—' : `<span style="color:${p.dte>21?'var(--ok)':p.dte>=10?'var(--warn)':'var(--danger)'}">${p.dte}</span>`}</td>
+      <td>${p.delta!=null ? `<span style="color:${Math.abs(p.delta)<0.40?'var(--ok)':Math.abs(p.delta)<=0.60?'var(--warn)':'var(--danger)'}">${(p.delta>=0?'+':'')+p.delta.toFixed(3)}</span>` : '—'}</td>
       <td>${p.underlying!=null ? '$'+p.underlying.toFixed(2) : '—'}</td>
       <td>${p.current_price!=null ? '$'+p.current_price.toFixed(2) : '—'}</td>
       <td>${pnlAbsStr}</td>
       <td>${pnlPctStr}</td>
-      <td>${badge}${reasons}</td>
-      <td${actionTdAttr}>${actionCell}</td>`;
+      <td>${badge}${flagChanged ? `<span title="Changed since last refresh" style="outline:1px solid var(--warn);border-radius:3px;padding:1px 4px;font-weight:700">&#9650; ${reasons}</span>` : reasons}</td>
+      <td${actionTdAttr}>${actionCell}</td>
+      ${checkboxCell}`;
     tbody.appendChild(tr);
+    _prevFlags[posKey] = fingerprint;
   }
   applyCollapseOk();
 }
@@ -1616,6 +1781,129 @@ function _saveRecs(recs) {
   try { localStorage.setItem(_LS_KEY, JSON.stringify(recs)); } catch {}
 }
 const _recommendations = _loadRecs(); // posKey -> {rec}
+
+// ── Flag-change detection ────────────────────────────────────────────────────
+// Stores the flag fingerprint from the previous render so we can highlight
+// anything that changed on the next fetch.
+let _prevFlags = {}; // posKey -> "flagged|nFlags|reason0;reason1;..."
+
+function _flagFingerprint(p) {
+  return [(p.flagged ? '1' : '0'), (p.reasons||[]).length, (p.reasons||[]).join(';')].join('|');
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Hidden rows persistence ──────────────────────────────────────────────────
+const _LS_HIDE_KEY = 'optionsHiddenRows';
+function _loadHidden() {
+  try { return JSON.parse(localStorage.getItem(_LS_HIDE_KEY) || '{}'); } catch { return {}; }
+}
+function _saveHidden() {
+  try { localStorage.setItem(_LS_HIDE_KEY, JSON.stringify(_hiddenRows)); } catch {}
+}
+const _hiddenRows = _loadHidden(); // posKey -> {snapshot}
+
+function _rowSnapshot(p) {
+  // A compact fingerprint of the fields that matter for change detection
+  return [
+    p.strike, p.expiry,
+    p.underlying != null ? p.underlying.toFixed(2) : '',
+    p.delta     != null ? p.delta.toFixed(3)      : '',
+    p.abs_pnl   != null ? p.abs_pnl.toFixed(2)    : '',
+    p.flagged ? '1' : '0',
+    (p.reasons||[]).length
+  ].join('|');
+}
+
+function unhideAll() {
+  for (const key of Object.keys(_hiddenRows)) delete _hiddenRows[key];
+  _saveHidden();
+  document.querySelectorAll('#pos-body tr').forEach(tr => {
+    tr.style.display = '';
+    const cb = tr.querySelector('input[type=checkbox]');
+    if (cb) cb.checked = false;
+  });
+}
+
+function _toggleHide(posKey, checked, snapshot, trEl) {
+  if (checked) {
+    _hiddenRows[posKey] = {snapshot};
+    if (trEl) trEl.style.display = 'none';
+  } else {
+    delete _hiddenRows[posKey];
+    if (trEl) trEl.style.display = '';
+  }
+  _saveHidden();
+}
+// ────────────────────────────────────────────────────────────────────────────
+
+// ── Auto-refresh scheduler ───────────────────────────────────────────────────
+// Uses a 30-second heartbeat rather than long setInterval timers, which
+// browsers throttle heavily (especially in background tabs).
+const _LS_AR_KEY  = 'optionsAutoRefresh';
+const _LS_AR_LAST = 'optionsAutoRefreshLastRun'; // epoch ms of last successful fetch
+let _arHeartbeat  = null;
+let _arIntervalSecs = 0;
+
+function _isMarketHours() {
+  const now = new Date();
+  const day = now.getDay();
+  if (day === 0 || day === 6) return false;
+  const mins = now.getHours() * 60 + now.getMinutes();
+  return mins >= 9 * 60 + 30 && mins < 16 * 60;
+}
+
+function _isMarketOpen() {
+  // Exactly at 9:30 or 16:00 Mon-Fri (within the current heartbeat window)
+  const now = new Date();
+  if (now.getDay() === 0 || now.getDay() === 6) return false;
+  const mins = now.getHours() * 60 + now.getMinutes();
+  return mins === 9 * 60 + 30 || mins === 16 * 60;
+}
+
+function _arTick() {
+  if (_arIntervalSecs <= 0) return;
+  const now = Date.now();
+
+  // Always fire at open/close bell (checked every 30s, fires once per minute)
+  if (_isMarketOpen()) {
+    const bellKey = 'arBellFired_' + new Date().toISOString().slice(0,16); // per-minute key
+    if (!sessionStorage.getItem(bellKey)) {
+      sessionStorage.setItem(bellKey, '1');
+      fetchData().then(() => localStorage.setItem(_LS_AR_LAST, String(Date.now())));
+      return;
+    }
+  }
+
+  if (!_isMarketHours()) return;
+
+  const last = parseInt(localStorage.getItem(_LS_AR_LAST) || '0', 10);
+  const elapsed = (now - last) / 1000; // seconds since last fetch
+  if (elapsed >= _arIntervalSecs) {
+    fetchData().then(() => localStorage.setItem(_LS_AR_LAST, String(Date.now())));
+  }
+}
+
+function setAutoRefresh(val) {
+  localStorage.setItem(_LS_AR_KEY, val);
+  clearInterval(_arHeartbeat);
+  _arHeartbeat = null;
+  _arIntervalSecs = parseInt(val, 10) || 0;
+
+  if (_arIntervalSecs > 0) {
+    _arHeartbeat = setInterval(_arTick, 30_000); // heartbeat every 30s
+  }
+}
+
+function _initAutoRefresh() {
+  const saved = localStorage.getItem(_LS_AR_KEY) || '0';
+  const sel = document.getElementById('auto-refresh-sel');
+  if (sel) {
+    const opt = [...sel.options].find(o => o.value === saved);
+    sel.value = opt ? saved : '0';
+  }
+  setAutoRefresh(saved);
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Proposed trades — server-side persistence via /api/unborn-rows
 const _unbornRows = {};   // populated on load from server
@@ -1706,6 +1994,18 @@ function _renderUnbornTable() {
   </table>`;
 }
 
+async function retryAnalysis(key, btn) {
+  // Clear server-side cache entry so the analysis re-runs fresh
+  await fetch('/api/reset-cache-entry', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({position_key: key})
+  });
+  delete _recommendations[key];
+  _saveRecs(_recommendations);
+  analyzePosition(key, btn);
+}
+
 async function deleteUnbornRow(key) {
   delete _unbornRows[key];
   await _saveUnbornToServer();
@@ -1720,16 +2020,33 @@ async function deleteUnbornRow(key) {
 }
 
 function recBadge(rec, key, chainCash) {
-  const cls = rec === 'ROLL' ? 'warn' : rec === 'ASSIGNMENT' ? 'danger' : 'ok';
-  const label = rec === 'HOLD' ? 'HOLD' : rec;
+  const cls = rec === 'ROLL' ? 'warn' : rec === 'ASSIGNMENT' ? 'danger' : rec === 'HOLD' ? 'hold' : 'ok';
+  const label = rec;
   const cashLine = (rec === 'ROLL' && chainCash != null)
     ? `<div style="font-size:10px;margin-top:3px;color:var(--${chainCash >= 0 ? 'ok' : 'danger'})">`
       + `Net chain: ${chainCash >= 0 ? '+' : ''}$${chainCash.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}</div>`
     : '';
-  return `<div style="display:inline-block;text-align:center">
-    <a href="/analyze/${encodeURIComponent(key)}" target="_blank"
-      class="badge badge-${cls}" style="text-decoration:none;cursor:pointer">${label}</a>${cashLine}
+  const safeKey = key.replace(/'/g,"\\'");
+  return `<div style="display:inline-flex;align-items:center;gap:4px">
+    <div style="display:inline-block;text-align:center">
+      <a href="/analyze/${encodeURIComponent(key)}" target="_blank"
+        class="badge badge-${cls}" style="text-decoration:none;cursor:pointer">${label}</a>${cashLine}
+    </div>
+    <button onclick="resetAnalysis('${safeKey}', this)" title="Reset to Analyze"
+      style="font-size:10px;padding:0 4px;line-height:14px;background:none;border:1px solid var(--muted);border-radius:3px;color:var(--muted);cursor:pointer">x</button>
   </div>`;
+}
+
+async function resetAnalysis(key, btn) {
+  await fetch('/api/reset-cache-entry', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({position_key: key})
+  });
+  delete _recommendations[key];
+  _saveRecs(_recommendations);
+  const cell = _actionCell(key);
+  if (cell) cell.innerHTML = `<button onclick="analyzePosition('${key.replace(/'/g,"\\'")}', this)" style="font-size:11px;padding:4px 10px">Analyze</button>`;
 }
 
 function _actionCell(key) {
@@ -1740,6 +2057,9 @@ function _actionCell(key) {
 async function analyzePosition(key, btn) {
   btn.disabled = true;
   btn.textContent = '⟳ Analyzing…';
+  btn.style.background = 'orange';
+  btn.style.color = '#000';
+  btn.style.borderColor = 'orange';
   console.log('[analyze] starting:', key);
   try {
     let d;
@@ -1774,21 +2094,24 @@ async function analyzePosition(key, btn) {
     const cell = _actionCell(key);
     if (cell) {
       cell.innerHTML = `<span class="err-tip" style="color:var(--danger);font-size:11px">&#9888; Error<span class="err-msg">${esc(e.message)}</span></span>
-        <button onclick="analyzePosition('${key.replace(/'/g,"\\'")}', this)" style="font-size:10px;padding:2px 6px;margin-left:4px">Retry</button>`;
+        <button onclick="retryAnalysis('${key.replace(/'/g,"\\'")}', this)" style="font-size:10px;padding:2px 6px;margin-left:4px">Retry</button>`;
     } else {
       btn.disabled = false;
       btn.textContent = 'Retry';
       btn.title = e.message;
+      btn.style.background = '';
+      btn.style.borderColor = '';
       btn.style.color = 'var(--danger)';
     }
   }
 }
 
 async function findUnborn() {
-  const ticker   = document.getElementById('ub-ticker').value.trim().toUpperCase();
-  const qty      = parseInt(document.getElementById('ub-qty').value) || 1;
-  const strat    = document.getElementById('ub-strat').value;
-  const resultEl = document.getElementById('unborn-result');
+  const ticker        = document.getElementById('ub-ticker').value.trim().toUpperCase();
+  const qty           = parseInt(document.getElementById('ub-qty').value) || 1;
+  const strat         = document.getElementById('ub-strat').value;
+  const ul_cost_basis = parseFloat(document.getElementById('ub-cost').value) || 0;
+  const resultEl      = document.getElementById('unborn-result');
   if (!ticker) { resultEl.innerHTML = '<span style="color:var(--danger);font-size:12px">Enter a ticker.</span>'; return; }
 
   resultEl.innerHTML = '<span style="color:var(--muted);font-size:12px">⟳ Analyzing…</span>';
@@ -1796,7 +2119,7 @@ async function findUnborn() {
     const r = await fetch('/api/unborn', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ticker, qty, strat})
+      body: JSON.stringify({ticker, qty, strat, ul_cost_basis})
     });
     let raw, d;
     try { raw = await r.text(); d = JSON.parse(raw); }
@@ -1821,6 +2144,7 @@ async function findUnborn() {
       document.getElementById('ub-ticker').value = '';
       document.getElementById('ub-qty').value = '1';
       document.getElementById('ub-strat').value = 'CC';
+      document.getElementById('ub-cost').value = '';
       resultEl.innerHTML = '';
     }
   } catch(e) {
@@ -1878,7 +2202,7 @@ function _showTradeModal(t) {
   div.innerHTML = `
     <div id="trade-modal-hdr" style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px 10px;background:var(--accent);border-radius:8px 8px 0 0;cursor:grab">
       <b style="color:#fff;font-size:13px">&#128203; Fidelity Trade Ticket</b>
-      <span onclick="document.getElementById('trade-modal').remove()" style="cursor:pointer;color:#fff;font-size:20px;line-height:1;padding:0 2px">&times;</span>
+      <span onclick="document.getElementById('trade-modal').remove()" onmousedown="event.stopPropagation()" style="cursor:pointer;color:#fff;font-size:20px;line-height:1;padding:0 2px">&times;</span>
     </div>
     <div style="padding:14px 16px">
       <table style="border-collapse:collapse;width:100%">
@@ -1944,6 +2268,7 @@ function sortTable(col) {
 document.querySelectorAll('th')[3].classList.add('sorted-asc');
 _loadUnbornFromServer();
 fetchData();
+_initAutoRefresh();
 </script>
 </body>
 </html>"""
@@ -2490,9 +2815,28 @@ def _launch_fidelity_trade(trade: dict) -> None:
     log.info("[fidelity] Form fill complete — review and place order in Fidelity")
 
 
+def _migrate_db_ul_cost_basis() -> None:
+    """Add ul_cost_basis column to positions table if not already present."""
+    import sqlite3
+    db_path = os.path.normpath(JOURNAL_DB)
+    if not os.path.exists(db_path):
+        return
+    try:
+        con = sqlite3.connect(db_path)
+        cols = [row[1] for row in con.execute("PRAGMA table_info(positions)").fetchall()]
+        if "ul_cost_basis" not in cols:
+            con.execute("ALTER TABLE positions ADD COLUMN ul_cost_basis REAL DEFAULT 0")
+            con.commit()
+            log.info("DB migrated: added ul_cost_basis column to positions")
+        con.close()
+    except Exception as exc:
+        log.warning("DB migration (ul_cost_basis) failed: %s", exc)
+
+
 def run_web_dashboard(token: str, account_id: str) -> None:
     """Start a Flask web dashboard showing all open positions with live data."""
     setup_logging()
+    _migrate_db_ul_cost_basis()
 
     try:
         from flask import Flask, Response, request as flask_request
@@ -2505,6 +2849,24 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     import urllib.parse
     import webbrowser
     import threading
+    import time as _time
+
+    # --- Token refresh logic ---
+    _token_state = {
+        "token": token,
+        "expires_at": _time.time() + 55 * 60,  # treat initial token as ~55 min valid
+    }
+    _token_lock = threading.Lock()
+
+    def _get_valid_token() -> str:
+        """Return a fresh access token, refreshing if within 5 minutes of expiry."""
+        with _token_lock:
+            if _time.time() >= _token_state["expires_at"]:
+                secret = os.environ.get("PUBLIC_API_SECRET", "")
+                log.info("Access token expired — refreshing.")
+                _token_state["token"] = get_access_token(secret)
+                _token_state["expires_at"] = _time.time() + 55 * 60
+            return _token_state["token"]
 
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
@@ -2530,6 +2892,23 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
     _analysis_cache: dict[str, dict] = _load_cache()
 
+    # Re-evaluate recommendations on load so any previously mis-classified
+    # entries (e.g. ROLL when primary was HOLD) get corrected immediately
+    # without requiring a fresh NotebookLM call.
+    _cache_dirty = False
+    for _ck, _cv in _analysis_cache.items():
+        if _cv.get("text") and not _cv.get("error"):
+            _fresh_rec = _detect_recommendation(_cv["text"])
+            if _fresh_rec != _cv.get("recommendation"):
+                log.info(
+                    "Cache correction: %s %s → %s (re-detected from text)",
+                    _ck, _cv.get("recommendation"), _fresh_rec,
+                )
+                _cv["recommendation"] = _fresh_rec
+                _cache_dirty = True
+    if _cache_dirty:
+        _save_cache(_analysis_cache)
+
     def _serial(obj):
         if obj is None:
             return None
@@ -2541,7 +2920,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
     @app.route("/api/eval")
     def api_eval():
-        data = get_eval_data(token, account_id, ticker=None, verbose=False)
+        import datetime as _dt
+        log.info("[DASHBOARD-REFRESH] eval requested at %s", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        data = get_eval_data(_get_valid_token(), account_id, ticker=None, verbose=False)
         # Include server-side analysis cache so the client can restore
         # recommendation badges after a manual refresh
         with _cache_lock:
@@ -2560,8 +2941,8 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             return Response(json.dumps({"error": "Missing position_key"}), status=400, mimetype="application/json")
 
         with _cache_lock:
-            # Already have a result — return it immediately
-            if pos_key in _analysis_cache:
+            # Already have a result — return it immediately (skip cached errors so they re-run)
+            if pos_key in _analysis_cache and not _analysis_cache[pos_key].get("error"):
                 return Response(json.dumps(_analysis_cache[pos_key]), mimetype="application/json")
             # Already running — tell the client to retry
             if pos_key in _analysis_inflight:
@@ -2613,8 +2994,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 _analysis_inflight.discard(pos_key)
 
         with _cache_lock:
-            _analysis_cache[pos_key] = result
-            _save_cache(_analysis_cache)
+            if not result.get("error"):
+                _analysis_cache[pos_key] = result
+                _save_cache(_analysis_cache)
         return Response(json.dumps(result, default=_serial), mimetype="application/json")
 
     # ── Unborn routes ──────────────────────────────────────────────────────────
@@ -2639,19 +3021,22 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
     @app.route("/api/unborn", methods=["POST"])
     def api_unborn():
-        body   = flask_request.get_json(force=True, silent=True) or {}
-        ticker = body.get("ticker", "").upper().strip()
-        qty    = int(body.get("qty") or 1)
-        strat  = body.get("strat", "CC").upper()
+        body          = flask_request.get_json(force=True, silent=True) or {}
+        ticker        = body.get("ticker", "").upper().strip()
+        qty           = int(body.get("qty") or 1)
+        strat         = body.get("strat", "CC").upper()
+        ul_cost_basis = float(body.get("ul_cost_basis") or 0)
         if not ticker:
             return Response(json.dumps({"error": "Missing ticker"}), status=400, mimetype="application/json")
         if strat not in ("CC", "CSP"):
             return Response(json.dumps({"error": f"Unknown strat: {strat}"}), status=400, mimetype="application/json")
 
-        ub_key = f"{ticker}|{strat}|{qty}"
+        # Include cost basis in cache key so different cost bases get distinct results
+        cb_key = f"{ul_cost_basis:.2f}" if ul_cost_basis else "0"
+        ub_key = f"{ticker}|{strat}|{qty}|{cb_key}"
 
         with _cache_lock:
-            if ub_key in _unborn_cache:
+            if ub_key in _unborn_cache and not _unborn_cache[ub_key].get("error"):
                 return Response(json.dumps(_unborn_cache[ub_key]), mimetype="application/json")
             if ub_key in _unborn_inflight:
                 return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
@@ -2672,10 +3057,12 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             with _cache_lock: _unborn_inflight.discard(ub_key)
             return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
 
-        log.info("[unborn] Running %s analysis for %s qty=%d", strat, ticker, qty)
+        log.info("[unborn] Running %s analysis for %s qty=%d ul_cost_basis=%.2f",
+                 strat, ticker, qty, ul_cost_basis)
         try:
             result = asyncio.run(
-                run_unborn_for_ticker(fresh_token, fresh_account_id, ticker, qty, strat, notebook_id)
+                run_unborn_for_ticker(fresh_token, fresh_account_id, ticker, qty, strat,
+                                      notebook_id, ul_cost_basis=ul_cost_basis)
             )
             if result.get("error"):
                 log.error("[unborn] Error for %s: %s", ticker, result["error"])
@@ -2689,8 +3076,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 _unborn_inflight.discard(ub_key)
 
         with _cache_lock:
-            _unborn_cache[ub_key] = result
-            _save_unborn_cache(_unborn_cache)
+            if not result.get("error"):
+                _unborn_cache[ub_key] = result
+                _save_unborn_cache(_unborn_cache)
         return Response(json.dumps(result, default=_serial), mimetype="application/json")
 
     _UNBORN_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unborn_rows.json")
@@ -2774,6 +3162,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   a.back:hover{{text-decoration:underline}}
   .badge{{display:inline-block;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:600;letter-spacing:.05em}}
   .badge-ok{{background:var(--ok-bg);color:var(--ok)}}
+  .badge-hold{{background:#0c1a2e;color:var(--accent);border:1px solid var(--accent)}}
   .badge-warn{{background:var(--warn-bg);color:var(--warn)}}
   .badge-danger{{background:var(--danger-bg);color:var(--danger)}}
   .rec-body h1,.rec-body h2{{color:var(--accent);margin:16px 0 6px;font-size:14px}}
@@ -2793,7 +3182,8 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   .ask-input textarea:focus{{border-color:var(--accent)}}
   .ask-input-row{{display:flex;gap:8px;align-items:center}}
   .ask-input-row button{{padding:6px 16px}}
-  #ask-spinner{{font-size:11px;color:var(--muted);display:none}}
+  #ask-spinner{{display:none;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.7s linear infinite;flex-shrink:0}}
+  @keyframes spin{{to{{transform:rotate(360deg)}}}}
 </style></head><body>
 <header>
   <a class="back" href="/" onclick="window.close();return false;">&#8592; Back</a>
@@ -2807,7 +3197,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     <textarea id="ask-q" rows="3" placeholder="Ask a follow-up question…"></textarea>
     <div class="ask-input-row">
       <button onclick="submitAsk()">Ask</button>
-      <span id="ask-spinner">&#8635; querying…</span>
+      <div id="ask-spinner"></div>
     </div>
   </div>
 </div>
@@ -2828,7 +3218,7 @@ async function submitAsk() {{
   const thread = document.getElementById('ask-thread');
   const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=q; thread.appendChild(qEl);
   ta.value = '';
-  document.getElementById('ask-spinner').style.display = 'inline';
+  document.getElementById('ask-spinner').style.display = 'block';
   const aEl = document.createElement('div'); aEl.className='ask-a'; aEl.textContent='…'; thread.appendChild(aEl);
   aEl.scrollIntoView({{behavior:'smooth'}});
   try {{
@@ -2883,9 +3273,33 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                     context_parts.append(f"Q: {item['q']}\nA: {item['a'][:600]}")
             context_parts.append(f"=== New Question ===\n{question}")
             full_prompt = "\n\n".join(context_parts)
+            _ASK_TRANSPORT_KW = ("timeout", "transport", "network", "connection", "reset", "eof", "read")
+            _ASK_TRANSPORT_BACKOFF = [15, 30, 60]
             async def _ask():
+                last_exc = None
                 async with NotebookLMClient.from_storage() as client:
-                    return await client.chat.ask(notebook_id, full_prompt)
+                    for attempt in range(4):
+                        try:
+                            return await client.chat.ask(notebook_id, full_prompt)
+                        except Exception as _exc:
+                            last_exc = _exc
+                            msg = str(_exc).lower()
+                            if "rate" in msg or "limit" in msg or "429" in msg or "reject" in msg:
+                                wait = 30 * (2 ** attempt)  # 30s, 60s, 120s
+                                log.warning("[ask] rate limited, waiting %ds (attempt %d/4)", wait, attempt+1)
+                                await asyncio.sleep(wait)
+                            elif any(kw in msg for kw in _ASK_TRANSPORT_KW):
+                                if attempt < 3:
+                                    wait = _ASK_TRANSPORT_BACKOFF[min(attempt, len(_ASK_TRANSPORT_BACKOFF) - 1)]
+                                    log.warning("[ask] transport/timeout error (attempt %d/4), retrying in %ds — %s", attempt+1, wait, _exc)
+                                    await asyncio.sleep(wait)
+                                else:
+                                    raise RuntimeError(
+                                        "NotebookLM timed out after 4 attempts. Try again in a few minutes."
+                                    ) from _exc
+                            else:
+                                raise
+                raise last_exc
             result = asyncio.run(_ask())
             answer = getattr(result, "answer", None) or str(result)
             log.info("[ask] pos_key=%s q=%s… answer_len=%d", pos_key, question[:40], len(answer))
@@ -2905,6 +3319,16 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
         except Exception as exc:
             log.error("[ask] error: %s", exc)
             return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
+
+    @app.route("/api/reset-cache-entry", methods=["POST"])
+    def api_reset_cache_entry():
+        body    = flask_request.get_json(force=True, silent=True) or {}
+        pos_key = body.get("position_key", "")
+        with _cache_lock:
+            _analysis_cache.pop(pos_key, None)
+            _save_cache(_analysis_cache)
+        log.info("[reset-entry] cleared cache for %s", pos_key)
+        return Response(json.dumps({"status": "ok"}), mimetype="application/json")
 
     @app.route("/api/unborn-cache-delete", methods=["POST"])
     def api_unborn_cache_delete():
@@ -2948,7 +3372,7 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
         else:
             rec  = cached.get("recommendation", "")
             text = cached.get("text", "")
-            rec_cls = {"ROLL": "warn", "ASSIGNMENT": "danger", "HOLD": "ok"}.get(rec, "ok")
+            rec_cls = {"ROLL": "warn", "ASSIGNMENT": "danger", "HOLD": "hold"}.get(rec, "ok")
             # Convert markdown-ish text to simple HTML
             lines_out = []
             for ln in text.splitlines():
@@ -2980,46 +3404,42 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
 
                 has_pos = pos_avg_price is not None and pos_qty is not None and pos_qty > 0
 
-                if rec == "ROLL" and has_pos:
-                    # ROLL: close current leg at 40% of premium before rolling (keep 60%)
-                    buy_back_cost = round(pos_avg_price * 0.40 * 100 * pos_qty, 2)
-                    expected_pnl  = round(pos_avg_price * 0.60 * 100 * pos_qty, 2)
-                    final_pnl     = round(chain_cash - buy_back_cost, 2)
-                    final_sign    = "+" if final_pnl >= 0 else ""
-                    final_clr     = "var(--ok)" if final_pnl >= 0 else "var(--danger)"
-                    working = (
-                        f"${collected:,.2f} collected "
-                        f"− ${paid:,.2f} paid "
-                        f"− ${buy_back_cost:,.2f} close at 40% "
-                        f"(${pos_avg_price:.2f} x 0.40 x 100 x {pos_qty} contracts) "
-                        f"= <strong style='color:{final_clr}'>{final_sign}${final_pnl:,.2f}</strong>"
-                    )
-                    exp_note = f". Expected PnL if closed today: +${expected_pnl:,.2f}"
+                def _fmt_pnl(val):
+                    sign = "+" if val >= 0 else ""
+                    clr  = "var(--ok)" if val >= 0 else "var(--danger)"
+                    return f"<strong style='color:{clr}'>{sign}${val:,.2f}</strong>"
 
-                elif rec == "HOLD" and has_pos:
-                    # HOLD: position expected to expire worthless — keep full remaining premium
-                    remaining     = round(pos_avg_price * 100 * pos_qty, 2)
-                    final_pnl     = round(chain_cash, 2)   # chain_cash already includes open premium
-                    final_sign    = "+" if final_pnl >= 0 else ""
-                    final_clr     = "var(--ok)" if final_pnl >= 0 else "var(--danger)"
+                base = f"${collected:,.2f} collected − ${paid:,.2f} paid"
+
+                if rec == "ROLL" and has_pos:
+                    # ROLL: close open leg at 40% (keep 60% profit), then roll
+                    buy_back_cost = round(pos_avg_price * 0.40 * 100 * pos_qty, 2)
+                    final_pnl     = round(chain_cash - buy_back_cost, 2)
                     working = (
-                        f"${collected:,.2f} collected "
-                        f"− ${paid:,.2f} paid "
-                        f"(${remaining:,.2f} remaining if expires worthless: "
-                        f"${pos_avg_price:.2f} x 100 x {pos_qty} contracts) "
-                        f"= <strong style='color:{final_clr}'>{final_sign}${final_pnl:,.2f}</strong>"
+                        f"{base} "
+                        f"− ${buy_back_cost:,.2f} close at 40% "
+                        f"(${pos_avg_price:.2f} × 0.40 × 100 × {pos_qty} contracts) "
+                        f"= {_fmt_pnl(final_pnl)}"
+                    )
+                    exp_note = ""
+
+                elif rec in ("HOLD", "ASSIGNMENT") and has_pos:
+                    # HOLD / ASSIGNMENT: show two scenarios
+                    buy_back_cost  = round(pos_avg_price * 0.40 * 100 * pos_qty, 2)
+                    pnl_worthless  = round(chain_cash, 2)
+                    pnl_60pct      = round(chain_cash - buy_back_cost, 2)
+                    working = (
+                        f"{base}<br>"
+                        f"&nbsp;&nbsp;If expires worthless: {_fmt_pnl(pnl_worthless)}<br>"
+                        f"&nbsp;&nbsp;If closed at 60% profit: − ${buy_back_cost:,.2f} close at 40% "
+                        f"(${pos_avg_price:.2f} × 0.40 × 100 × {pos_qty} contracts) "
+                        f"= {_fmt_pnl(pnl_60pct)}"
                     )
                     exp_note = ""
 
                 else:
-                    # No position data or ASSIGNMENT — show raw chain cash
-                    sign    = "+" if chain_cash >= 0 else ""
-                    clr     = "var(--ok)" if chain_cash >= 0 else "var(--danger)"
-                    working = (
-                        f"${collected:,.2f} collected "
-                        f"− ${paid:,.2f} paid "
-                        f"= <strong style='color:{clr}'>{sign}${chain_cash:,.2f}</strong>"
-                    )
+                    # No position data — show raw chain cash
+                    working  = f"{base} = {_fmt_pnl(round(chain_cash, 2))}"
                     exp_note = ""
 
                 chain_html = (
@@ -3061,6 +3481,7 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
   a.back:hover{{text-decoration:underline}}
   .badge{{display:inline-block;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:600;letter-spacing:.05em}}
   .badge-ok{{background:var(--ok-bg);color:var(--ok)}}
+  .badge-hold{{background:#0c1a2e;color:var(--accent);border:1px solid var(--accent)}}
   .badge-warn{{background:var(--warn-bg);color:var(--warn)}}
   .badge-danger{{background:var(--danger-bg);color:var(--danger)}}
   .rec-body h1,.rec-body h2{{color:var(--accent);margin:16px 0 6px;font-size:14px}}
@@ -3083,7 +3504,8 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
   .ask-input textarea:focus{{border-color:var(--accent)}}
   .ask-input-row{{display:flex;gap:8px;align-items:center}}
   .ask-input-row button{{padding:6px 16px}}
-  #ask-spinner{{font-size:11px;color:var(--muted);display:none}}
+  #ask-spinner{{display:none;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.7s linear infinite;flex-shrink:0}}
+  @keyframes spin{{to{{transform:rotate(360deg)}}}}
 </style>
 </head>
 <body>
@@ -3099,7 +3521,7 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
     <textarea id="ask-q" rows="3" placeholder="Ask a follow-up question…"></textarea>
     <div class="ask-input-row">
       <button onclick="submitAsk()">Ask</button>
-      <span id="ask-spinner">&#8635; querying…</span>
+      <div id="ask-spinner"></div>
     </div>
   </div>
 </div>
@@ -3123,7 +3545,7 @@ async function submitAsk() {{
   qEl.textContent = q;
   thread.appendChild(qEl);
   ta.value = '';
-  document.getElementById('ask-spinner').style.display = 'inline';
+  document.getElementById('ask-spinner').style.display = 'block';
   const aEl = document.createElement('div');
   aEl.className = 'ask-a';
   aEl.textContent = '…';
@@ -3172,7 +3594,10 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
         # Spawn a lightweight detached process (close_fds=True so it does NOT
         # inherit the Flask socket) that waits for us to release the port, then
         # starts a fresh server. Parent exits immediately via os._exit().
+        # Set _PORTFOLIO_BOUNCE=1 so the child knows not to open a new browser tab.
         import subprocess
+        env_override = os.environ.copy()
+        env_override["_PORTFOLIO_BOUNCE"] = "1"
         cmd = (
             f"import time, os, sys; "
             f"time.sleep(1.5); "
@@ -3182,12 +3607,19 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
             [sys.executable, "-c", cmd],
             close_fds=True,
             start_new_session=True,
+            env=env_override,
         )
         os._exit(0)
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
-    threading.Thread(target=_open_browser, daemon=True).start()
+    # Only open a browser tab on a fresh start, not when bounced via SIGTERM (kill -15).
+    if not os.environ.get("_PORTFOLIO_BOUNCE"):
+        threading.Thread(target=_open_browser, daemon=True).start()
+    else:
+        log.info("Bounce restart detected (_PORTFOLIO_BOUNCE set) — skipping browser open")
+        # Clear the flag so any further child bounces are also suppressed correctly
+        os.environ.pop("_PORTFOLIO_BOUNCE", None)
     app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False, threaded=True)
 
 
@@ -3425,11 +3857,23 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
     stem = base.split(".")[0].upper()
     uploading_ticker = stem if (1 <= len(stem) <= 5 and stem.isupper()) else None
 
+    # Skip upload if we recently uploaded this ticker (avoids burning rate-limit quota on retries)
+    if uploading_ticker:
+        last = _last_upload_time.get(uploading_ticker)
+        if last and (datetime.datetime.now() - last).total_seconds() < _UPLOAD_TTL_MINUTES * 60:
+            log.info("Skipping upload for %s — uploaded %.0f min ago (TTL %d min)",
+                     uploading_ticker,
+                     (datetime.datetime.now() - last).total_seconds() / 60,
+                     _UPLOAD_TTL_MINUTES)
+            return
+
     log.info("Uploading %s to NotebookLM notebook %s ...", file_path, notebook_id)
     try:
         async with NotebookLMClient.from_storage() as client:
             await _purge_stale_ticker_sources(client, notebook_id, uploading_ticker)
             await client.sources.add_file(notebook_id, file_path, wait=True)
+        if uploading_ticker:
+            _last_upload_time[uploading_ticker] = datetime.datetime.now()
         log.info("Upload complete: %s", os.path.basename(file_path))
     except Exception as exc:
         print(f"ERROR: Upload failed — {exc}", file=sys.stderr)
@@ -3580,6 +4024,7 @@ async def query_notebooklm(
     positions: list[dict] | None = None,
     vix: float | None = None,
     silent: bool = False,
+    ul_cost_basis: float | None = None,
 ) -> str | None:
     """Ask NotebookLM for the best CC or CSP choice given the ticker source."""
     try:
@@ -3597,15 +4042,50 @@ async def query_notebooklm(
     strat_label = STRAT_LABELS[strat]
 
     # Embed known dates so the LLM can reason about expiry selection precisely
+    # Only include clauses where data is actually known
+    _earnings_known = dates.get("earnings_date", "Unknown").lower() not in ("unknown", "n/a", "")
+    _exdiv_known    = dates.get("exdiv_date",   "Unknown").lower() not in ("unknown", "n/a", "")
     earnings_note = (
-        f"the next earnings announcement is {dates['earnings_date']} "
-        f"({dates['earnings_source']})"
+        f"the next earnings announcement is {dates['earnings_date']} ({dates['earnings_source']})"
+        if _earnings_known else ""
     )
     exdiv_note = (
         f"the next ex-dividend date is {dates['exdiv_date']} "
         f"({dates['exdiv_source']}, {dates['dividend_amount']} per share)"
+        if _exdiv_known else ""
     )
+    known_notes = [n for n in [earnings_note, exdiv_note] if n]
+    dates_clause = ("Note that " + " and ".join(known_notes) + ". ") if known_notes else ""
+
     vix_note = f"the current VIX is {vix:.2f}" if vix is not None else ""
+
+    # ── Cost basis clause ──────────────────────────────────────────────────────
+    _cb = float(ul_cost_basis) if ul_cost_basis else 0.0
+    if _cb > 0:
+        if strat == "ROLL":
+            cost_basis_clause = (
+                f"The cost basis of the underlying {ticker} shares is ${_cb:.2f} per share. "
+                f"Factor this into your roll recommendation — in particular, flag any scenario "
+                f"where rolling to a lower strike would place it below cost basis, which could "
+                f"result in a loss on assignment. "
+            )
+        elif strat == "CC":
+            cost_basis_clause = (
+                f"The cost basis of the underlying {ticker} shares is ${_cb:.2f} per share. "
+                f"Please ensure the recommended strike is at or above the cost basis to avoid "
+                f"realizing a loss on assignment, and factor this into your strike selection. "
+            )
+        else:  # CSP
+            cost_basis_clause = (
+                f"The reference cost basis for {ticker} is ${_cb:.2f} per share. "
+                f"Factor this into your recommended strike selection — the effective cost if "
+                f"assigned will be the strike minus the premium received. "
+            )
+    else:
+        cost_basis_clause = (
+            f"Note: The cost basis of the underlying {ticker} is not available "
+            f"(ul_cost_basis is 0 or not set). Please flag this gap in your analysis. "
+        )
 
     if strat == "ROLL":
         # Summarise current open positions for context
@@ -3631,7 +4111,8 @@ async def query_notebooklm(
             f"and the latest PLAN and REVIEW sources{vix_clause} determine the best roll or "
             f"do nothing strategy. "
             f"{pos_context}"
-            f"Note that {earnings_note} and {exdiv_note}. "
+            f"{dates_clause}"
+            f"{cost_basis_clause}"
             f"{pnl_instruction}"
         )
     else:
@@ -3641,20 +4122,66 @@ async def query_notebooklm(
             f"taking into consideration the economic calendar releases, "
             f"the latest PLAN and REVIEW sources{vix_clause} and the upcoming "
             f"dividends and/or earnings releases? "
-            f"Note that {earnings_note} and {exdiv_note}."
+            f"{dates_clause}"
+            f"{cost_basis_clause}"
         )
 
+    log.info(
+        "[query_notebooklm] prompt for %s (copy/paste ready):\n%s\n%s\n%s",
+        ticker,
+        "-" * 72,
+        question.strip(),
+        "-" * 72,
+    )
     if not silent:
         print(f"\nQuerying NotebookLM...")
 
-    try:
-        async with NotebookLMClient.from_storage() as client:
-            result = await client.chat.ask(notebook_id, question)
-    except Exception as exc:
-        if not silent:
-            print(f"ERROR: Query failed — {exc}", file=sys.stderr)
-            sys.exit(1)
-        return None
+    _TRANSPORT_KEYWORDS = ("timeout", "transport", "network", "connection", "reset", "eof", "read")
+    _MAX_ATTEMPTS = 4
+    _TRANSPORT_BACKOFF = [15, 30, 60]  # seconds between transport-error retries
+
+    last_exc = None
+    async with NotebookLMClient.from_storage() as client:
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                result = await client.chat.ask(notebook_id, question)
+                break
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                if "rate" in msg or "limit" in msg or "429" in msg or "reject" in msg:
+                    if attempt == 0:
+                        log.warning("[query_notebooklm] rate limited, waiting 20s before one retry (exc: %s)", exc)
+                        await asyncio.sleep(20)
+                    else:
+                        log.warning("[query_notebooklm] rate limited on retry — giving up (exc: %s)", exc)
+                        raise RuntimeError(
+                            "NotebookLM is rate limiting your account. Wait 15–30 minutes before trying again."
+                        ) from exc
+                elif any(kw in msg for kw in _TRANSPORT_KEYWORDS):
+                    if attempt < _MAX_ATTEMPTS - 1:
+                        wait = _TRANSPORT_BACKOFF[min(attempt, len(_TRANSPORT_BACKOFF) - 1)]
+                        log.warning(
+                            "[query_notebooklm] transport/timeout error (attempt %d/%d), retrying in %ds — %s",
+                            attempt + 1, _MAX_ATTEMPTS, wait, exc,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        log.warning("[query_notebooklm] transport/timeout error on final attempt — giving up: %s", exc)
+                        raise RuntimeError(
+                            f"NotebookLM timed out after {_MAX_ATTEMPTS} attempts. "
+                            "NotebookLM may be overloaded — try again in a few minutes."
+                        ) from exc
+                else:
+                    if not silent:
+                        print(f"ERROR: Query failed — {exc}", file=sys.stderr)
+                        sys.exit(1)
+                    return None
+        else:
+            if not silent:
+                print(f"ERROR: Query failed after retries — {last_exc}", file=sys.stderr)
+                sys.exit(1)
+            return None
 
     answer = getattr(result, "answer", None) or str(result)
     # Strip LaTeX / math notation that NotebookLM sometimes emits
