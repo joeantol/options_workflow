@@ -1,1 +1,1 @@
-{}
+{"GLD|CC": {"symbol": "GLD", "option_type": "CALL", "strike": "450.0", "expiry": "2026-06-03", "side": "Short", "dte": 0, "delta": null, "ul_price": 407.8699951171875, "opt_price": "44", "_synthesized": true, "ideal_entry": "Thu/Fri AM", "_qty": 5, "_ubKey": "GLD%7CCC%7C5", "_ul_cost_basis": 446.32}}

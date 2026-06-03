@@ -454,30 +454,79 @@ def get_chain_net_cash(spread_id, fallback_ticker: str | None = None) -> dict:
         return {"net_cash": 0.0, "collected": 0.0, "paid": 0.0, "num_positions": 0, "scoped_by": "error"}
 
 
+def get_ul_cost_basis_from_db(ticker: str) -> float:
+    """Look up the underlying cost basis for ticker from trades.db.
+    Checks open positions first, then any historical position with ul_cost_basis set.
+    Returns 0.0 if not found."""
+    import sqlite3
+    db_path = os.path.normpath(JOURNAL_DB)
+    if not os.path.exists(db_path):
+        return 0.0
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # Prefer a position that still has open trades; fall back to any row with cb set
+        row = con.execute(
+            """
+            SELECT p.ul_cost_basis
+            FROM positions p
+            JOIN trades t ON t.position_id = p.id
+            WHERE UPPER(p.symbol) = UPPER(?)
+              AND p.ul_cost_basis > 0
+            ORDER BY t.trade_date DESC
+            LIMIT 1
+            """,
+            (ticker,),
+        ).fetchone()
+        if not row:
+            # Fallback: any position row for this ticker with cb set (no trade join)
+            row = con.execute(
+                "SELECT ul_cost_basis FROM positions WHERE UPPER(symbol) = UPPER(?) AND ul_cost_basis > 0 ORDER BY id DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
+        con.close()
+        return float(row[0]) if row and row[0] else 0.0
+    except Exception as exc:
+        log.warning("get_ul_cost_basis_from_db(%s) failed: %s", ticker, exc)
+        return 0.0
+
+
 # Cache underlying prices within a session to avoid redundant yfinance calls
 _price_cache: dict[str, float | None] = {}
+
+
+def _fetch_yf_price(ticker: str) -> float | None:
+    """Fetch current price via yfinance without touching the session cache.
+    Uses fast_info first, then history() as fallback — avoids quoteSummary
+    which 404s for ETFs (GDX, GLD, SLV, etc.)."""
+    try:
+        import yfinance as yf
+        t = yf.Ticker(ticker)
+        fi = t.fast_info
+        price = float(fi.last_price) if getattr(fi, "last_price", None) else None
+        if not price:
+            # 1-minute bars for today → last Close is the current intraday price
+            hist = t.history(period="1d", interval="1m")
+            if hist is not None and not hist.empty:
+                price = float(hist["Close"].iloc[-1])
+        return price
+    except Exception:
+        return None
 
 
 def get_underlying_price(ticker: str) -> float | None:
     """Return the current underlying stock price via yfinance (cached per run)."""
     if ticker in _price_cache:
         return _price_cache[ticker]
-    price: float | None = None
-    try:
-        import yfinance as yf
-        fi = yf.Ticker(ticker).fast_info
-        price = float(fi.last_price) if getattr(fi, "last_price", None) else None
-        if not price:
-            info = yf.Ticker(ticker).info
-            raw = (
-                info.get("currentPrice")
-                or info.get("regularMarketPrice")
-                or info.get("previousClose")
-            )
-            price = float(raw) if raw else None
-    except Exception:
-        pass
+    price = _fetch_yf_price(ticker)
     _price_cache[ticker] = price
+    return price
+
+
+def get_underlying_price_fresh(ticker: str) -> float | None:
+    """Fetch a live underlying price from yfinance, bypassing the session cache."""
+    price = _fetch_yf_price(ticker)
+    if price is not None:
+        _price_cache[ticker] = price  # keep cache warm for other callers
     return price
 
 
@@ -712,9 +761,10 @@ def get_eval_data(
     greeks_data = get_option_greeks_batch(token, account_id, osi_list)
     _log(f"{len(greeks_data)} received.")
 
-    # ── Per-ticker caches (underlying price + ATR) ────────────────────────────
+    # ── Per-ticker caches (underlying price + ATR + dividend) ─────────────────
     price_cache_local: dict[str, float | None] = {}
     atr_cache: dict[str, tuple[float | None, float | None]] = {}
+    div_cache: dict[str, float | None] = {}  # ticker -> dividend amount as float
 
     result_positions: list[dict] = []
 
@@ -735,6 +785,16 @@ def get_eval_data(
             atr_val = get_atr(sym, period=14)
             atr_cache[sym] = (atr_val, atr_val * 1.5 if atr_val else None)
         atr_val, buffer = atr_cache[sym]
+
+        # Dividend amount (for early-assignment risk warning on calls)
+        if sym not in div_cache:
+            try:
+                kd = get_key_dates(sym)
+                raw_div = kd.get("dividend_amount", "N/A")
+                div_cache[sym] = float(raw_div.lstrip("$")) if raw_div not in ("N/A", "", None) else None
+            except Exception:
+                div_cache[sym] = None
+        dividend_amount = div_cache[sym]
 
         osi = build_osi_symbol(sym, expiry, opt_type, strike).replace(" ", "")
 
@@ -820,6 +880,7 @@ def get_eval_data(
             "pct_pnl": pct_pnl,
             "reasons": reasons,
             "flagged": bool(reasons),
+            "dividend_amount": dividend_amount,
         })
 
     flagged_count = sum(1 for p in result_positions if p["flagged"])
@@ -1311,6 +1372,17 @@ async def run_unborn_for_ticker(
                 "error": f"No option expirations found for {ticker} on Public.com.",
                 "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat,
             }
+        # Filter out expirations within 7 days — too near-term to be useful
+        _today = datetime.date.today()
+        all_expirations = [
+            e for e in all_expirations
+            if (datetime.date.fromisoformat(e) - _today).days >= 7
+        ]
+        if not all_expirations:
+            return {
+                "error": f"No expirations with DTE ≥ 7 found for {ticker}.",
+                "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat,
+            }
         expirations = all_expirations[:num_expirations]
 
         all_rows: list[dict] = []
@@ -1415,6 +1487,7 @@ async def run_unborn_for_ticker(
             "ticker": ticker,
             "strat": strat,
             "chain": [chosen] if chosen else [],
+            "ul_cost_basis": ul_cost_basis,
             "error": None,
         }
 
@@ -1546,8 +1619,6 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
       <option value="CC" selected>CC</option>
       <option value="CSP">CSP</option>
     </select>
-    <label for="ub-cost" title="Cost basis of the underlying shares">Cost Basis $</label>
-    <input type="number" id="ub-cost" placeholder="0.00" min="0" step="0.01" style="width:80px" title="Your cost basis per share for the underlying">
     <button onclick="findUnborn()">Find</button>
     <span id="unborn-result"></span>
   </div>
@@ -1678,8 +1749,9 @@ function renderTable() {
       : '<span class="' + (pnlPct>=0?'pnl-pos':'pnl-neg') + '">'
         + (pnlPct>=0?'+':'') + pnlPct.toFixed(1) + '%</span>';
 
-    const reasons = (p.reasons||[]).length === 0 ? '' :
-      '<ul class="reasons">' + p.reasons.map(r => '<li>' + esc(r) + '</li>').join('') + '</ul>';
+    // ── Server reasons: strip ATR breach (we re-evaluate it client-side) ──
+    const serverReasons = (p.reasons||[]).filter(r => !r.includes('ATR buffer'));
+    const serverReasonItems = serverReasons.map(r => '<li>' + esc(r) + '</li>').join('');
 
     const posKey = [p.symbol, p.option_type, String(p.strike||''), p.expiry||''].join('|');
     const fingerprint = _flagFingerprint(p);
@@ -1704,6 +1776,35 @@ function renderTable() {
         symColor = pctAway <= 3.0 ? 'color:var(--warn)' : 'color:var(--ok)';
       }
     }
+
+    // ── Client-side ATR breach (re-evaluated on every live price update) ──
+    let clientAtrBreach = false;
+    if (underlying != null && p.buffer != null && strike > 0) {
+      const gap = optType === 'PUT' ? underlying - strike : strike - underlying;
+      clientAtrBreach = gap < p.buffer;
+    }
+    const prevAtrState = _prevClientAtr[posKey]; // undefined = never seen
+    // Only highlight as changed/new after at least one price poll (avoids noise on initial load)
+    const atrHighlight = _pricePollCount > 0 && clientAtrBreach
+      && (prevAtrState === undefined || prevAtrState !== clientAtrBreach);
+    _prevClientAtr[posKey] = clientAtrBreach;
+
+    const atrBadgeInner = clientAtrBreach && p.atr != null
+      ? `ATR breach (gap &lt; 1.5×ATR $${(p.buffer||0).toFixed(2)})`
+      : null;
+    const atrBadgeHtml = atrBadgeInner
+      ? (atrHighlight
+          ? `<li><span title="ATR breach status just changed" style="outline:2px solid var(--warn);border-radius:3px;padding:1px 4px;font-weight:700">&#9650; ${atrBadgeInner}</span></li>`
+          : `<li>${atrBadgeInner}</li>`)
+      : '';
+
+    // ── U/L price tick direction (from live price poller) ──
+    const sym = (p.symbol||'').toUpperCase();
+    const tick = _ulPriceTick[sym];
+    const ulPriceHtml = underlying == null ? '—'
+      : tick === 'up'   ? `<span style="color:var(--ok);font-weight:700"  title="Price up since last poll">&#9650; $${underlying.toFixed(2)}</span>`
+      : tick === 'down' ? `<span style="color:var(--danger);font-weight:700" title="Price down since last poll">&#9660; $${underlying.toFixed(2)}</span>`
+      : `$${underlying.toFixed(2)}`;
 
     // ── Hide row logic ──
     const snapshot = _rowSnapshot(p);
@@ -1739,11 +1840,28 @@ function renderTable() {
       <td>${qty}</td>
       <td>${p.dte==null ? '—' : `<span style="color:${p.dte>21?'var(--ok)':p.dte>=10?'var(--warn)':'var(--danger)'}">${p.dte}</span>`}</td>
       <td>${p.delta!=null ? `<span style="color:${Math.abs(p.delta)<0.40?'var(--ok)':Math.abs(p.delta)<=0.60?'var(--warn)':'var(--danger)'}">${(p.delta>=0?'+':'')+p.delta.toFixed(3)}</span>` : '—'}</td>
-      <td>${p.underlying!=null ? '$'+p.underlying.toFixed(2) : '—'}</td>
-      <td>${p.current_price!=null ? '$'+p.current_price.toFixed(2) : '—'}</td>
+      <td>${ulPriceHtml}</td>
+      <td>${(() => {
+        if (p.current_price == null) return '—';
+        const priceStr = '$' + p.current_price.toFixed(2);
+        const divWarn = optType === 'CALL'
+          && p.dividend_amount != null
+          && p.current_price < p.dividend_amount;
+        return divWarn
+          ? `<span style="color:var(--danger);font-weight:700" title="Remaining premium ($${p.current_price.toFixed(2)}) is less than the dividend ($${p.dividend_amount.toFixed(2)}). Early assignment risk: the holder may exercise to capture the dividend before ex-div.">${priceStr} ⚠</span>`
+          : priceStr;
+      })()}</td>
       <td>${pnlAbsStr}</td>
       <td>${pnlPctStr}</td>
-      <td>${badge}${flagChanged ? `<span title="Changed since last refresh" style="outline:1px solid var(--warn);border-radius:3px;padding:1px 4px;font-weight:700">&#9650; ${reasons}</span>` : reasons}</td>
+      <td>${badge}${(() => {
+        const allItems = serverReasonItems + atrBadgeHtml;
+        if (!allItems) return '';
+        const ulStyle = flagChanged
+          ? 'outline:1px solid var(--warn);border-radius:3px;padding:2px 4px;margin-top:2px'
+          : '';
+        const ulTitle = flagChanged ? 'title="Flags changed since last refresh"' : '';
+        return `<ul class="reasons" style="${ulStyle}" ${ulTitle}>${allItems}</ul>`;
+      })()}</td>
       <td${actionTdAttr}>${actionCell}</td>
       ${checkboxCell}`;
     tbody.appendChild(tr);
@@ -1786,6 +1904,13 @@ const _recommendations = _loadRecs(); // posKey -> {rec}
 // Stores the flag fingerprint from the previous render so we can highlight
 // anything that changed on the next fetch.
 let _prevFlags = {}; // posKey -> "flagged|nFlags|reason0;reason1;..."
+
+// ── Live price polling state ─────────────────────────────────────────────────
+let _prevUlPrices  = {};  // {ticker: price} — price seen at last poll
+let _ulPriceTick   = {};  // {ticker: 'up'|'down'|null} — direction since last poll
+let _prevClientAtr = {};  // {posKey: bool} — ATR breach state at last render
+let _pricePollCount = 0;  // increments each time fetchPrices() completes
+let _prevVix       = null; // VIX at last poll
 
 function _flagFingerprint(p) {
   return [(p.flagged ? '1' : '0'), (p.reasons||[]).length, (p.reasons||[]).join(';')].join('|');
@@ -1946,6 +2071,7 @@ function _renderUnbornTable() {
     k => (_unbornRows[k].delta??-99),
     k => (_unbornRows[k].ul_price??0),
     k => (_unbornRows[k].opt_price??0),
+    k => (_unbornRows[k]._ul_cost_basis??0),
     k => (_unbornRows[k].ideal_entry||''),
   ];
   if (_ubSortCol < _ubCols.length) {
@@ -1977,6 +2103,7 @@ function _renderUnbornTable() {
       <td>${c.delta!=null?(c.delta>=0?'+':'')+parseFloat(c.delta).toFixed(3):'—'}</td>
       <td>${fv(c.ul_price,2,'$')}</td>
       <td>${fv(c.opt_price,2,'$')}</td>
+      <td>${c._ul_cost_basis > 0 ? fv(c._ul_cost_basis,2,'$') : '—'}</td>
       <td style="color:var(--muted);font-size:11px;white-space:normal;max-width:130px">${esc(c.ideal_entry||'—')}</td>
       <td style="white-space:nowrap">
         <button data-key="${esc(k)}" onclick="placeTrade(this.dataset.key,this)" style="font-size:11px;padding:3px 8px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">Trade</button>
@@ -1988,7 +2115,7 @@ function _renderUnbornTable() {
     <thead><tr>
       ${thHdr('Symbol',0)}${thHdr('Type',1)}${thHdr('Strike',2)}${thHdr('Expiry',3)}
       ${thHdr('Side',4)}${thHdr('Qty',5)}${thHdr('DTE',6)}${thHdr('&Delta;',7)}
-      ${thHdr('U/L Price',8)}${thHdr('Opt Price',9)}${thHdr('Ideal Entry',10)}<th></th>
+      ${thHdr('U/L Price',8)}${thHdr('Opt Price',9)}${thHdr('Cost Basis',10)}${thHdr('Ideal Entry',11)}<th></th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
@@ -2019,9 +2146,11 @@ async function deleteUnbornRow(key) {
   _renderUnbornTable();
 }
 
-function recBadge(rec, key, chainCash) {
-  const cls = rec === 'ROLL' ? 'warn' : rec === 'ASSIGNMENT' ? 'danger' : rec === 'HOLD' ? 'hold' : 'ok';
+function recBadge(rec, key, chainCash, text) {
+  const cls = rec === 'ROLL' ? 'warn' : rec === 'ASSIGNMENT' ? 'danger'
+    : rec === 'HOLD' ? 'hold' : rec === 'LET EXPIRE' ? 'muted' : 'ok';
   const label = rec;
+  const tipAttr = (rec === 'LET EXPIRE' && text) ? ` title="${esc(text)}"` : '';
   const cashLine = (rec === 'ROLL' && chainCash != null)
     ? `<div style="font-size:10px;margin-top:3px;color:var(--${chainCash >= 0 ? 'ok' : 'danger'})">`
       + `Net chain: ${chainCash >= 0 ? '+' : ''}$${chainCash.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}</div>`
@@ -2030,7 +2159,7 @@ function recBadge(rec, key, chainCash) {
   return `<div style="display:inline-flex;align-items:center;gap:4px">
     <div style="display:inline-block;text-align:center">
       <a href="/analyze/${encodeURIComponent(key)}" target="_blank"
-        class="badge badge-${cls}" style="text-decoration:none;cursor:pointer">${label}</a>${cashLine}
+        class="badge badge-${cls}" style="text-decoration:none;cursor:pointer"${tipAttr}>${label}</a>${cashLine}
     </div>
     <button onclick="resetAnalysis('${safeKey}', this)" title="Reset to Analyze"
       style="font-size:10px;padding:0 4px;line-height:14px;background:none;border:1px solid var(--muted);border-radius:3px;color:var(--muted);cursor:pointer">x</button>
@@ -2085,10 +2214,11 @@ async function analyzePosition(key, btn) {
     }
     console.log('[analyze] result:', d);
     if (d.error) throw new Error(d.error);
-    _recommendations[key] = {rec: d.recommendation, chainCash: d.chain_cash ?? null};
+    const displayRec = (d.auto && d.recommendation === 'HOLD') ? 'LET EXPIRE' : d.recommendation;
+    _recommendations[key] = {rec: displayRec, chainCash: d.chain_cash ?? null, text: d.text ?? null};
     _saveRecs(_recommendations);
     const cell = _actionCell(key);
-    if (cell) cell.innerHTML = recBadge(d.recommendation, key, d.chain_cash ?? null);
+    if (cell) cell.innerHTML = recBadge(displayRec, key, d.chain_cash ?? null, d.text ?? null);
   } catch(e) {
     console.error('[analyze] error for', key, ':', e.message);
     const cell = _actionCell(key);
@@ -2107,11 +2237,10 @@ async function analyzePosition(key, btn) {
 }
 
 async function findUnborn() {
-  const ticker        = document.getElementById('ub-ticker').value.trim().toUpperCase();
-  const qty           = parseInt(document.getElementById('ub-qty').value) || 1;
-  const strat         = document.getElementById('ub-strat').value;
-  const ul_cost_basis = parseFloat(document.getElementById('ub-cost').value) || 0;
-  const resultEl      = document.getElementById('unborn-result');
+  const ticker   = document.getElementById('ub-ticker').value.trim().toUpperCase();
+  const qty      = parseInt(document.getElementById('ub-qty').value) || 1;
+  const strat    = document.getElementById('ub-strat').value;
+  const resultEl = document.getElementById('unborn-result');
   if (!ticker) { resultEl.innerHTML = '<span style="color:var(--danger);font-size:12px">Enter a ticker.</span>'; return; }
 
   resultEl.innerHTML = '<span style="color:var(--muted);font-size:12px">⟳ Analyzing…</span>';
@@ -2119,7 +2248,7 @@ async function findUnborn() {
     const r = await fetch('/api/unborn', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ticker, qty, strat, ul_cost_basis})
+      body: JSON.stringify({ticker, qty, strat})
     });
     let raw, d;
     try { raw = await r.text(); d = JSON.parse(raw); }
@@ -2136,7 +2265,7 @@ async function findUnborn() {
     // Accumulate proposed trades — add/update this ticker|strat entry, keep others
     const chain = d.chain || [];
     if (chain.length) {
-      const row = Object.assign({}, chain[0], {_qty: qty, _ubKey: ubKey});
+      const row = Object.assign({}, chain[0], {_qty: qty, _ubKey: ubKey, _ul_cost_basis: d.ul_cost_basis ?? null});
       _unbornRows[ticker + '|' + strat] = row;
       await _saveUnbornToServer();
       _renderUnbornTable();
@@ -2144,7 +2273,6 @@ async function findUnborn() {
       document.getElementById('ub-ticker').value = '';
       document.getElementById('ub-qty').value = '1';
       document.getElementById('ub-strat').value = 'CC';
-      document.getElementById('ub-cost').value = '';
       resultEl.innerHTML = '';
     }
   } catch(e) {
@@ -2264,11 +2392,72 @@ function sortTable(col) {
   renderTable();
 }
 
+// ── Live underlying price poller (every 5 min, independent of main refresh) ──
+const _LS_PR_LAST = 'optionsPriceLastRun'; // epoch ms of last price poll
+const _PRICE_INTERVAL_SECS = 300;           // 5 minutes
+let _priceHeartbeat = null;
+
+async function fetchPrices() {
+  try {
+    const r = await fetch('/api/prices');
+    if (!r.ok) return;
+    const prices = await r.json();
+    for (const p of _data) {
+      const sym = (p.symbol || '').toUpperCase();
+      const info = prices[sym];
+      if (!info) continue;
+      const newPrice = info.price;
+      if (newPrice != null) {
+        const prev = _prevUlPrices[sym];
+        _ulPriceTick[sym] = (prev == null) ? null : (newPrice > prev ? 'up' : newPrice < prev ? 'down' : null);
+        _prevUlPrices[sym] = newPrice;
+        p.underlying = newPrice;
+      }
+      if (info.atr  != null) p.atr    = info.atr;
+      if (info.buffer != null) p.buffer = info.buffer;
+    }
+    // ── VIX ──
+    const vixInfo = prices['__vix__'];
+    if (vixInfo && vixInfo.price != null) {
+      const newVix = vixInfo.price;
+      const vEl = document.getElementById('h-vix');
+      if (vEl) {
+        const tick = _prevVix != null ? (newVix > _prevVix ? 'up' : newVix < _prevVix ? 'down' : null) : null;
+        const arrow = tick === 'up' ? ' ▲' : tick === 'down' ? ' ▼' : '';
+        const lvlCls = newVix < 20 ? 'ok' : newVix < 30 ? 'warn' : 'danger';
+        const tickStyle = tick === 'up' ? ';color:var(--danger)' : tick === 'down' ? ';color:var(--ok)' : '';
+        vEl.innerHTML = `<span style="color:var(--${lvlCls})${tickStyle}">${newVix.toFixed(2)}${arrow}</span>`;
+        vEl.className = 'stat-value';
+      }
+      _prevVix = newVix;
+    }
+
+    _pricePollCount++;
+    localStorage.setItem(_LS_PR_LAST, String(Date.now()));
+    renderTable();
+  } catch(e) { /* silent — don't disrupt the UI */ }
+}
+
+function _priceTick() {
+  if (!_isMarketHours()) return;
+  const last = parseInt(localStorage.getItem(_LS_PR_LAST) || '0', 10);
+  if ((Date.now() - last) / 1000 >= _PRICE_INTERVAL_SECS) fetchPrices();
+}
+
+// Share the existing 30-second heartbeat — just add _priceTick to the interval
+function _initPriceRefresh() {
+  // Fire once on load (after a short delay so _data is populated) — only during market hours
+  setTimeout(() => { if (_isMarketHours()) fetchPrices(); }, 3000);
+  _priceHeartbeat = setInterval(_priceTick, 30_000);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Sort by expiry by default (col 5, ascending)
 document.querySelectorAll('th')[3].classList.add('sorted-asc');
 _loadUnbornFromServer();
 fetchData();
 _initAutoRefresh();
+_initPriceRefresh();
 </script>
 </body>
 </html>"""
@@ -2918,6 +3107,23 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     def index():
         return Response(_WEB_DASHBOARD_HTML, mimetype="text/html")
 
+    @app.route("/api/prices")
+    def api_prices():
+        """Return live underlying prices + ATR values for all open positions (yfinance only)."""
+        positions = get_all_open_positions()
+        tickers = {p["symbol"].upper() for p in positions}
+        result = {}
+        for sym in tickers:
+            price = get_underlying_price_fresh(sym)
+            atr   = get_atr(sym, period=14)
+            result[sym] = {
+                "price":  price,
+                "atr":    atr,
+                "buffer": round(atr * 1.5, 4) if atr else None,
+            }
+        result["__vix__"] = {"price": get_vix()}
+        return Response(json.dumps(result, default=_serial), mimetype="application/json")
+
     @app.route("/api/eval")
     def api_eval():
         import datetime as _dt
@@ -2955,9 +3161,38 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         # Parse key: symbol|option_type|strike|expiry
         parts = pos_key.split("|")
         if len(parts) != 4:
+            with _cache_lock:
+                _analysis_inflight.discard(pos_key)
             return Response(json.dumps({"error": f"Bad position_key: {pos_key}"}), status=400, mimetype="application/json")
         sym, opt_type, strike_str, expiry = parts
         ticker = sym.upper()
+
+        # ── Short-circuit: OTM position expiring today or already expired ────
+        import datetime as _dt
+        try:
+            _exp_date = _dt.date.fromisoformat(expiry)
+            _dte = (_exp_date - _dt.date.today()).days
+            _strike = float(strike_str)
+            _ul = get_underlying_price(ticker) or 0.0
+            _otm = (opt_type.upper() == "CALL" and _ul < _strike) or \
+                   (opt_type.upper() == "PUT"  and _ul > _strike)
+            if _dte <= 0 and _otm:
+                _result = {
+                    "recommendation": "HOLD",
+                    "text": (
+                        f"{ticker} {opt_type.upper()} ${_strike:.2f} expires {'today' if _dte == 0 else 'expired'} "
+                        f"and is OTM (u/l ${_ul:.2f}). No action needed — let it expire worthless."
+                    ),
+                    "ticker": ticker,
+                    "auto": True,
+                }
+                with _cache_lock:
+                    _analysis_cache[pos_key] = _result
+                    _analysis_inflight.discard(pos_key)
+                return Response(json.dumps(_result), mimetype="application/json")
+        except Exception:
+            pass  # fall through to normal analysis
+        # ─────────────────────────────────────────────────────────────────────
 
         notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
         if not notebook_id:
@@ -3025,13 +3260,15 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         ticker        = body.get("ticker", "").upper().strip()
         qty           = int(body.get("qty") or 1)
         strat         = body.get("strat", "CC").upper()
-        ul_cost_basis = float(body.get("ul_cost_basis") or 0)
         if not ticker:
             return Response(json.dumps({"error": "Missing ticker"}), status=400, mimetype="application/json")
         if strat not in ("CC", "CSP"):
             return Response(json.dumps({"error": f"Unknown strat: {strat}"}), status=400, mimetype="application/json")
 
-        # Include cost basis in cache key so different cost bases get distinct results
+        # Look up cost basis from DB (CC only); ignore any UI-supplied value
+        ul_cost_basis = get_ul_cost_basis_from_db(ticker) if strat == "CC" else 0.0
+        log.info("[unborn] %s cost basis from DB: %.2f", ticker, ul_cost_basis)
+
         cb_key = f"{ul_cost_basis:.2f}" if ul_cost_basis else "0"
         ub_key = f"{ticker}|{strat}|{qty}|{cb_key}"
 
@@ -3116,7 +3353,14 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     @app.route("/unborn/<path:ub_key>")
     def unborn_detail(ub_key: str):
         ub_key = urllib.parse.unquote(ub_key)
+        # Exact match first; fall back to prefix match (handles cost-basis suffix added server-side)
         cached = _unborn_cache.get(ub_key)
+        if cached is None:
+            prefix = ub_key + "|"
+            for k, v in _unborn_cache.items():
+                if k.startswith(prefix):
+                    cached = v
+                    break
         parts  = ub_key.split("|")   # TICKER|STRAT|QTY
         title_str = html_mod.escape(" · ".join(parts))
 
@@ -3682,8 +3926,12 @@ def get_key_dates(ticker: str) -> dict:
 
     t = yf.Ticker(ticker)
 
-    # ── Earnings date ──────────────────────────────────────────────────────────
+    # ── Earnings date (skip for ETFs — they have no earnings calendar) ─────────
     try:
+        fi_check = t.fast_info
+        # ETFs report quoteType as "ETF"; skip earnings lookup to avoid quoteSummary 404s
+        if getattr(fi_check, "quote_type", "").upper() == "ETF":
+            raise StopIteration  # jump to except, leave earnings_date as "Unknown"
         cal = t.calendar  # dict or DataFrame depending on yfinance version
         # Newer yfinance returns a dict; older returns a DataFrame
         if isinstance(cal, dict):
@@ -3706,9 +3954,11 @@ def get_key_dates(ticker: str) -> dict:
     except Exception:
         pass
 
-    # Estimate earnings if not found: last earnings + ~91 days
+    # Estimate earnings if not found: last earnings + ~91 days (skip for ETFs)
     if result["earnings_source"] != "confirmed":
         try:
+            if getattr(t.fast_info, "quote_type", "").upper() == "ETF":
+                raise StopIteration
             hist_earnings = []
             fin = t.quarterly_income_stmt
             if fin is not None and not fin.empty:
@@ -3727,15 +3977,18 @@ def get_key_dates(ticker: str) -> dict:
             pass
 
     # ── Dividend ex-date ───────────────────────────────────────────────────────
+    # Use fast_info (no quoteSummary call — safe for ETFs like GDX, SLV, GLD)
     try:
-        info = t.info or {}
-        ex_ts = info.get("exDividendDate")
+        fi = t.fast_info
+        ex_ts = getattr(fi, "last_dividend_date", None)
         if ex_ts:
-            ex_date = datetime.date.fromtimestamp(int(ex_ts))
+            ex_date = ex_ts.date() if hasattr(ex_ts, "date") else datetime.date.fromtimestamp(int(ex_ts))
             if ex_date >= today:
                 result["exdiv_date"] = str(ex_date)
                 result["exdiv_source"] = "confirmed"
-                result["dividend_amount"] = f"${info.get('lastDividendValue', 'N/A')}"
+            last_div = getattr(fi, "last_dividend_value", None)
+            if last_div:
+                result["dividend_amount"] = f"${float(last_div):.4f}".rstrip("0").rstrip(".")
     except Exception:
         pass
 
@@ -4061,7 +4314,10 @@ async def query_notebooklm(
 
     # ── Cost basis clause ──────────────────────────────────────────────────────
     _cb = float(ul_cost_basis) if ul_cost_basis else 0.0
-    if _cb > 0:
+    if strat == "CSP":
+        # Cost basis is not relevant for CSPs — omit entirely
+        cost_basis_clause = ""
+    elif _cb > 0:
         if strat == "ROLL":
             cost_basis_clause = (
                 f"The cost basis of the underlying {ticker} shares is ${_cb:.2f} per share. "
@@ -4069,17 +4325,11 @@ async def query_notebooklm(
                 f"where rolling to a lower strike would place it below cost basis, which could "
                 f"result in a loss on assignment. "
             )
-        elif strat == "CC":
+        else:  # CC
             cost_basis_clause = (
                 f"The cost basis of the underlying {ticker} shares is ${_cb:.2f} per share. "
                 f"Please ensure the recommended strike is at or above the cost basis to avoid "
                 f"realizing a loss on assignment, and factor this into your strike selection. "
-            )
-        else:  # CSP
-            cost_basis_clause = (
-                f"The reference cost basis for {ticker} is ${_cb:.2f} per share. "
-                f"Factor this into your recommended strike selection — the effective cost if "
-                f"assigned will be the strike minus the premium received. "
             )
     else:
         cost_basis_clause = (
