@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-get_option_chain.py
+option_dashboard.py
 
 Fetches option chains from the Public.com API and saves them to a CSV file.
 Optionally uploads the CSV to a Google NotebookLM notebook.
 
 Usage:
-    python get_option_chain.py --ticker IBM [--num 10] [--upload]
+    python option_dashboard.py --ticker IBM [--num 10] [--upload]
 
 Requirements:
     - Set the PUBLIC_API_SECRET environment variable to your Public.com Secret Token.
@@ -1501,7 +1501,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Portfolio Eval</title>
+<title>Option Dashboard</title>
 <style>
   :root {
     --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
@@ -1577,7 +1577,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 <div id="error-bar"></div>
 <header>
-  <h1>&#9660; Portfolio Eval</h1>
+  <h1>&#9660; Option Dashboard</h1>
   <div class="stat"><span class="stat-label">Total</span><span class="stat-value" id="h-total">—</span></div>
   <div class="stat"><span class="stat-label">Flagged</span><span class="stat-value" id="h-flagged">—</span></div>
   <div class="stat"><span class="stat-label">VIX</span><span class="stat-value" id="h-vix">—</span></div>
@@ -2054,8 +2054,21 @@ async function _saveUnbornToServer() {
 }
 
 function _renderUnbornTable() {
+  try { _renderUnbornTableInner(); } catch(e) {
+    const el = document.getElementById('unborn-chain');
+    if (el) el.innerHTML = `<p style="color:var(--danger)">Render error: ${e.message}</p>`;
+    console.error('[unborn render]', e);
+  }
+}
+function _renderUnbornTableInner() {
   const el = document.getElementById('unborn-chain');
-  const keys = Object.keys(_unbornRows);
+  const today = new Date(); today.setHours(0,0,0,0);
+  // Filter out rows whose option has already expired
+  const keys = Object.keys(_unbornRows).filter(k => {
+    const exp = _unbornRows[k].expiry;
+    if (!exp) return true;
+    return new Date(exp + 'T00:00:00') > today;
+  });
   if (!keys.length) { el.innerHTML = ''; return; }
   const fv = (v, d, p='') => v == null ? '—' : p + parseFloat(v).toFixed(d);
 
@@ -2269,6 +2282,7 @@ async function findUnborn() {
       _unbornRows[ticker + '|' + strat] = row;
       await _saveUnbornToServer();
       _renderUnbornTable();
+      document.getElementById('unborn-chain').scrollIntoView({behavior:'smooth', block:'nearest'});
       // Clear inputs after successful display
       document.getElementById('ub-ticker').value = '';
       document.getElementById('ub-qty').value = '1';
@@ -3251,7 +3265,18 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         except Exception as exc:
             log.warning("Could not save unborn cache: %s", exc)
 
-    _unborn_cache: dict[str, dict] = _load_unborn_cache()
+    _unborn_cache_raw: dict[str, dict] = _load_unborn_cache()
+    import datetime as _dt_uc
+    _today_uc = _dt_uc.date.today().isoformat()
+    _unborn_cache: dict[str, dict] = {
+        k: v for k, v in _unborn_cache_raw.items()
+        if not (v.get("chain") and v["chain"] and
+                v["chain"][0].get("expiry", "9999") <= _today_uc)
+    }
+    if len(_unborn_cache) < len(_unborn_cache_raw):
+        log.info("[unborn] Purged %d expired cache entries on startup",
+                 len(_unborn_cache_raw) - len(_unborn_cache))
+        _save_unborn_cache(_unborn_cache)
     _unborn_inflight: set[str] = set()
 
     @app.route("/api/unborn", methods=["POST"])
@@ -3907,13 +3932,13 @@ def get_key_dates(ticker: str) -> dict:
     """
     try:
         import yfinance as yf
-    except ImportError:
-        print(
-            "ERROR: yfinance is not installed.\n"
-            "  Install it with:  pip install yfinance",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    except ImportError as _yf_err:
+        log.error("yfinance import failed (%s) — pip install yfinance", _yf_err)
+        return {
+            "earnings_date": "Unknown", "earnings_source": "unknown",
+            "exdiv_date": "Unknown", "exdiv_source": "unknown",
+            "dividend_amount": "N/A",
+        }
 
     today = datetime.date.today()
     result = {
@@ -4096,14 +4121,8 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
     try:
         from notebooklm import NotebookLMClient
     except ImportError:
-        print(
-            "ERROR: notebooklm-py is not installed.\n"
-            "  Install it with:  pip install \"notebooklm-py[browser]\"\n"
-            "  Then run:         playwright install chromium\n"
-            "  Then log in:      notebooklm login",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        log.error("notebooklm-py is not installed — pip install 'notebooklm-py[browser]'")
+        raise ImportError("notebooklm-py is not installed")
 
     # Extract ticker from the filename stem (e.g. "IBM.csv" → "IBM")
     base = os.path.basename(file_path)
@@ -4283,14 +4302,8 @@ async def query_notebooklm(
     try:
         from notebooklm import NotebookLMClient
     except ImportError:
-        print(
-            "ERROR: notebooklm-py is not installed.\n"
-            "  Install it with:  pip install \"notebooklm-py[browser]\"\n"
-            "  Then run:         playwright install chromium\n"
-            "  Then log in:      notebooklm login",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        log.error("notebooklm-py is not installed — pip install 'notebooklm-py[browser]'")
+        raise ImportError("notebooklm-py is not installed")
 
     strat_label = STRAT_LABELS[strat]
 
@@ -4482,31 +4495,31 @@ OPTIONS
 _HELP_EPILOG = """\
 EXAMPLES
   Fetch 5 expirations for IBM and save to IBM.csv:
-    python get_option_chain.py --ticker IBM --num 5
+    python option_dashboard.py --ticker IBM --num 5
 
   Fetch, save, and upload to NotebookLM:
-    python get_option_chain.py --ticker IBM --num 5 --upload
+    python option_dashboard.py --ticker IBM --num 5 --upload
 
   Skip fetch — upload an existing IBM.csv to NotebookLM:
-    python get_option_chain.py --ticker IBM --onlyload
+    python option_dashboard.py --ticker IBM --onlyload
 
   Ask NotebookLM for the best Covered Call (source already uploaded):
-    python get_option_chain.py --ticker IBM --strat CC
+    python option_dashboard.py --ticker IBM --strat CC
 
   Full pipeline — fetch, upload, then get a CSP recommendation:
-    python get_option_chain.py --ticker IBM --num 5 --upload --strat CSP
+    python option_dashboard.py --ticker IBM --num 5 --upload --strat CSP
 
   Roll analysis — fetch fresh chain, upload, read journal, query for roll/hold:
-    python get_option_chain.py --ticker IBM --num 5 --upload --strat ROLL
+    python option_dashboard.py --ticker IBM --num 5 --upload --strat ROLL
 
   Roll analysis using existing CSV (no re-fetch):
-    python get_option_chain.py --ticker IBM --onlyload --strat ROLL
+    python option_dashboard.py --ticker IBM --onlyload --strat ROLL
 
   Evaluate ALL open positions for risk signals (delta, DTE, ATM, ITM):
-    python get_option_chain.py --eval
+    python option_dashboard.py --eval
 
   Evaluate only IBM open positions:
-    python get_option_chain.py --eval --ticker IBM
+    python option_dashboard.py --eval --ticker IBM
 
 JOURNAL
   Open positions are read (read-only) from:
