@@ -1422,7 +1422,7 @@ def _detect_recommendation(text: str) -> str:
     top = low[:600]
     if re.search(
         r"\bdo not roll\b|\bshould not roll\b|\bno need to roll\b"
-        r"|\bnot roll\b|\bavoid rolling\b|\bno roll\b",
+        r"|\bnot roll\b|\bavoid rolling\b|\bno roll\b|\bdo nothing\b",
         top
     ):
         return "HOLD"
