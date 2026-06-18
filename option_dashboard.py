@@ -39,6 +39,13 @@ import re
 import sys
 import textwrap
 import threading
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass  # python-dotenv not installed; rely on environment variables
 
 
 BASE_URL = "https://api.public.com"
@@ -85,9 +92,9 @@ def setup_logging(level: int = logging.DEBUG) -> str:
     fh.setLevel(level)
     fh.setFormatter(fmt)
 
-    # Console handler — WARN and above only
+    # Console handler — CRITICAL only
     ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.WARNING)
+    ch.setLevel(logging.CRITICAL)
     ch.setFormatter(fmt)
 
     root = logging.getLogger()
@@ -434,24 +441,83 @@ def get_chain_net_cash(spread_id, fallback_ticker: str | None = None) -> dict:
         WHERE {where}
           AND t.is_test = 0
     """
+    # Second query: include test trades to get simulated (test-close) PnL
+    sql_sim = f"""
+        SELECT
+            SUM(CASE WHEN t.action = 'sell' THEN  t.price * t.quantity ELSE 0 END) AS gross_collected,
+            SUM(CASE WHEN t.action = 'buy'  THEN  t.price * t.quantity ELSE 0 END) AS gross_paid
+        FROM positions p
+        JOIN trades t ON t.position_id = p.id
+        WHERE {where}
+    """
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        row = con.execute(sql, (param,)).fetchone()
+        row     = con.execute(sql,     (param,)).fetchone()
+        row_sim = con.execute(sql_sim, (param,)).fetchone()
         con.close()
         collected = round(float(row[0] or 0.0) * 100, 2)
         paid      = round(float(row[1] or 0.0) * 100, 2)
         n_pos     = int(row[2] or 0)
-        log.debug("get_chain_net_cash: collected=%.2f paid=%.2f positions=%d", collected, paid, n_pos)
+        sim_collected = round(float(row_sim[0] or 0.0) * 100, 2)
+        sim_paid      = round(float(row_sim[1] or 0.0) * 100, 2)
+        has_test  = (sim_collected != collected or sim_paid != paid)
+        log.debug("get_chain_net_cash: collected=%.2f paid=%.2f positions=%d has_test=%s",
+                  collected, paid, n_pos, has_test)
         return {
             "net_cash":      round(collected - paid, 2),
             "collected":     collected,
             "paid":          paid,
             "num_positions": n_pos,
             "scoped_by":     scoped,
+            "sim_net_cash":  round(sim_collected - sim_paid, 2),
+            "has_test":      has_test,
         }
     except sqlite3.OperationalError as exc:
         log.error("get_chain_net_cash query failed: %s", exc)
-        return {"net_cash": 0.0, "collected": 0.0, "paid": 0.0, "num_positions": 0, "scoped_by": "error"}
+        return {"net_cash": 0.0, "collected": 0.0, "paid": 0.0, "num_positions": 0,
+                "scoped_by": "error", "sim_net_cash": 0.0, "has_test": False}
+
+
+def get_pos_hypo_cash(pos_id: int) -> dict:
+    """
+    Return cash flows for a single position including test trades.
+    Mirrors the journal's HYPO_CLOSED logic: when a test trade exists,
+    the position-level PnL (real open + test close) is what the row should show.
+
+    Returns:
+        pos_cash : float  — (sell proceeds − buy costs) × 100 for this position only
+        has_test : bool   — True if any test trade exists on this position
+    """
+    import sqlite3
+    db_path = os.path.normpath(JOURNAL_DB)
+    if not os.path.exists(db_path):
+        return {"pos_cash": None, "has_test": False}
+    # Mirror journal CF_SQL: include commissions and fees so dashboard matches journal
+    sql = """
+        SELECT
+            SUM(CASE WHEN t.action='sell'
+                     THEN (t.price * t.quantity * 100) - t.commission - t.fees
+                     ELSE 0 END)                          AS collected,
+            SUM(CASE WHEN t.action='buy'
+                     THEN (t.price * t.quantity * 100) + t.commission + t.fees
+                     ELSE 0 END)                          AS paid,
+            MAX(CASE WHEN t.is_test=1 THEN 1 ELSE 0 END) AS has_test
+        FROM trades t
+        WHERE t.position_id = ?
+    """
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        row = con.execute(sql, (pos_id,)).fetchone()
+        con.close()
+        if row is None or row[0] is None:
+            return {"pos_cash": None, "has_test": False}
+        collected = round(float(row[0] or 0.0), 2)
+        paid      = round(float(row[1] or 0.0), 2)
+        has_test  = bool(row[2])
+        return {"pos_cash": round(collected - paid, 2), "has_test": has_test}
+    except Exception as exc:
+        log.error("get_pos_hypo_cash query failed: %s", exc)
+        return {"pos_cash": None, "has_test": False}
 
 
 def get_ul_cost_basis_from_db(ticker: str) -> float:
@@ -490,6 +556,50 @@ def get_ul_cost_basis_from_db(ticker: str) -> float:
         return 0.0
 
 
+def get_stock_qty_from_db(ticker: str) -> int | None:
+    """Return the number of CC contracts available for ticker from trades.db.
+
+    Queries open positions where option_type is not CALL/PUT (i.e. stock/share
+    positions).  The DB stores contracts directly — no division needed.
+    Returns None if no position is found.
+    """
+    import sqlite3
+
+    db_path = os.path.normpath(JOURNAL_DB)
+    if not os.path.exists(db_path):
+        log.warning("get_stock_qty_from_db: DB not found at %s", db_path)
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # Use the most recent call position for this ticker (open or closed)
+        # to determine the contract qty for a new CC.
+        # Use the sell quantity from the most recent call position (open or closed).
+        # Net qty is 0 for closed positions, so we look at the original sell trade.
+        row = con.execute(
+            """
+            SELECT t.quantity
+            FROM trades t
+            JOIN positions p ON t.position_id = p.id
+            WHERE UPPER(p.symbol) = UPPER(?)
+              AND UPPER(p.option_type) = 'CALL'
+              AND t.action = 'sell'
+            ORDER BY p.id DESC
+            LIMIT 1
+            """,
+            (ticker,),
+        ).fetchone()
+        con.close()
+        if row and row[0]:
+            qty = int(row[0])
+            log.info("get_stock_qty_from_db(%s): found %d contracts from last call position", ticker, qty)
+            return qty if qty > 0 else None
+        log.info("get_stock_qty_from_db(%s): no call position found", ticker)
+        return None
+    except Exception as exc:
+        log.warning("get_stock_qty_from_db(%s) failed: %s", ticker, exc)
+        return None
+
+
 # Cache underlying prices within a session to avoid redundant yfinance calls
 _price_cache: dict[str, float | None] = {}
 
@@ -508,8 +618,13 @@ def _fetch_yf_price(ticker: str) -> float | None:
             hist = t.history(period="1d", interval="1m")
             if hist is not None and not hist.empty:
                 price = float(hist["Close"].iloc[-1])
+        if price is None:
+            log.warning("[PRICE] yfinance returned None for %s (fast_info.last_price=%s)", ticker, getattr(fi, "last_price", "N/A"))
+        else:
+            log.info("[PRICE] %s = $%.2f", ticker, price)
         return price
-    except Exception:
+    except Exception as exc:
+        log.warning("[PRICE] yfinance error for %s: %s", ticker, exc)
         return None
 
 
@@ -589,6 +704,54 @@ def build_osi_symbol(ticker: str, expiry: str, option_type: str, strike: float) 
     cp   = "C" if option_type.upper() == "CALL" else "P"
     strike_int = round(float(strike) * 1000)
     return f"{root}{dt.strftime('%y%m%d')}{cp}{strike_int:08d}"
+
+
+def get_equity_quotes_batch(token: str, account_id: str, tickers: list[str]) -> dict[str, float | None]:
+    """
+    Fetch current equity prices for a list of tickers via the Public.com quotes endpoint.
+    Returns dict: TICKER -> price (float) or None on failure.
+    Falls back to yfinance for any ticker not returned by the API.
+    """
+    import requests
+
+    if not tickers:
+        return {}
+
+    instruments = [{"symbol": t.upper(), "type": "EQUITY"} for t in tickers]
+    url = f"{BASE_URL}/userapigateway/marketdata/{account_id}/quotes"
+    result: dict[str, float | None] = {}
+    try:
+        resp = requests.post(url, headers=get_headers(token), json={"instruments": instruments})
+        if resp.status_code == 200:
+            raw = resp.json()
+            quotes_list = raw if isinstance(raw, list) else raw.get("quotes", [])
+            for q in quotes_list:
+                sym = (q.get("instrument") or {}).get("symbol", "").upper()
+                if not sym:
+                    continue
+                bid  = q.get("bid")
+                ask  = q.get("ask")
+                last = q.get("last")
+                try:
+                    if bid is not None and ask is not None:
+                        price = (float(bid) + float(ask)) / 2
+                    elif last is not None:
+                        price = float(last)
+                    else:
+                        price = None
+                except (ValueError, TypeError):
+                    price = None
+                result[sym] = price
+    except Exception:
+        pass
+
+    # yfinance fallback for any ticker missing from API response
+    for t in tickers:
+        sym = t.upper()
+        if sym not in result or result[sym] is None:
+            result[sym] = _fetch_yf_price(sym)
+
+    return result
 
 
 def get_option_quotes(token: str, account_id: str, positions: list[dict]) -> dict[str, dict]:
@@ -760,7 +923,6 @@ def get_eval_data(
     _log(f"  Fetching greeks for {len(osi_list)} contract(s)...", end=" ", flush=True)
     greeks_data = get_option_greeks_batch(token, account_id, osi_list)
     _log(f"{len(greeks_data)} received.")
-
     # ── Per-ticker caches (underlying price + ATR + dividend) ─────────────────
     price_cache_local: dict[str, float | None] = {}
     atr_cache: dict[str, tuple[float | None, float | None]] = {}
@@ -844,14 +1006,16 @@ def get_eval_data(
             elif opt_type == "PUT" and underlying < strike:
                 reasons.append(f"ITM: u/l ${underlying:.2f} < put strike ${strike:.2f}")
 
-        # ── Condition 4: Near ATM ─────────────────────────────────────────────
+        # ── Condition 4: Near ATM (skip if already ITM) ──────────────────────
         if underlying is not None:
-            pct_away = abs(underlying - strike) / strike * 100
-            if pct_away <= ATM_THRESHOLD_PCT:
-                reasons.append(
-                    f"Near ATM: u/l ${underlying:.2f} vs strike ${strike:.2f}"
-                    f" ({pct_away:.1f}% away)"
-                )
+            _is_itm_c4 = (opt_type == "CALL" and underlying > strike) or (opt_type == "PUT" and underlying < strike)
+            if not _is_itm_c4:
+                pct_away = abs(underlying - strike) / strike * 100
+                if pct_away <= ATM_THRESHOLD_PCT:
+                    reasons.append(
+                        f"Near ATM: u/l ${underlying:.2f} vs strike ${strike:.2f}"
+                        f" ({pct_away:.1f}% away)"
+                    )
 
         # ── Condition 5: Within 1.5× ATR buffer ──────────────────────────────
         if underlying is not None and buffer is not None:
@@ -868,6 +1032,50 @@ def get_eval_data(
                         f"Within ATR buffer of ${buffer:.2f} (1.5 × ATR ${atr_val:.2f})"
                     )
 
+        # ── Condition 6: Dividend ≥ Extrinsic Value (early assignment risk) ──
+        # Warn only when ITM and dividend >= extrinsic (i.e. little time value left)
+        if current_price is not None and dividend_amount is not None and underlying is not None:
+            _is_itm = (opt_type == "CALL" and underlying > strike) or (opt_type == "PUT" and underlying < strike)
+            if _is_itm:
+                if opt_type == "CALL":
+                    _intrinsic = max(0.0, underlying - strike)
+                else:
+                    _intrinsic = max(0.0, strike - underlying)
+                _extrinsic = max(0.0, current_price - _intrinsic)
+                if dividend_amount >= _extrinsic:
+                    reasons.append(
+                        f"dividend (${dividend_amount:.2f}) ≥ extrinsic (${_extrinsic:.2f})"
+                        f" — early assignment risk"
+                    )
+
+        spread_id = pos.get("spread_id")
+        if spread_id is not None:
+            chain = get_chain_net_cash(spread_id)
+            chain_cash      = chain["net_cash"]     if chain["scoped_by"] != "none" else None
+            sim_chain_cash  = chain["sim_net_cash"] if chain["scoped_by"] != "none" else None
+            has_test_trade  = chain["has_test"]     if chain["scoped_by"] != "none" else False
+        else:
+            chain_cash     = None
+            sim_chain_cash = None
+            has_test_trade = False
+
+        # Per-position hypo cash: this position's own trades (real + test).
+        # Always check, even if there's no spread_id — handles standalone positions
+        # with a test trade (e.g. HAL Jul with no roll chain).
+        pos_id = pos.get("id")
+        if pos_id is not None:
+            hypo = get_pos_hypo_cash(pos_id)
+            if hypo["has_test"]:
+                pos_hypo_cash = hypo["pos_cash"]
+                # For no-spread_id positions, sim_chain_cash falls back to pos-level
+                if not has_test_trade:
+                    has_test_trade = True
+                    sim_chain_cash = hypo["pos_cash"]
+            else:
+                pos_hypo_cash = None
+        else:
+            pos_hypo_cash = None
+
         result_positions.append({
             **pos,
             "dte": dte,
@@ -878,6 +1086,10 @@ def get_eval_data(
             "current_price": current_price,
             "abs_pnl": abs_pnl,
             "pct_pnl": pct_pnl,
+            "chain_cash":     chain_cash,
+            "sim_chain_cash": sim_chain_cash,
+            "has_test_trade": has_test_trade,
+            "pos_hypo_cash":  pos_hypo_cash,
             "reasons": reasons,
             "flagged": bool(reasons),
             "dividend_amount": dividend_amount,
@@ -975,23 +1187,31 @@ def _parse_recommended_option(text: str, chain_rows: list[dict]) -> dict | None:
     except ValueError:
         return None
 
-    # Extract expiry: YYYY-MM-DD, or Month DD YYYY, or Month DD, YYYY
-    date_match = re.search(
+    # Extract expiry: only accept dates that exist as actual expiries in the chain.
+    # This prevents prose dates ("as of June 9, 2026") from being used as the expiry.
+    _valid_expiries = {r.get("expiry") for r in chain_rows if r.get("expiry")}
+    _DATE_PAT = (
         r'(\d{4}-\d{2}-\d{2})'
         r'|(\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?'
         r'|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
-        r'\s+\d{1,2},?\s+\d{4})',
-        text, re.IGNORECASE
+        r'\s+\d{1,2},?\s+\d{4})'
     )
     target_expiry = None
-    if date_match:
-        raw_date = date_match.group(1) or date_match.group(2)
-        for fmt in ("%Y-%m-%d", "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y"):
+    for _dm in re.finditer(_DATE_PAT, text, re.IGNORECASE):
+        _raw = next((g for g in _dm.groups() if g), None)
+        if not _raw:
+            continue
+        for _fmt in ("%Y-%m-%d", "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y"):
             try:
-                target_expiry = datetime.datetime.strptime(raw_date.replace(",", ", ").strip(), fmt).strftime("%Y-%m-%d")
-                break
+                _parsed = datetime.datetime.strptime(_raw.replace(",", ", ").strip(), _fmt).date()
+                _parsed_str = _parsed.strftime("%Y-%m-%d")
+                if _parsed_str in _valid_expiries:
+                    target_expiry = _parsed_str
+                    break
             except ValueError:
                 continue
+        if target_expiry:
+            break
 
     # Find best matching row: must match strike exactly; prefer exact expiry too
     best = None
@@ -1008,9 +1228,28 @@ def _parse_recommended_option(text: str, chain_rows: list[dict]) -> dict | None:
             best_dist = score
             best = row
 
-    # If no close match found (e.g. recommended expiry not in fetched chain),
-    # synthesize a row directly from the parsed text so we show the right option
-    if best is None or best_dist >= 1000:
+    # If recommended strike isn't close to any chain row (or wrong expiry),
+    # synthesize a row with the exact values from the text.
+    # Threshold: >$10 away means the chain is missing that strike (often the API
+    # truncates far-OTM contracts), so don't fall back to the "closest" wrong strike.
+    _STRIKE_THRESHOLD = 10.0
+    if best is None or best_dist >= _STRIKE_THRESHOLD:
+        if target_strike:
+            # If NLM didn't mention an expiry, pick the chain expiry closest to 30 DTE
+            if not target_expiry and chain_rows:
+                import datetime as _dt2
+                _today2 = _dt2.date.today()
+                _best_exp, _best_dte_dist = None, float("inf")
+                for _r in chain_rows:
+                    _exp = _r.get("expiry")
+                    if _exp:
+                        try:
+                            _d = abs((_dt2.date.fromisoformat(_exp) - _today2).days - 30)
+                            if _d < _best_dte_dist:
+                                _best_dte_dist, _best_exp = _d, _exp
+                        except ValueError:
+                            pass
+                target_expiry = _best_exp
         if target_strike and target_expiry:
             # Extract price from text: @ $X.XX or premium of $X.XX
             price_match = re.search(
@@ -1338,6 +1577,8 @@ async def run_roll_for_position(
             "chain_collected": chain["collected"],
             "chain_paid":      chain["paid"],
             "chain_positions": chain["num_positions"],
+            "sim_chain_cash":  chain["sim_net_cash"],   # includes test trades
+            "has_test_trade":  chain["has_test"],
             "pos_avg_price":   pos_avg_price,
             "pos_qty":         pos_qty,
             "ul_cost_basis":   ul_cost_basis,
@@ -1365,8 +1606,24 @@ async def run_unborn_for_ticker(
       3. Query NotebookLM with CC or CSP strategy
     Returns dict: {recommendation, text, ticker, strat, error}
     """
+    _NO_OPT_ROW = {
+        "symbol": ticker, "option_type": strat, "strike": None, "expiry": None,
+        "side": "Short", "dte": None, "delta": None, "ul_price": None,
+        "opt_price": None, "ideal_entry": "NO OPT AVAIL", "_no_opt": True,
+    }
     try:
-        all_expirations = get_expirations(token, account_id, ticker)
+        try:
+            all_expirations = get_expirations(token, account_id, ticker)
+        except RuntimeError as _exp_err:
+            _msg = str(_exp_err)
+            if "does not support option" in _msg or "HTTP 400" in _msg:
+                log.warning("[unborn] %s has no option support: %s", ticker, _msg)
+                return {
+                    "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat,
+                    "chain": [_NO_OPT_ROW], "ul_cost_basis": ul_cost_basis,
+                    "_no_opt": True, "error": None,
+                }
+            raise
         if not all_expirations:
             return {
                 "error": f"No option expirations found for {ticker} on Public.com.",
@@ -1462,25 +1719,43 @@ async def run_unborn_for_ticker(
 
         log.info("[unborn] display_rows count: %d, first: %s", len(display_rows), display_rows[0] if display_rows else None)
         rec = _detect_recommendation(text)
-        chosen = _parse_recommended_option(text, display_rows)
-        log.info("[unborn] chosen: %s", chosen)
-        if chosen is None and display_rows:
-            # Fallback: pick option closest to 30 DTE and 0.30 delta
-            target_delta = 0.30 if strat == "CC" else -0.30
-            def _score(r):
-                try:
-                    d_dist = abs(float(r.get("delta") or 0) - target_delta)
-                except (TypeError, ValueError):
-                    d_dist = 1.0
-                try:
-                    dte_dist = abs((r.get("dte") or 30) - 30)
-                except (TypeError, ValueError):
-                    dte_dist = 30
-                return dte_dist * 0.5 + d_dist * 50
-            chosen = min(display_rows, key=_score)
-        if chosen is not None:
-            chosen = dict(chosen)
-            chosen["ideal_entry"] = _parse_ideal_entry(text)
+        _do_nothing = bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", text, re.IGNORECASE))
+        if _do_nothing:
+            # Return a placeholder row — option details are blank, ideal_entry = DO NOTHING
+            chosen = {
+                "symbol":      ticker,
+                "option_type": strat,
+                "strike":      None,
+                "expiry":      None,
+                "side":        "Short",
+                "dte":         None,
+                "delta":       None,
+                "ul_price":    display_rows[0].get("ul_price") if display_rows else None,
+                "opt_price":   None,
+                "ideal_entry": "DO NOTHING",
+                "_do_nothing": True,
+            }
+            log.info("[unborn] DO NOTHING recommendation for %s", ticker)
+        else:
+            chosen = _parse_recommended_option(text, display_rows)
+            log.info("[unborn] chosen: %s", chosen)
+            if chosen is None and display_rows:
+                # Fallback: pick option closest to 30 DTE and 0.30 delta
+                target_delta = 0.30 if strat == "CC" else -0.30
+                def _score(r):
+                    try:
+                        d_dist = abs(float(r.get("delta") or 0) - target_delta)
+                    except (TypeError, ValueError):
+                        d_dist = 1.0
+                    try:
+                        dte_dist = abs((r.get("dte") or 30) - 30)
+                    except (TypeError, ValueError):
+                        dte_dist = 30
+                    return dte_dist * 0.5 + d_dist * 50
+                chosen = min(display_rows, key=_score)
+            if chosen is not None:
+                chosen = dict(chosen)
+                chosen["ideal_entry"] = _parse_ideal_entry(text)
         return {
             "recommendation": rec,
             "text": text,
@@ -1488,6 +1763,7 @@ async def run_unborn_for_ticker(
             "strat": strat,
             "chain": [chosen] if chosen else [],
             "ul_cost_basis": ul_cost_basis,
+            "_do_nothing": _do_nothing,
             "error": None,
         }
 
@@ -1502,6 +1778,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Option Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23052e16' stroke='%2322c55e' stroke-width='3'/%3E%3Cpath d='M14 40 A20 20 0 1 1 50 40' fill='none' stroke='%23164b2a' stroke-width='6' stroke-linecap='round'/%3E%3Cpath d='M14 40 A20 20 0 0 1 44 18' fill='none' stroke='%2322c55e' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='32' cy='32' r='3' fill='%2322c55e'/%3E%3Cline x1='32' y1='32' x2='44' y2='20' stroke='%2386efac' stroke-width='2.5' stroke-linecap='round'/%3E%3Ctext x='32' y='50' text-anchor='middle' font-size='8' fill='%2322c55e' font-family='monospace'%3EOPTS%3C/text%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
@@ -1569,8 +1846,10 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   #unborn-chain table { border-collapse:collapse; font-size:12px; width:100%; }
   #unborn-chain th { background:var(--surface); color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.05em; padding:5px 10px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
   #unborn-chain td { padding:5px 10px; border-bottom:1px solid var(--border); white-space:nowrap; color:var(--text); }
-  #spinner { display: none; font-size: 11px; color: var(--muted); margin-left: 10px; }
-  #spinner.active { display: inline; }
+  #spinner { display: none; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-left: 10px; }
+  #spinner.active { display: inline-flex; }
+  #spinner .spin-ring { width: 13px; height: 13px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; flex-shrink: 0; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   #error-bar { display: none; background: var(--danger-bg); color: var(--danger); padding: 8px 16px; font-size: 12px; border-bottom: 1px solid var(--danger); }
 </style>
 </head>
@@ -1604,21 +1883,25 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
       </label>
       <span id="last-run" style="font-size:10px;color:var(--muted);padding-left:2px">Last Run: —</span>
     </div>
-    <span id="spinner">&#8635; refreshing…</span>
+    <span id="spinner"><span class="spin-ring"></span>refreshing…</span>
     <button onclick="fetchData()">&#8635; Refresh</button>
   </div>
 </header>
 <main>
   <div class="unborn-bar">
     <label for="ub-ticker">Ticker</label>
-    <input type="text" id="ub-ticker" placeholder="IBM" maxlength="10" style="text-transform:uppercase">
+    <input type="text" id="ub-ticker" placeholder="IBM" maxlength="10" style="text-transform:uppercase" oninput="this.value=this.value.toUpperCase()" onblur="autoFillCcQty()">
     <label for="ub-qty">Qty</label>
     <input type="number" id="ub-qty" placeholder="1" min="1" value="1" style="width:60px">
     <label for="ub-strat">Strategy</label>
-    <select id="ub-strat">
+    <select id="ub-strat" onchange="autoFillCcQty()">
       <option value="CC" selected>CC</option>
       <option value="CSP">CSP</option>
     </select>
+    <span id="ub-cb-group" style="display:none;align-items:center;gap:6px">
+      <label for="ub-cost-basis">Cost Basis</label>
+      <input type="number" id="ub-cost-basis" placeholder="0.00" min="0" step="0.01" style="width:80px">
+    </span>
     <button onclick="findUnborn()">Find</button>
     <span id="unborn-result"></span>
   </div>
@@ -1637,10 +1920,10 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
         <th onclick="sortTable(7)">Δ</th>
         <th onclick="sortTable(8)">U/L Price</th>
         <th onclick="sortTable(9)">Opt Price</th>
-        <th onclick="sortTable(10)">PnL $</th>
-        <th onclick="sortTable(11)">PnL %</th>
+        <th onclick="sortTable(10)">PnL</th>
         <th>Status / Flags</th>
         <th>Action<br><button onclick="resetRecommendations()" style="font-size:10px;padding:2px 7px;margin-top:4px;font-weight:normal">Reset</button></th>
+        <th style="text-align:center">Alert</th>
         <th style="text-align:center;cursor:pointer" onclick="unhideAll()" title="Click to unhide all">Hide</th>
       </tr>
     </thead>
@@ -1648,9 +1931,64 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   </table>
   <div id="skipped-section"></div>
 </main>
+
+<!-- ── Alert Modal ──────────────────────────────────────────────────────── -->
+<div id="alert-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9000;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:22px 26px;min-width:340px;max-width:420px;box-shadow:0 8px 32px #0008">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <span id="alert-modal-title" style="font-weight:700;font-size:13px;color:var(--accent)"></span>
+      <span onclick="closeAlertModal()" style="cursor:pointer;font-size:20px;line-height:1;color:var(--muted)">&times;</span>
+    </div>
+    <input type="hidden" id="alert-pos-key">
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <tr>
+        <td style="padding:6px 8px 6px 0;color:var(--muted);white-space:nowrap">Underlying Price</td>
+        <td style="padding:6px 4px">
+          <select id="alert-price-dir" style="background:var(--surface2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px">
+            <option value="above">Above</option>
+            <option value="below">Below</option>
+          </select>
+        </td>
+        <td style="padding:6px 0">
+          <input id="alert-price-val" type="number" step="any" placeholder="blank = ignore"
+            style="width:130px;background:var(--surface2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:3px 7px;font-size:12px">
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:6px 8px 6px 0;color:var(--muted);white-space:nowrap">Delta</td>
+        <td style="padding:6px 4px">
+          <select id="alert-delta-dir" style="background:var(--surface2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px">
+            <option value="above">Above</option>
+            <option value="below">Below</option>
+          </select>
+        </td>
+        <td style="padding:6px 0">
+          <input id="alert-delta-val" type="number" step="any" placeholder="blank = ignore"
+            style="width:130px;background:var(--surface2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:3px 7px;font-size:12px">
+        </td>
+      </tr>
+    </table>
+    <div style="margin:14px 0 18px;font-size:12px;color:var(--muted)">
+      Trigger condition:&nbsp;&nbsp;
+      <label style="cursor:pointer;margin-right:14px">
+        <input type="radio" name="alert-cond" id="alert-cond-and" value="and" style="margin-right:4px">AND
+      </label>
+      <label style="cursor:pointer">
+        <input type="radio" name="alert-cond" id="alert-cond-or" value="or" checked style="margin-right:4px">OR
+      </label>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="clearAlert()" style="font-size:12px;padding:5px 12px;background:var(--danger);color:#fff;border:none;border-radius:5px;cursor:pointer">Clear</button>
+      <button onclick="closeAlertModal()" style="font-size:12px;padding:5px 12px;background:var(--surface2);color:var(--fg);border:1px solid var(--border);border-radius:5px;cursor:pointer">Cancel</button>
+      <button onclick="saveAlert()" style="font-size:12px;padding:5px 14px;background:var(--accent);color:#000;font-weight:700;border:none;border-radius:5px;cursor:pointer">Save</button>
+    </div>
+  </div>
+</div>
 <script>
 let _data = [];
-let _sortCol = 0, _sortDir = 1;
+const _LS_SORT_KEY = 'optionsSortState';
+let _sortCol = (() => { try { return JSON.parse(localStorage.getItem(_LS_SORT_KEY) || '[0,1]')[0]; } catch { return 0; } })();
+let _sortDir = (() => { try { return JSON.parse(localStorage.getItem(_LS_SORT_KEY) || '[0,1]')[1]; } catch { return 1; } })();
 let _ubSortCol = 3, _ubSortDir = 1;
 function _ubSort(col) {
   if (_ubSortCol === col) _ubSortDir *= -1; else { _ubSortCol = col; _ubSortDir = 1; }
@@ -1679,6 +2017,13 @@ async function fetchData() {
 
 function applyData(d) {
   _data = d.positions || [];
+  // Seed _prevUlPrices from server data so the first price poll can show ticks
+  for (const p of _data) {
+    const sym = (p.symbol || '').toUpperCase();
+    if (_prevUlPrices[sym] == null && p.underlying != null) {
+      _prevUlPrices[sym] = p.underlying;
+    }
+  }
   // Restore any server-cached analysis results so badges survive refresh
   const serverRecs = d.cached_recommendations || {};
   let changed = false;
@@ -1711,7 +2056,14 @@ function fmt(v, digits, prefix='') {
   return v == null ? '—' : prefix + v.toFixed(digits);
 }
 
+function _applySortHeader() {
+  const ths = document.querySelectorAll('th');
+  ths.forEach(th => th.classList.remove('sorted-asc','sorted-desc'));
+  if (ths[_sortCol]) ths[_sortCol].classList.add(_sortDir === 1 ? 'sorted-asc' : 'sorted-desc');
+}
+
 function renderTable() {
+  _applySortHeader();
   const rows = [..._data];
   rows.sort((a, b) => {
     const cols = [
@@ -1719,7 +2071,7 @@ function renderTable() {
       r => r.expiry, r => (r.net_qty > 0 ? 'Short' : 'Long'),
       r => Math.abs(r.net_qty||0), r => r.dte??999, r => r.delta??-99,
       r => r.underlying??0, r => r.current_price??0,
-      r => r.abs_pnl??-999999, r => r.pct_pnl??-999999,
+      r => { if (r.has_test_trade && r.sim_chain_cash != null) { return r.chain_cash !== 0 && r.chain_cash != null ? (r.sim_chain_cash / Math.abs(r.chain_cash)) * 100 : r.sim_chain_cash; } if (r.chain_cash != null && r.current_price != null) { const abs = r.chain_cash - r.current_price * 100 * Math.abs(r.net_qty||0); return r.chain_cash !== 0 ? (abs / Math.abs(r.chain_cash)) * 100 : abs; } return r.pct_pnl ?? -999999; },
     ];
     const fn = cols[_sortCol] || (r => 0);
     const av = fn(a), bv = fn(b);
@@ -1740,8 +2092,21 @@ function renderTable() {
 
     const side = (p.net_qty||0) > 0 ? 'Short' : 'Long';
     const qty  = Math.abs(p.net_qty||0);
-    const pnlAbs = p.abs_pnl;
-    const pnlPct = p.pct_pnl;
+    // Net chain cash PnL: if a test trade exists, sim_chain_cash is the full-chain answer
+    // with the test buyback baked in — the honest number across all rolls.
+    let pnlAbs = null, pnlPct = null;
+    if (p.has_test_trade && p.sim_chain_cash != null) {
+      pnlAbs = p.sim_chain_cash;
+      pnlPct = p.chain_cash !== 0 && p.chain_cash != null
+        ? (pnlAbs / Math.abs(p.chain_cash)) * 100 : null;
+    } else if (p.chain_cash != null && p.current_price != null && qty > 0) {
+      const buybackCost = p.current_price * 100 * qty;
+      pnlAbs = p.chain_cash - buybackCost;
+      pnlPct = p.chain_cash !== 0 ? (pnlAbs / Math.abs(p.chain_cash)) * 100 : null;
+    } else {
+      pnlAbs = p.abs_pnl;
+      pnlPct = p.pct_pnl;
+    }
     const pnlAbsStr = pnlAbs == null ? '—'
       : '<span class="' + (pnlAbs>=0?'pnl-pos':'pnl-neg') + '">'
         + (pnlAbs>=0?'+':'') + '$' + pnlAbs.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',') + '</span>';
@@ -1749,8 +2114,8 @@ function renderTable() {
       : '<span class="' + (pnlPct>=0?'pnl-pos':'pnl-neg') + '">'
         + (pnlPct>=0?'+':'') + pnlPct.toFixed(1) + '%</span>';
 
-    // ── Server reasons: strip ATR breach (we re-evaluate it client-side) ──
-    const serverReasons = (p.reasons||[]).filter(r => !r.includes('ATR buffer'));
+    // ── Server reasons: strip ATR breach + dividend/extrinsic (we re-evaluate both client-side) ──
+    const serverReasons = (p.reasons||[]).filter(r => !r.includes('ATR buffer') && !r.includes('early assignment'));
     const serverReasonItems = serverReasons.map(r => '<li>' + esc(r) + '</li>').join('');
 
     const posKey = [p.symbol, p.option_type, String(p.strike||''), p.expiry||''].join('|');
@@ -1796,6 +2161,20 @@ function renderTable() {
       ? (atrHighlight
           ? `<li><span title="ATR breach status just changed" style="outline:2px solid var(--warn);border-radius:3px;padding:1px 4px;font-weight:700">&#9650; ${atrBadgeInner}</span></li>`
           : `<li>${atrBadgeInner}</li>`)
+      : '';
+
+    // ── Dividend ≥ extrinsic (client-side, re-evaluated on live price) ──
+    const _isItm = (optType === 'CALL' && underlying > strike) || (optType === 'PUT' && underlying < strike);
+    let divWarn = false, _extrinsic = null;
+    if (p.dividend_amount != null && _isItm && underlying != null && strike > 0 && p.current_price != null) {
+      const _intrinsic = optType === 'CALL'
+        ? Math.max(0, underlying - strike)
+        : Math.max(0, strike - underlying);
+      _extrinsic = Math.max(0, p.current_price - _intrinsic);
+      divWarn = p.dividend_amount >= _extrinsic;
+    }
+    const divWarnBadgeHtml = divWarn
+      ? `<li><span style="color:var(--danger);font-weight:700" title="Early assignment risk">dividend ($${p.dividend_amount.toFixed(2)}) ≥ extrinsic ($${_extrinsic.toFixed(2)}) — early assignment risk</span></li>`
       : '';
 
     // ── U/L price tick direction (from live price poller) ──
@@ -1844,17 +2223,13 @@ function renderTable() {
       <td>${(() => {
         if (p.current_price == null) return '—';
         const priceStr = '$' + p.current_price.toFixed(2);
-        const divWarn = optType === 'CALL'
-          && p.dividend_amount != null
-          && p.current_price < p.dividend_amount;
         return divWarn
-          ? `<span style="color:var(--danger);font-weight:700" title="Remaining premium ($${p.current_price.toFixed(2)}) is less than the dividend ($${p.dividend_amount.toFixed(2)}). Early assignment risk: the holder may exercise to capture the dividend before ex-div.">${priceStr} ⚠</span>`
+          ? `<span style="color:var(--danger);font-weight:700" title="Dividend ($${p.dividend_amount.toFixed(2)}) ≥ extrinsic value ($${_extrinsic.toFixed(2)}). Early assignment risk: the holder may exercise to capture the dividend before ex-div.">${priceStr} ⚠</span>`
           : priceStr;
       })()}</td>
-      <td>${pnlAbsStr}</td>
-      <td>${pnlPctStr}</td>
+      <td style="white-space:nowrap;line-height:1.4">${pnlPctStr !== '—' ? pnlPctStr : '—'}${pnlAbsStr !== '—' ? '<br><span style="font-size:10px;opacity:.85">' + pnlAbsStr + '</span>' : ''}</td>
       <td>${badge}${(() => {
-        const allItems = serverReasonItems + atrBadgeHtml;
+        const allItems = serverReasonItems + atrBadgeHtml + divWarnBadgeHtml;
         if (!allItems) return '';
         const ulStyle = flagChanged
           ? 'outline:1px solid var(--warn);border-radius:3px;padding:2px 4px;margin-top:2px'
@@ -1863,6 +2238,23 @@ function renderTable() {
         return `<ul class="reasons" style="${ulStyle}" ${ulTitle}>${allItems}</ul>`;
       })()}</td>
       <td${actionTdAttr}>${actionCell}</td>
+      <td style="text-align:center">${(() => {
+        const hasAlert = !!_alerts[posKey];
+        const a = _alerts[posKey] || {};
+        const btnStyle = hasAlert
+          ? 'background:var(--accent);color:#000;font-weight:700'
+          : 'background:var(--surface2);color:var(--fg)';
+        const btnTitle = hasAlert ? 'Alert set — click to edit' : 'Set price/delta alert';
+        const bell = `<button onclick="openAlertModal('${safeKey}')" style="font-size:11px;padding:2px 8px;border:none;border-radius:4px;cursor:pointer;${btnStyle}" title="${btnTitle}">${hasAlert ? '🔔' : '🔕'}</button>`;
+        const condBox = hasAlert
+          ? `<label style="display:block;margin-top:3px;font-size:10px;color:var(--muted);cursor:pointer;white-space:nowrap" title="Checked = AND, unchecked = OR">
+               <input type="checkbox" ${a.condition === 'and' ? 'checked' : ''}
+                 onchange="_toggleAlertCond('${safeKey}', this.checked)"
+                 style="margin-right:2px;accent-color:var(--accent);cursor:pointer">AND
+             </label>`
+          : '';
+        return bell + condBox;
+      })()}</td>
       ${checkboxCell}`;
     tbody.appendChild(tr);
     _prevFlags[posKey] = fingerprint;
@@ -1906,7 +2298,7 @@ const _recommendations = _loadRecs(); // posKey -> {rec}
 let _prevFlags = {}; // posKey -> "flagged|nFlags|reason0;reason1;..."
 
 // ── Live price polling state ─────────────────────────────────────────────────
-let _prevUlPrices  = {};  // {ticker: price} — price seen at last poll
+let _prevUlPrices  = (() => { try { return JSON.parse(localStorage.getItem(_LS_PR_PRICES) || '{}'); } catch { return {}; } })();
 let _ulPriceTick   = {};  // {ticker: 'up'|'down'|null} — direction since last poll
 let _prevClientAtr = {};  // {posKey: bool} — ATR breach state at last render
 let _pricePollCount = 0;  // increments each time fetchPrices() completes
@@ -1960,6 +2352,158 @@ function _toggleHide(posKey, checked, snapshot, trEl) {
   _saveHidden();
 }
 // ────────────────────────────────────────────────────────────────────────────
+
+// ── Alert system ─────────────────────────────────────────────────────────────
+const _LS_ALERT_KEY = 'optionAlerts';
+let _alerts = {};          // posKey -> {priceDir, priceVal, deltaDir, deltaVal, condition}
+let _alertFired = {};      // posKey -> last-fired epoch ms (cooldown)
+let _divAlertFired = {};   // posKey -> last-fired epoch ms for dividend/extrinsic auto-alerts
+const _ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 min between repeat alerts
+
+function _loadAlerts() {
+  try { return JSON.parse(localStorage.getItem(_LS_ALERT_KEY) || '{}'); } catch { return {}; }
+}
+function _saveAlerts() {
+  try { localStorage.setItem(_LS_ALERT_KEY, JSON.stringify(_alerts)); } catch {}
+}
+_alerts = _loadAlerts();
+
+function openAlertModal(posKey) {
+  const a = _alerts[posKey] || {};
+  document.getElementById('alert-modal-title').textContent =
+    'Set Alert: ' + posKey.replace(/\\|/g, ' · ');
+  document.getElementById('alert-pos-key').value = posKey;
+  document.getElementById('alert-price-dir').value = a.priceDir || 'above';
+  document.getElementById('alert-price-val').value = a.priceVal != null ? a.priceVal : '';
+  document.getElementById('alert-delta-dir').value = a.deltaDir || 'above';
+  document.getElementById('alert-delta-val').value = a.deltaVal != null ? a.deltaVal : '';
+  const cond = a.condition || 'or';
+  document.getElementById('alert-cond-' + cond).checked = true;
+  document.getElementById('alert-modal-overlay').style.display = 'flex';
+  document.getElementById('alert-price-val').focus();
+}
+
+function closeAlertModal() {
+  document.getElementById('alert-modal-overlay').style.display = 'none';
+}
+
+function saveAlert() {
+  const posKey  = document.getElementById('alert-pos-key').value;
+  const priceRaw = document.getElementById('alert-price-val').value.trim();
+  const deltaRaw = document.getElementById('alert-delta-val').value.trim();
+  if (!priceRaw && !deltaRaw) {
+    delete _alerts[posKey];
+    _saveAlerts();
+    closeAlertModal();
+    renderTable();
+    return;
+  }
+  _alerts[posKey] = {
+    priceDir:  document.getElementById('alert-price-dir').value,
+    priceVal:  priceRaw ? parseFloat(priceRaw) : null,
+    deltaDir:  document.getElementById('alert-delta-dir').value,
+    deltaVal:  deltaRaw ? parseFloat(deltaRaw) : null,
+    condition: document.querySelector('input[name="alert-cond"]:checked').value,
+  };
+  _saveAlerts();
+  closeAlertModal();
+  renderTable();
+}
+
+function clearAlert() {
+  const posKey = document.getElementById('alert-pos-key').value;
+  delete _alerts[posKey];
+  delete _alertFired[posKey];
+  _saveAlerts();
+  closeAlertModal();
+  renderTable();
+}
+
+function _toggleAlertCond(posKey, checked) {
+  if (!_alerts[posKey]) return;
+  _alerts[posKey].condition = checked ? 'and' : 'or';
+  _saveAlerts();
+}
+
+function _checkAlerts() {
+  if (!_data || !_data.length) return;
+  const now = Date.now();
+  for (const p of _data) {
+    const posKey = [p.symbol, p.option_type, p.strike, p.expiry].join('|');
+
+    // ── Dividend/extrinsic auto-alert (fires regardless of configured alert) ──
+    if ((now - (_divAlertFired[posKey] || 0)) >= _ALERT_COOLDOWN_MS) {
+      const _ul    = p.underlying;
+      const _str   = parseFloat(p.strike || 0);
+      const _ot    = (p.option_type || '').toUpperCase();
+      const _isItm = (_ot === 'CALL' && _ul > _str) || (_ot === 'PUT' && _ul < _str);
+      if (_isItm && p.dividend_amount != null && _ul != null && _str > 0 && p.current_price != null) {
+        const _intr = _ot === 'CALL' ? Math.max(0, _ul - _str) : Math.max(0, _str - _ul);
+        const _extr = Math.max(0, p.current_price - _intr);
+        if (p.dividend_amount >= _extr) {
+          _divAlertFired[posKey] = now;
+          const sym = (p.symbol||'').toUpperCase();
+          const msg = `${sym} ${_ot} $${p.strike} ${p.expiry}: `
+            + `dividend ($${p.dividend_amount.toFixed(2)}) ≥ extrinsic ($${_extr.toFixed(2)}) — early assignment risk`;
+          _sendPushoverAlert(msg);
+        }
+      }
+    }
+
+    // ── User-configured price/delta alerts ───────────────────────────────────
+    const a = _alerts[posKey];
+    if (!a) continue;
+    if ((now - (_alertFired[posKey] || 0)) < _ALERT_COOLDOWN_MS) continue;
+
+    const ulPrice = p.underlying;
+    const delta   = p.delta;
+
+    const _test = (dir, threshold, value) => {
+      if (threshold == null || value == null) return null;
+      return dir === 'above' ? value > threshold : value < threshold;
+    };
+
+    const priceTrip = _test(a.priceDir, a.priceVal, ulPrice);
+    const deltaTrip = _test(a.deltaDir, a.deltaVal, delta);
+
+    let triggered = false;
+    if (a.condition === 'and') {
+      const checks = [];
+      if (a.priceVal != null) checks.push(priceTrip);
+      if (a.deltaVal != null) checks.push(deltaTrip);
+      triggered = checks.length > 0 && checks.every(Boolean);
+    } else {
+      const checks = [];
+      if (a.priceVal != null) checks.push(priceTrip);
+      if (a.deltaVal != null) checks.push(deltaTrip);
+      triggered = checks.some(Boolean);
+    }
+
+    if (triggered) {
+      _alertFired[posKey] = now;
+      const parts = [];
+      if (a.priceVal != null && priceTrip)
+        parts.push(`underlying ${a.priceDir} $${a.priceVal} (now $${(ulPrice||0).toFixed(2)})`);
+      if (a.deltaVal != null && deltaTrip)
+        parts.push(`delta ${a.deltaDir} ${a.deltaVal} (now ${(delta||0).toFixed(3)})`);
+      const sym = (p.symbol||'').toUpperCase();
+      const msg = `${sym} ${(p.option_type||'').toUpperCase()} $${p.strike} ${p.expiry}: ` + parts.join(', ');
+      _sendPushoverAlert(msg);
+    }
+  }
+}
+
+async function _sendPushoverAlert(message) {
+  try {
+    const r = await fetch('/api/send-alert', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message}),
+    });
+    if (!r.ok) console.warn('Pushover alert failed:', await r.text());
+  } catch(e) { console.warn('Alert send error:', e); }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ── Auto-refresh scheduler ───────────────────────────────────────────────────
 // Uses a 30-second heartbeat rather than long setInterval timers, which
@@ -2039,6 +2583,13 @@ async function _loadUnbornFromServer() {
     if (!r.ok) return;
     const d = await r.json();
     Object.assign(_unbornRows, d);
+    // Seed _prevUlPrices from stored ul_price so first poll can show ticks
+    for (const row of Object.values(_unbornRows)) {
+      const sym = (row.symbol || '').toUpperCase();
+      if (_prevUlPrices[sym] == null && row.ul_price != null) {
+        _prevUlPrices[sym] = row.ul_price;
+      }
+    }
     _renderUnbornTable();
   } catch(e) { /* silently ignore */ }
 }
@@ -2067,7 +2618,7 @@ function _renderUnbornTableInner() {
   const keys = Object.keys(_unbornRows).filter(k => {
     const exp = _unbornRows[k].expiry;
     if (!exp) return true;
-    return new Date(exp + 'T00:00:00') > today;
+    return new Date(exp + 'T00:00:00') >= today;
   });
   if (!keys.length) { el.innerHTML = ''; return; }
   const fv = (v, d, p='') => v == null ? '—' : p + parseFloat(v).toFixed(d);
@@ -2105,22 +2656,35 @@ function _renderUnbornTableInner() {
     const symCell = detailHref
       ? `<a href="${detailHref}" target="_blank" style="color:var(--accent);text-decoration:none"><b>${esc(c.symbol)}</b></a>`
       : `<b>${esc(c.symbol)}</b>`;
+    const _blank = c._do_nothing || c._no_opt;
     return `<tr>
       <td>${symCell}</td>
       <td>${esc((c.option_type||'').toUpperCase())}</td>
-      <td>${fv(c.strike,2,'$')}</td>
-      <td>${esc(c.expiry||'—')}</td>
-      <td>${esc(c.side||'Short')}</td>
-      <td>${qty}</td>
-      <td>${c.dte??'—'}</td>
-      <td>${c.delta!=null?(c.delta>=0?'+':'')+parseFloat(c.delta).toFixed(3):'—'}</td>
-      <td>${fv(c.ul_price,2,'$')}</td>
-      <td>${fv(c.opt_price,2,'$')}</td>
+      <td>${_blank ? '—' : fv(c.strike,2,'$')}</td>
+      <td>${_blank ? '—' : esc(c.expiry||'—')}</td>
+      <td>${_blank ? '—' : esc(c.side||'Short')}</td>
+      <td>${_blank ? '—' : qty}</td>
+      <td>${_blank ? '—' : (c.dte??'—')}</td>
+      <td>${_blank ? '—' : (c.delta!=null?(c.delta>=0?'+':'')+parseFloat(c.delta).toFixed(3):'—')}</td>
+      <td>${(() => {
+        if (c.ul_price == null) return '—';
+        const sym  = (c.symbol||'').toUpperCase();
+        const tick = _ulPriceTick[sym];
+        const priceStr = '$' + parseFloat(c.ul_price).toFixed(2);
+        return tick === 'up'
+          ? '<span style="color:var(--ok);font-weight:700" title="Price up since last poll">&#9650; ' + priceStr + '</span>'
+          : tick === 'down'
+          ? '<span style="color:var(--danger);font-weight:700" title="Price down since last poll">&#9660; ' + priceStr + '</span>'
+          : priceStr;
+      })()}</td>
+      <td>${_blank ? '—' : fv(c.opt_price,2,'$')}</td>
       <td>${c._ul_cost_basis > 0 ? fv(c._ul_cost_basis,2,'$') : '—'}</td>
-      <td style="color:var(--muted);font-size:11px;white-space:normal;max-width:130px">${esc(c.ideal_entry||'—')}</td>
+      <td style="font-size:11px;white-space:normal;max-width:130px;${c._no_opt?'color:var(--muted);font-style:italic':c._do_nothing?'color:var(--warn);font-weight:700':'color:var(--muted)'}">${esc(c.ideal_entry||'—')}</td>
       <td style="white-space:nowrap">
-        <button data-key="${esc(k)}" onclick="placeTrade(this.dataset.key,this)" style="font-size:11px;padding:3px 8px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">Trade</button>
-        <button data-key="${esc(k)}" onclick="deleteUnbornRow(this.dataset.key)" style="font-size:11px;padding:3px 6px;background:var(--danger-bg);color:var(--danger);border:1px solid var(--danger);border-radius:4px;cursor:pointer;margin-left:4px">&times;</button>
+        ${_blank ? '' : '<button data-key="' + esc(k) + '" onclick="placeTrade(this.dataset.key,this)" style="font-size:11px;padding:3px 8px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">Trade</button>'}
+        <button data-key="${esc(k)}" onclick="deleteUnbornRow(this.dataset.key)" style="font-size:11px;padding:3px 6px;background:var(--danger-bg);color:var(--danger);border:1px solid var(--danger);border-radius:4px;cursor:pointer;${_blank?'':'margin-left:4px'}">&times;</button>
+        ${c._no_opt ? '' : '<button data-key="' + esc(k) + '" onclick="recalcUnbornRow(this.dataset.key,this)" title="Re-run analysis" style="font-size:11px;padding:3px 8px;background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;cursor:pointer;margin-left:4px">Recalc</button>'}
+        ${c._run_at ? '<span style="font-size:10px;color:var(--muted);margin-left:6px;white-space:nowrap">' + esc(c._run_at) + '</span>' : ''}
       </td>
     </tr>`;
   }).join('');
@@ -2146,17 +2710,84 @@ async function retryAnalysis(key, btn) {
   analyzePosition(key, btn);
 }
 
+async function _setUnbornCostBasis(key, val) {
+  const v = parseFloat(val);
+  if (!_unbornRows[key] || isNaN(v) || v <= 0) return;
+  _unbornRows[key]._ul_cost_basis = v;
+  await _saveUnbornToServer();
+  _renderUnbornTable();
+}
+
 async function deleteUnbornRow(key) {
   delete _unbornRows[key];
   await _saveUnbornToServer();
-  // Also purge the server-side analysis cache for this row
-  const c = _unbornRows[key];  // already deleted, but _ubKey may have been on it
   await fetch('/api/unborn-cache-delete', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({row_key: key})
   });
   _renderUnbornTable();
+}
+
+async function recalcUnbornRow(key, btn) {
+  // key = "TICKER|STRAT"
+  const parts = key.split('|');
+  const ticker = parts[0];
+  const strat  = parts[1] || 'CC';
+  const row    = _unbornRows[key] || {};
+  const qty    = row._qty || 1;
+  const oldRow = Object.assign({}, row);  // keep a copy in case we need to restore
+
+  // Disable buttons and blank stale market data while running; row stays visible
+  const tr = btn.closest('tr');
+  const btns = tr ? tr.querySelectorAll('button') : [btn];
+  btns.forEach(b => { b.disabled = true; });
+  btn.innerHTML = '<span style="display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle"></span>';
+  // Columns: 0=Symbol,1=Type,2=Strike,3=Expiry,4=Side,5=Qty,6=DTE,7=Delta,8=UL,9=OptPrice,10=Basis,11=Ideal,12=Actions
+  if (tr) [2, 3, 6, 7, 9].forEach(i => { if (tr.cells[i]) tr.cells[i].textContent = '—'; });
+
+  // Purge server-side cache so a fresh analysis runs
+  await fetch('/api/unborn-cache-delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({row_key: key})
+  });
+
+  try {
+    let d;
+    while (true) {
+      const r = await fetch('/api/unborn', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ticker, qty, strat})
+      });
+      let raw;
+      try { raw = await r.text(); d = JSON.parse(raw); }
+      catch { throw new Error('Non-JSON: ' + (raw||'').slice(0,200)); }
+      if (r.status === 202 && d.status === 'in_progress') {
+        await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
+        continue;
+      }
+      break;
+    }
+    if (d.error) throw new Error(d.error);
+    const chain = d.chain || [];
+    if (chain.length) {
+      const ubKey = encodeURIComponent(ticker + '|' + strat + '|' + qty);
+      const _runAt = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
+      _unbornRows[key] = Object.assign({}, chain[0], {_qty: qty, _ubKey: ubKey, _ul_cost_basis: d.ul_cost_basis ?? null, _run_at: _runAt});
+    } else {
+      // Analysis ran but returned no chain — restore old row
+      _unbornRows[key] = oldRow;
+    }
+    await _saveUnbornToServer();
+    _renderUnbornTable();
+  } catch(e) {
+    // Restore old row on error
+    _unbornRows[key] = oldRow;
+    _renderUnbornTable();
+    alert('Recalc failed for ' + ticker + ': ' + e.message);
+  }
 }
 
 function recBadge(rec, key, chainCash, text) {
@@ -2198,10 +2829,13 @@ function _actionCell(key) {
 
 async function analyzePosition(key, btn) {
   btn.disabled = true;
-  btn.textContent = '⟳ Analyzing…';
   btn.style.background = 'orange';
   btn.style.color = '#000';
   btn.style.borderColor = 'orange';
+  btn.style.display = 'inline-flex';
+  btn.style.alignItems = 'center';
+  btn.style.gap = '5px';
+  btn.innerHTML = '<span style="width:11px;height:11px;border:2px solid rgba(0,0,0,0.25);border-top-color:#000;border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Analyzing…';
   console.log('[analyze] starting:', key);
   try {
     let d;
@@ -2249,23 +2883,51 @@ async function analyzePosition(key, btn) {
   }
 }
 
+async function autoFillCcQty() {
+  const ticker  = document.getElementById('ub-ticker').value.trim().toUpperCase();
+  const strat   = document.getElementById('ub-strat').value;
+  const cbGroup = document.getElementById('ub-cb-group');
+  if (strat !== 'CC' || !ticker) { cbGroup.style.display = 'none'; return; }
+  try {
+    const r = await fetch('/api/cc-qty/' + encodeURIComponent(ticker));
+    const d = await r.json();
+    if (d.qty != null && d.qty > 0) document.getElementById('ub-qty').value = d.qty;
+  } catch(e) { /* silently ignore */ }
+  try {
+    const r2 = await fetch('/api/cost-basis/' + encodeURIComponent(ticker));
+    const d2  = await r2.json();
+    const hasBasis = d2.ul_cost_basis > 0;
+    cbGroup.style.display = hasBasis ? 'none' : 'inline-flex';
+    if (hasBasis) document.getElementById('ub-cost-basis').value = '';
+  } catch(e) { cbGroup.style.display = 'inline-flex'; }
+}
+
 async function findUnborn() {
-  const ticker   = document.getElementById('ub-ticker').value.trim().toUpperCase();
-  const qty      = parseInt(document.getElementById('ub-qty').value) || 1;
-  const strat    = document.getElementById('ub-strat').value;
+  const ticker    = document.getElementById('ub-ticker').value.trim().toUpperCase();
+  const qty       = parseInt(document.getElementById('ub-qty').value) || 1;
+  const strat     = document.getElementById('ub-strat').value;
+  const costBasis = parseFloat(document.getElementById('ub-cost-basis').value) || 0;
   const resultEl = document.getElementById('unborn-result');
   if (!ticker) { resultEl.innerHTML = '<span style="color:var(--danger);font-size:12px">Enter a ticker.</span>'; return; }
 
-  resultEl.innerHTML = '<span style="color:var(--muted);font-size:12px">⟳ Analyzing…</span>';
+  resultEl.innerHTML = '<span style="display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px"><span style="width:13px;height:13px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Analyzing…</span>';
   try {
-    const r = await fetch('/api/unborn', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ticker, qty, strat})
-    });
-    let raw, d;
-    try { raw = await r.text(); d = JSON.parse(raw); }
-    catch { throw new Error('Server returned non-JSON: ' + (raw||'').slice(0,200)); }
+    let d;
+    while (true) {
+      const r = await fetch('/api/unborn', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ticker, qty, strat, cost_basis: costBasis})
+      });
+      let raw;
+      try { raw = await r.text(); d = JSON.parse(raw); }
+      catch { throw new Error('Server returned non-JSON: ' + (raw||'').slice(0,200)); }
+      if (r.status === 202 && d.status === 'in_progress') {
+        await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
+        continue;
+      }
+      break;
+    }
     if (d.error) throw new Error(d.error);
 
     // Recommendation badge
@@ -2278,7 +2940,8 @@ async function findUnborn() {
     // Accumulate proposed trades — add/update this ticker|strat entry, keep others
     const chain = d.chain || [];
     if (chain.length) {
-      const row = Object.assign({}, chain[0], {_qty: qty, _ubKey: ubKey, _ul_cost_basis: d.ul_cost_basis ?? null});
+      const _runAt2 = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
+      const row = Object.assign({}, chain[0], {_qty: qty, _ubKey: ubKey, _ul_cost_basis: d.ul_cost_basis ?? null, _run_at: _runAt2});
       _unbornRows[ticker + '|' + strat] = row;
       await _saveUnbornToServer();
       _renderUnbornTable();
@@ -2287,6 +2950,8 @@ async function findUnborn() {
       document.getElementById('ub-ticker').value = '';
       document.getElementById('ub-qty').value = '1';
       document.getElementById('ub-strat').value = 'CC';
+      document.getElementById('ub-cost-basis').value = '';
+      document.getElementById('ub-cb-group').style.display = 'none';
       resultEl.innerHTML = '';
     }
   } catch(e) {
@@ -2312,6 +2977,9 @@ async function placeTrade(rowKey, btn) {
     if (d.status === 'launched') {
       btn.textContent = '✓';
       btn.style.background = 'var(--ok)';
+      btn.disabled = false;
+      btn.title = 'Click to retry';
+      btn.onclick = () => _resetTradeBtn(btn, rowKey);
       _showTradeModal(d.trade);
     } else {
       throw new Error(d.error || 'Unknown error');
@@ -2319,9 +2987,17 @@ async function placeTrade(rowKey, btn) {
   } catch(e) {
     btn.textContent = 'Err';
     btn.style.background = 'var(--danger)';
-    btn.title = e.message;
+    btn.title = e.message + ' — click to retry';
     btn.disabled = false;
+    btn.onclick = () => _resetTradeBtn(btn, rowKey);
   }
+}
+
+function _resetTradeBtn(btn, rowKey) {
+  btn.textContent = 'Trade';
+  btn.style.background = 'var(--accent)';
+  btn.title = '';
+  btn.onclick = () => placeTrade(rowKey, btn);
 }
 
 function _cpBtn(val) {
@@ -2349,7 +3025,7 @@ function _showTradeModal(t) {
     <div style="padding:14px 16px">
       <table style="border-collapse:collapse;width:100%">
         <tr><td style="color:var(--muted);padding:5px 14px 5px 0;white-space:nowrap">1. Action</td>
-            <td><b style="color:var(--ok)">Sell to Open</b></td></tr>
+            <td><b style="color:var(--ok)">Sell to Open</b>${t._run_at ? `<div style="font-size:10px;color:var(--muted);margin-top:2px">${esc(t._run_at)}</div>` : ''}</td></tr>
         <tr><td style="color:var(--muted);padding:5px 14px 5px 0">2. Symbol</td>
             <td><b>${esc(t.symbol)}</b>${_cpBtn(t.symbol)}</td></tr>
         <tr><td style="color:var(--muted);padding:5px 14px 5px 0">3. Type</td>
@@ -2403,11 +3079,13 @@ function sortTable(col) {
   if (_sortCol === col) { _sortDir *= -1; }
   else { _sortCol = col; _sortDir = 1; }
   ths[col].classList.add(_sortDir === 1 ? 'sorted-asc' : 'sorted-desc');
+  localStorage.setItem(_LS_SORT_KEY, JSON.stringify([_sortCol, _sortDir]));
   renderTable();
 }
 
 // ── Live underlying price poller (every 5 min, independent of main refresh) ──
-const _LS_PR_LAST = 'optionsPriceLastRun'; // epoch ms of last price poll
+const _LS_PR_LAST   = 'optionsPriceLastRun';  // epoch ms of last price poll
+const _LS_PR_PRICES = 'optionsPrevUlPrices';  // {ticker: price} — persisted across refresh
 const _PRICE_INTERVAL_SECS = 300;           // 5 minutes
 let _priceHeartbeat = null;
 
@@ -2416,15 +3094,19 @@ async function fetchPrices() {
     const r = await fetch('/api/prices');
     if (!r.ok) return;
     const prices = await r.json();
+    const _seenSyms = new Set();
     for (const p of _data) {
       const sym = (p.symbol || '').toUpperCase();
       const info = prices[sym];
       if (!info) continue;
       const newPrice = info.price;
       if (newPrice != null) {
-        const prev = _prevUlPrices[sym];
-        _ulPriceTick[sym] = (prev == null) ? null : (newPrice > prev ? 'up' : newPrice < prev ? 'down' : null);
-        _prevUlPrices[sym] = newPrice;
+        if (!_seenSyms.has(sym)) {
+          const prev = _prevUlPrices[sym];
+          _ulPriceTick[sym] = (prev == null) ? null : (newPrice > prev ? 'up' : newPrice < prev ? 'down' : null);
+          _prevUlPrices[sym] = newPrice;
+          _seenSyms.add(sym);
+        }
         p.underlying = newPrice;
       }
       if (info.atr  != null) p.atr    = info.atr;
@@ -2447,8 +3129,25 @@ async function fetchPrices() {
     }
 
     _pricePollCount++;
-    localStorage.setItem(_LS_PR_LAST, String(Date.now()));
+    localStorage.setItem(_LS_PR_LAST,   String(Date.now()));
+    localStorage.setItem(_LS_PR_PRICES, JSON.stringify(_prevUlPrices));
+    // ── Update unborn ul_price + tick direction ────────────────────────────
+    for (const k of Object.keys(_unbornRows)) {
+      const sym = (_unbornRows[k].symbol || '').toUpperCase();
+      const info = prices[sym];
+      if (!info || info.price == null) continue;
+      const newPrice = info.price;
+      // Only compute tick if this symbol isn't already in _data (avoid double-setting)
+      if (!_data.some(p => (p.symbol||'').toUpperCase() === sym)) {
+        const prev = _prevUlPrices[sym];
+        _ulPriceTick[sym] = (prev == null) ? null : (newPrice > prev ? 'up' : newPrice < prev ? 'down' : null);
+        _prevUlPrices[sym] = newPrice;
+      }
+      _unbornRows[k].ul_price = newPrice;
+    }
     renderTable();
+    _renderUnbornTable();
+    _checkAlerts();
   } catch(e) { /* silent — don't disrupt the UI */ }
 }
 
@@ -2803,10 +3502,42 @@ def _select_nth_account_item(n: int) -> str:
     )
 
 
+_FIDELITY_URL_FRAGMENT = "fidelity.com/ftgw/digital/trade-options"
+
 def _osascript_js(js: str) -> str:
-    """Wrap JS in an osascript AppleScript tell-block for Chrome's front tab."""
+    """Wrap JS for Chrome's current active tab (simple, no tab iteration)."""
     safe = js.replace("\\", "\\\\").replace('"', '\\"')
     return f'tell application "Google Chrome" to execute front window\'s active tab javascript "{safe}"'
+
+
+def _focus_fidelity_tab() -> str:
+    """Find the trade-options tab by URL, bring it to front, activate Chrome.
+    Uses multi-line AppleScript passed via stdin to avoid -e quoting issues."""
+    import subprocess as _sp
+    script = (
+        'tell application "Google Chrome"\n'
+        '  repeat with w in windows\n'
+        '    set i to 0\n'
+        '    repeat with t in tabs of w\n'
+        '      set i to i + 1\n'
+        '      if URL of t contains "trade-options" then\n'
+        '        set active tab index of w to i\n'
+        '        set index of w to 1\n'
+        '        activate\n'
+        '        return "focused:tab-" & i\n'
+        '      end if\n'
+        '    end repeat\n'
+        '  end repeat\n'
+        '  activate\n'
+        '  return "trade-options-tab-not-found"\n'
+        'end tell'
+    )
+    try:
+        r = _sp.run(["osascript"], input=script,
+                    capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() or r.stderr.strip()
+    except Exception as exc:
+        return str(exc)
 
 
 def _run_js(js: str, label: str) -> str:
@@ -2866,6 +3597,8 @@ def _launch_fidelity_trade(trade: dict) -> None:
         _sp.Popen(["open", url])
 
     _time.sleep(5)   # wait for Angular to render
+    focus_result = _focus_fidelity_tab()
+    log.info("[fidelity] focus-tab → %s", focus_result)
 
     # ── 1. Select account: click button#account, wait, pick 3rd item (Babs IRA) ──
     _run_js(_click_nth_account(3), "open-account-dropdown")
@@ -2908,8 +3641,24 @@ def _launch_fidelity_trade(trade: dict) -> None:
             "symbol-enter"
         )
 
-    # Wait for expiry/strike dropdowns to populate after symbol confirmation
-    _time.sleep(3.0)
+    # Poll until the expiry dropdown button is enabled (Angular populates it after symbol load).
+    # Replaces the old fixed 3-second sleep — more robust across machines with different load times.
+    _exp_ready_poll = (
+        "(function(){"
+        "var btn=document.getElementById('exp_dropdown-0');"
+        "if(!btn) return 'no-btn';"
+        "if(btn.disabled) return 'disabled';"
+        "return 'ready';"
+        "})()"
+    )
+    for _wi in range(20):   # up to 10 s
+        _ws = _run_js(_exp_ready_poll, f"wait-exp-dropdown-{_wi}")
+        if _ws.strip() == "ready":
+            log.info("[fidelity] expiry dropdown ready after ~%.1fs", _wi * 0.5)
+            break
+        _time.sleep(0.5)
+    else:
+        log.warning("[fidelity] expiry dropdown never became ready — proceeding anyway")
 
     # ── 3. Qty ──
     _run_js(_angular_set("quantity-0", qty), "set-qty")
@@ -2927,17 +3676,50 @@ def _launch_fidelity_trade(trade: dict) -> None:
         f"r.click();r.dispatchEvent(new Event('change',{{bubbles:true}}));return 'ok:{radio_id}';}})() ",
         "set-call-put"
     )
-    _time.sleep(0.5)
+    # Poll for expiry dropdown to re-populate after call/put selection changes the chain
+    for _cpi in range(14):   # up to 7 s
+        _cps = _run_js(_exp_ready_poll, f"wait-exp-after-cp-{_cpi}")
+        if _cps.strip() == "ready":
+            log.info("[fidelity] expiry dropdown ready after call/put ~%.1fs", _cpi * 0.5)
+            break
+        _time.sleep(0.5)
 
     # ── 6. Expiry dropdown ──
     if expiry_label:
+        log.info("[fidelity] refocus → %s", _focus_fidelity_tab())
         _run_js(_click_id("exp_dropdown-0"), "open-expiry-dropdown")
         _time.sleep(1.5)
-        _run_js(_click_dropdown_option(expiry_label), "select-expiry")
+        result_exp = _run_js(_click_dropdown_option(expiry_label), "select-expiry")
+        # Fallback: try full month name (e.g. "July 17, 2026" vs "Jul 17, 2026")
+        if "not found" in result_exp:
+            import calendar as _cal
+            month_num = int(expiry_raw.split("-")[1]) if expiry_raw else 0
+            full_month = _cal.month_name[month_num] if month_num else ""
+            day = str(int(expiry_raw.split("-")[2])) if expiry_raw else ""
+            year = expiry_raw.split("-")[0] if expiry_raw else ""
+            alt_label = f"{full_month} {day}, {year}"
+            log.info("[fidelity] expiry not found as %r — trying %r", expiry_label, alt_label)
+            _run_js(_click_dropdown_option(alt_label), "select-expiry-alt")
         _time.sleep(0.5)
 
     # ── 7. Strike dropdown ──
     if strike_label:
+        log.info("[fidelity] refocus → %s", _focus_fidelity_tab())
+        # Poll for strike dropdown to be enabled after expiry selection
+        _strike_ready_poll = (
+            "(function(){"
+            "var btn=document.getElementById('strike_dropdown-0');"
+            "if(!btn) return 'no-btn';"
+            "if(btn.disabled) return 'disabled';"
+            "return 'ready';"
+            "})()"
+        )
+        for _sri in range(14):   # up to 7 s
+            _srs = _run_js(_strike_ready_poll, f"wait-strike-{_sri}")
+            if _srs.strip() == "ready":
+                log.info("[fidelity] strike dropdown ready after ~%.1fs", _sri * 0.5)
+                break
+            _time.sleep(0.5)
         _run_js(_click_id("strike_dropdown-0"), "open-strike-dropdown")
         _time.sleep(1.0)
         result = _run_js(_click_dropdown_option(strike_label), "select-strike")
@@ -3047,6 +3829,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         log.error("Flask is required for --web mode. Install with: pip install flask")
         sys.exit(1)
 
+    import base64
     import html as html_mod
     import json
     import urllib.parse
@@ -3117,15 +3900,37 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             return None
         raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
 
+    def _sanitize(obj):
+        """Recursively replace float NaN/Inf with None so json.dumps produces valid JSON."""
+        import math
+        if isinstance(obj, float):
+            return None if (math.isnan(obj) or math.isinf(obj)) else obj
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize(v) for v in obj]
+        return obj
+
     @app.route("/")
     def index():
         return Response(_WEB_DASHBOARD_HTML, mimetype="text/html")
 
     @app.route("/api/prices")
     def api_prices():
-        """Return live underlying prices + ATR values for all open positions (yfinance only)."""
+        """Return live underlying prices + ATR values for all open + unborn positions (yfinance)."""
         positions = get_all_open_positions()
         tickers = {p["symbol"].upper() for p in positions}
+        # Also include tickers from unborn rows so the poller updates them too
+        try:
+            if os.path.exists(_UNBORN_ROWS_FILE):
+                with open(_UNBORN_ROWS_FILE, "r", encoding="utf-8") as f:
+                    unborn = json.load(f)
+                for row in unborn.values():
+                    sym = (row.get("symbol") or "").upper()
+                    if sym:
+                        tickers.add(sym)
+        except Exception:
+            pass
         result = {}
         for sym in tickers:
             price = get_underlying_price_fresh(sym)
@@ -3136,12 +3941,13 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 "buffer": round(atr * 1.5, 4) if atr else None,
             }
         result["__vix__"] = {"price": get_vix()}
-        return Response(json.dumps(result, default=_serial), mimetype="application/json")
+        return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
 
     @app.route("/api/eval")
     def api_eval():
         import datetime as _dt
         log.info("[DASHBOARD-REFRESH] eval requested at %s", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        _price_cache.clear()  # force fresh underlying prices on every manual refresh
         data = get_eval_data(_get_valid_token(), account_id, ticker=None, verbose=False)
         # Include server-side analysis cache so the client can restore
         # recommendation badges after a manual refresh
@@ -3151,7 +3957,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 for k, v in _analysis_cache.items()
                 if not v.get("error")
             }
-        return Response(json.dumps(data, default=_serial), mimetype="application/json")
+        return Response(json.dumps(_sanitize(data), default=_serial), mimetype="application/json")
 
     @app.route("/api/analyze", methods=["POST"])
     def api_analyze():
@@ -3246,7 +4052,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             if not result.get("error"):
                 _analysis_cache[pos_key] = result
                 _save_cache(_analysis_cache)
-        return Response(json.dumps(result, default=_serial), mimetype="application/json")
+        return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
 
     # ── Unborn routes ──────────────────────────────────────────────────────────
     _UNBORN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".unborn_cache.json")
@@ -3271,7 +4077,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     _unborn_cache: dict[str, dict] = {
         k: v for k, v in _unborn_cache_raw.items()
         if not (v.get("chain") and v["chain"] and
-                v["chain"][0].get("expiry", "9999") <= _today_uc)
+                (v["chain"][0].get("expiry") or "9999") <= _today_uc)
     }
     if len(_unborn_cache) < len(_unborn_cache_raw):
         log.info("[unborn] Purged %d expired cache entries on startup",
@@ -3290,9 +4096,16 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         if strat not in ("CC", "CSP"):
             return Response(json.dumps({"error": f"Unknown strat: {strat}"}), status=400, mimetype="application/json")
 
-        # Look up cost basis from DB (CC only); ignore any UI-supplied value
-        ul_cost_basis = get_ul_cost_basis_from_db(ticker) if strat == "CC" else 0.0
-        log.info("[unborn] %s cost basis from DB: %.2f", ticker, ul_cost_basis)
+        # Look up cost basis from DB (CC only); fall back to UI-supplied value if DB has none
+        ui_cost_basis = float(body.get("cost_basis") or 0)
+        ul_cost_basis = 0.0
+        if strat == "CC":
+            ul_cost_basis = get_ul_cost_basis_from_db(ticker)
+            if not ul_cost_basis and ui_cost_basis > 0:
+                ul_cost_basis = ui_cost_basis
+                log.info("[unborn] %s cost basis from UI: %.2f", ticker, ul_cost_basis)
+            else:
+                log.info("[unborn] %s cost basis from DB: %.2f", ticker, ul_cost_basis)
 
         cb_key = f"{ul_cost_basis:.2f}" if ul_cost_basis else "0"
         ub_key = f"{ticker}|{strat}|{qty}|{cb_key}"
@@ -3321,27 +4134,36 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
         log.info("[unborn] Running %s analysis for %s qty=%d ul_cost_basis=%.2f",
                  strat, ticker, qty, ul_cost_basis)
-        try:
-            result = asyncio.run(
-                run_unborn_for_ticker(fresh_token, fresh_account_id, ticker, qty, strat,
-                                      notebook_id, ul_cost_basis=ul_cost_basis)
-            )
-            if result.get("error"):
-                log.error("[unborn] Error for %s: %s", ticker, result["error"])
-            else:
-                log.info("[unborn] %s → %s", ticker, result.get("recommendation"))
-        except Exception as exc:
-            log.exception("[unborn] Unhandled exception for %s", ticker)
-            result = {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat}
-        finally:
-            with _cache_lock:
-                _unborn_inflight.discard(ub_key)
 
-        with _cache_lock:
-            if not result.get("error"):
-                _unborn_cache[ub_key] = result
-                _save_unborn_cache(_unborn_cache)
-        return Response(json.dumps(result, default=_serial), mimetype="application/json")
+        # Run the analysis in a background thread so Playwright launching Chromium
+        # cannot disrupt the Flask request thread or the asyncio event loop.
+        # The handler returns 202 immediately; the JS polling loop picks up the
+        # cached result once the background thread finishes.
+        def _run_analysis():
+            try:
+                result = asyncio.run(
+                    run_unborn_for_ticker(fresh_token, fresh_account_id, ticker, qty, strat,
+                                          notebook_id, ul_cost_basis=ul_cost_basis)
+                )
+                if result.get("error"):
+                    log.error("[unborn] Error for %s: %s", ticker, result["error"])
+                else:
+                    log.info("[unborn] %s → %s", ticker, result.get("recommendation"))
+            except Exception as exc:
+                log.exception("[unborn] Unhandled exception for %s", ticker)
+                result = {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat}
+            finally:
+                with _cache_lock:
+                    _unborn_inflight.discard(ub_key)
+            with _cache_lock:
+                if not result.get("error"):
+                    _unborn_cache[ub_key] = result
+                    _save_unborn_cache(_unborn_cache)
+
+        t = threading.Thread(target=_run_analysis, daemon=True)
+        t.start()
+        return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                        status=202, mimetype="application/json")
 
     _UNBORN_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unborn_rows.json")
 
@@ -3367,6 +4189,43 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             return Response(json.dumps({"error": str(exc)}), mimetype="application/json", status=500)
         return Response(json.dumps({"status": "ok"}), mimetype="application/json")
 
+    @app.route("/api/cc-qty/<ticker>", methods=["GET"])
+    def api_cc_qty(ticker: str):
+        """Return the number of CC contracts available for ticker from trades.db."""
+        qty = get_stock_qty_from_db(ticker.upper().strip())
+        return Response(json.dumps({"ticker": ticker.upper(), "qty": qty}), mimetype="application/json")
+
+    @app.route("/api/cost-basis/<ticker>", methods=["GET"])
+    def api_cost_basis(ticker: str):
+        """Return the underlying cost basis for ticker from trades.db (0 if not found)."""
+        cb = get_ul_cost_basis_from_db(ticker.upper().strip())
+        return Response(json.dumps({"ticker": ticker.upper(), "ul_cost_basis": cb}), mimetype="application/json")
+
+    @app.route("/api/send-alert", methods=["POST"])
+    def api_send_alert():
+        body      = flask_request.get_json(force=True) or {}
+        message   = body.get("message", "Options alert triggered")
+        user_key  = os.environ.get("PUSHOVER_USER_KEY", "")
+        app_token = os.environ.get("PUSHOVER_APP_TOKEN", "")
+        if not user_key or not app_token:
+            log.warning("[alert] Pushover credentials not set (PUSHOVER_USER_KEY / PUSHOVER_APP_TOKEN)")
+            return Response(
+                json.dumps({"status": "error", "detail": "Pushover credentials not configured"}),
+                mimetype="application/json", status=500,
+            )
+        import urllib.request as _urlreq
+        payload = urllib.parse.urlencode({
+            "token":   app_token,
+            "user":    user_key,
+            "message": message,
+            "title":   "Options Alert",
+        }).encode()
+        req  = _urlreq.Request("https://api.pushover.net/1/messages.json", data=payload)
+        resp = _urlreq.urlopen(req, timeout=10)
+        result = json.loads(resp.read())
+        log.info("[alert] Pushover sent: %s → %s", message, result)
+        return Response(json.dumps({"status": "ok", "pushover": result}), mimetype="application/json")
+
     @app.route("/api/trade", methods=["POST"])
     def api_trade():
         trade = flask_request.get_json(force=True) or {}
@@ -3388,6 +4247,17 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     break
         parts  = ub_key.split("|")   # TICKER|STRAT|QTY
         title_str = html_mod.escape(" · ".join(parts))
+        ticker_sym = html_mod.escape(parts[0].upper())
+        # Font size scales down for longer tickers (e.g. 4-char vs 2-char)
+        _fs = {1: 52, 2: 44, 3: 34, 4: 26}.get(len(parts[0]), 20)
+        _favicon_svg = (
+            f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+            f"<circle cx='32' cy='32' r='30' fill='white'/>"
+            f"<text x='32' y='32' dominant-baseline='central' text-anchor='middle' "
+            f"font-family='monospace' font-weight='bold' font-size='{_fs}' fill='#052e16'>{ticker_sym}</text>"
+            f"</svg>"
+        )
+        favicon_href = "data:image/svg+xml;base64," + base64.b64encode(_favicon_svg.encode()).decode()
 
         if not cached:
             body_html = "<p style='color:var(--muted)'>Analysis not found. Click <b>Find</b> first.</p>"
@@ -3395,9 +4265,13 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             body_html = f"<p style='color:var(--danger)'>Error: {html_mod.escape(cached['error'])}</p>"
         else:
             strat    = cached.get("strat", "")
-            rec      = "SELL TO OPEN" if strat in ("CC", "CSP") else "OPEN"
+            if cached.get("_do_nothing"):
+                rec     = "DO NOTHING"
+                rec_cls = "warn"
+            else:
+                rec     = "SELL TO OPEN" if strat in ("CC", "CSP") else "OPEN"
+                rec_cls = "ok"   # unborn = new open trade, always shown as affirmative
             text     = cached.get("text", "")
-            rec_cls  = "ok"   # unborn = new open trade, always shown as affirmative
             lines_out = []
             for ln in text.splitlines():
                 ln_esc = html_mod.escape(ln)
@@ -3418,6 +4292,22 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         page = f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title_str} — Unborn</title>
+<script>
+(function(){{
+  var c=document.createElement('canvas');
+  c.width=c.height=64;
+  var x=c.getContext('2d');
+  x.fillStyle='white';
+  x.beginPath();x.arc(32,32,30,0,Math.PI*2);x.fill();
+  x.fillStyle='#052e16';
+  x.textAlign='center';x.textBaseline='middle';
+  x.font='bold {_fs}px monospace';
+  x.fillText('{ticker_sym}',32,32);
+  var l=document.querySelector("link[rel~='icon']")||document.createElement('link');
+  l.rel='icon';l.href=c.toDataURL();
+  document.head.appendChild(l);
+}})();
+</script>
 <style>
   :root{{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3a;--text:#e2e8f0;--muted:#8892a4;
     --accent:#4f8ef7;--ok:#22c55e;--warn:#f59e0b;--danger:#ef4444;
@@ -3510,6 +4400,20 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
 </script>
 </body></html>"""
         return Response(page, mimetype="text/html")
+
+    @app.route("/favicon/<ticker>.svg")
+    def ticker_favicon(ticker):
+        t   = html_mod.escape(ticker.upper()[:6])
+        fs  = {1: 36, 2: 32, 3: 24, 4: 18}.get(len(t), 14)
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+            f'<circle cx="32" cy="32" r="30" fill="white"/>'
+            f'<text x="32" y="32" dominant-baseline="central" text-anchor="middle" '
+            f'font-family="monospace" font-weight="bold" font-size="{fs}" fill="#052e16">{t}</text>'
+            f'</svg>'
+        )
+        return Response(svg, mimetype="image/svg+xml",
+                        headers={"Cache-Control": "no-store"})
 
     @app.route("/api/ask", methods=["POST"])
     def api_ask():
@@ -3628,6 +4532,8 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
 
         parts = pos_key.split("|")
         title_str = " · ".join(parts) if parts else pos_key
+        ticker_sym = html_mod.escape(parts[0].upper()) if parts else "?"
+        _fs = {1: 36, 2: 32, 3: 24, 4: 18}.get(len(parts[0]) if parts else 1, 14)
 
         if not cached:
             body_html = (
@@ -3661,12 +4567,14 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                     ln_esc = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', ln_esc)
                     lines_out.append(f"<p>{ln_esc}</p>")
             # Net Chain Cash PnL footer
-            chain_cash    = cached.get("chain_cash")
-            collected     = cached.get("chain_collected")
-            paid          = cached.get("chain_paid")
-            n_pos         = cached.get("chain_positions")
-            pos_avg_price = cached.get("pos_avg_price")
-            pos_qty       = cached.get("pos_qty")
+            chain_cash      = cached.get("chain_cash")
+            sim_chain_cash  = cached.get("sim_chain_cash")
+            has_test_trade  = cached.get("has_test_trade", False)
+            collected       = cached.get("chain_collected")
+            paid            = cached.get("chain_paid")
+            n_pos           = cached.get("chain_positions")
+            pos_avg_price   = cached.get("pos_avg_price")
+            pos_qty         = cached.get("pos_qty")
 
             if chain_cash is not None and collected is not None and paid is not None:
                 pos_lbl = f"{n_pos} position{'s' if n_pos != 1 else ''}" if n_pos else "positions"
@@ -3680,7 +4588,15 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
 
                 base = f"${collected:,.2f} collected − ${paid:,.2f} paid"
 
-                if rec == "ROLL" and has_pos:
+                if has_test_trade and sim_chain_cash is not None:
+                    # Test trade present: sim_chain_cash is the locked-in chain PnL
+                    working = (
+                        f"{base} (+ test close) = {_fmt_pnl(round(sim_chain_cash, 2))}"
+                        f"&nbsp;<span style='color:var(--muted);font-size:11px'>[simulated close]</span>"
+                    )
+                    exp_note = ""
+
+                elif rec == "ROLL" and has_pos:
                     # ROLL: close open leg at 40% (keep 60% profit), then roll
                     buy_back_cost = round(pos_avg_price * 0.40 * 100 * pos_qty, 2)
                     final_pnl     = round(chain_cash - buy_back_cost, 2)
@@ -3734,6 +4650,22 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html_mod.escape(title_str)} — Recommendation</title>
+<script>
+(function(){{
+  var c=document.createElement('canvas');
+  c.width=c.height=64;
+  var x=c.getContext('2d');
+  x.fillStyle='white';
+  x.beginPath();x.arc(32,32,30,0,Math.PI*2);x.fill();
+  x.fillStyle='#052e16';
+  x.textAlign='center';x.textBaseline='middle';
+  x.font='bold {_fs}px monospace';
+  x.fillText('{ticker_sym}',32,32);
+  var l=document.querySelector("link[rel~='icon']")||document.createElement('link');
+  l.rel='icon';l.href=c.toDataURL();
+  document.head.appendChild(l);
+}})();
+</script>
 <style>
   :root {{
     --bg:#0f1117;--surface:#1a1d27;--border:#2a2d3a;
@@ -4148,8 +5080,8 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
             _last_upload_time[uploading_ticker] = datetime.datetime.now()
         log.info("Upload complete: %s", os.path.basename(file_path))
     except Exception as exc:
-        print(f"ERROR: Upload failed — {exc}", file=sys.stderr)
-        sys.exit(1)
+        log.error("Upload failed — %s", exc)
+        raise
 
 
 STRAT_LABELS = {
@@ -4325,6 +5257,13 @@ async def query_notebooklm(
 
     vix_note = f"the current VIX is {vix:.2f}" if vix is not None else ""
 
+    # ── Underlying price (live from yfinance) ─────────────────────────────────
+    ul_price = get_underlying_price(ticker)
+    ul_price_note = (
+        f"The current underlying price of {ticker} is ${ul_price:.2f}. "
+        if ul_price is not None else ""
+    )
+
     # ── Cost basis clause ──────────────────────────────────────────────────────
     _cb = float(ul_cost_basis) if ul_cost_basis else 0.0
     if strat == "CSP":
@@ -4345,10 +5284,19 @@ async def query_notebooklm(
                 f"realizing a loss on assignment, and factor this into your strike selection. "
             )
     else:
-        cost_basis_clause = (
-            f"Note: The cost basis of the underlying {ticker} is not available "
-            f"(ul_cost_basis is 0 or not set). Please flag this gap in your analysis. "
+        # Don't flag missing cost basis when rolling put positions — stock isn't owned
+        _rolling_puts = (
+            strat == "ROLL"
+            and positions
+            and all(str(p.get("option_type", "")).upper() == "PUT" for p in positions)
         )
+        if _rolling_puts:
+            cost_basis_clause = ""
+        else:
+            cost_basis_clause = (
+                f"Note: The cost basis of the underlying {ticker} is not available "
+                f"(ul_cost_basis is 0 or not set). Please flag this gap in your analysis. "
+            )
 
     if strat == "ROLL":
         # Summarise current open positions for context
@@ -4373,6 +5321,7 @@ async def query_notebooklm(
             f"Based on the updated {ticker} source, the latest economic release calendar, "
             f"and the latest PLAN and REVIEW sources{vix_clause} determine the best roll or "
             f"do nothing strategy. "
+            f"{ul_price_note}"
             f"{pos_context}"
             f"{dates_clause}"
             f"{cost_basis_clause}"
@@ -4384,9 +5333,15 @@ async def query_notebooklm(
             f"Given the {ticker} source, what is the best {strat_label} choice, "
             f"taking into consideration the economic calendar releases, "
             f"the latest PLAN and REVIEW sources{vix_clause} and the upcoming "
-            f"dividends and/or earnings releases? "
-            f"{dates_clause}"
-            f"{cost_basis_clause}"
+            f"dividends and/or earnings releases?\n\n"
+            f"{ul_price_note}"
+            f"{dates_clause}\n\n"
+            f"{cost_basis_clause}\n\n"
+            f"Explicitly audit every recommendation against the T-Bill hurdle rate for the "
+            f"current week. Calculate the annualized yield for the suggested strike and compare "
+            f"it to the risk-free rate. If no strike at or above my cost basis clearly beats "
+            f"the T-Bill baseline, recommend 'Doing Nothing' as the most professional move, "
+            f"as per the strategy manuals."
         )
 
     log.info(
