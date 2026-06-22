@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/joeandbabs/public-env/bin/python
 """
 option_dashboard.py
 
@@ -1719,7 +1719,7 @@ async def run_unborn_for_ticker(
 
         log.info("[unborn] display_rows count: %d, first: %s", len(display_rows), display_rows[0] if display_rows else None)
         rec = _detect_recommendation(text)
-        _do_nothing = bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", text, re.IGNORECASE))
+        _do_nothing = bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", text[:600], re.IGNORECASE))
         if _do_nothing:
             # Return a placeholder row — option details are blank, ideal_entry = DO NOTHING
             chosen = {
@@ -1898,10 +1898,6 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
       <option value="CC" selected>CC</option>
       <option value="CSP">CSP</option>
     </select>
-    <span id="ub-cb-group" style="display:none;align-items:center;gap:6px">
-      <label for="ub-cost-basis">Cost Basis</label>
-      <input type="number" id="ub-cost-basis" placeholder="0.00" min="0" step="0.01" style="width:80px">
-    </span>
     <button onclick="findUnborn()">Find</button>
     <span id="unborn-result"></span>
   </div>
@@ -2028,9 +2024,13 @@ function applyData(d) {
   const serverRecs = d.cached_recommendations || {};
   let changed = false;
   for (const [key, val] of Object.entries(serverRecs)) {
-    if (!_recommendations[key] && val.recommendation) {
-      _recommendations[key] = {rec: val.recommendation};
-      changed = true;
+    if (val.recommendation) {
+      const existing = _recommendations[key];
+      const incoming = {rec: val.recommendation, chainCash: val.chain_cash ?? null, runAt: val.run_at ?? null};
+      if (!existing || existing.rec !== incoming.rec || existing.runAt !== incoming.runAt) {
+        _recommendations[key] = Object.assign(existing || {}, incoming);
+        changed = true;
+      }
     }
   }
   if (changed) _saveRecs(_recommendations);
@@ -2050,6 +2050,19 @@ function applyData(d) {
   document.getElementById('h-time').textContent = (d.fetched_at || '').replace('T', ' ');
   renderTable();
   renderSkipped(d.skipped || []);
+
+  // Pick up any externally-triggered in-flight analyses (e.g. scheduled_refresh.py)
+  _inflight       = new Set(d.inflight || []);
+  _unbornInflight = new Set(d.unborn_inflight || []);
+  for (const key of _inflight) {
+    if (_recommendations[key]) continue;  // badge already showing
+    const cell = _actionCell(key);
+    if (!cell) continue;
+    const btn = cell.querySelector('button');
+    if (!btn || btn.disabled) continue;   // already spinning
+    analyzePosition(key, btn);
+  }
+  if (_unbornInflight.size) _renderUnbornTableInner();
 }
 
 function fmt(v, digits, prefix='') {
@@ -2123,7 +2136,7 @@ function renderTable() {
     const flagChanged = posKey in _prevFlags && _prevFlags[posKey] !== fingerprint;
     const cached = _recommendations[posKey];
     const actionCell = cached
-      ? recBadge(cached.rec, posKey, cached.chainCash)
+      ? recBadge(cached.rec, posKey, cached.chainCash, cached.text, cached.runAt)
       : `<button onclick="analyzePosition('${posKey.replace(/'/g,"\\'")}', this)" style="font-size:11px;padding:4px 10px">Analyze</button>`;
     const actionTdAttr = ` data-poskey="${posKey.replace(/"/g,'&quot;')}"`;
 
@@ -2260,6 +2273,20 @@ function renderTable() {
     _prevFlags[posKey] = fingerprint;
   }
   applyCollapseOk();
+
+  // Auto-analyze flagged positions that don't have a cached recommendation yet
+  for (const p of rows) {
+    if (!p.flagged) continue;
+    const posKey = [p.symbol, p.option_type, String(p.strike||''), p.expiry||''].join('|');
+    if (_recommendations[posKey]) continue;
+    if (_autoQueued.has(posKey)) continue;
+    const cell = _actionCell(posKey);
+    if (!cell) continue;
+    const btn = cell.querySelector('button');
+    if (!btn || btn.disabled) continue;
+    _autoQueued.add(posKey);
+    analyzePosition(posKey, btn);
+  }
 }
 
 function esc(s) {
@@ -2291,6 +2318,10 @@ function _saveRecs(recs) {
   try { localStorage.setItem(_LS_KEY, JSON.stringify(recs)); } catch {}
 }
 const _recommendations = _loadRecs(); // posKey -> {rec}
+let _inflight       = new Set(); // pos_keys currently being analyzed server-side
+let _unbornInflight = new Set(); // "TICKER|STRAT" row keys with unborn analysis running
+let _autoQueued     = new Set(); // pos_keys auto-triggered for analysis this session
+let _unbornAutoRecalcDone = false;
 
 // ── Flag-change detection ────────────────────────────────────────────────────
 // Stores the flag fingerprint from the previous render so we can highlight
@@ -2591,17 +2622,38 @@ async function _loadUnbornFromServer() {
       }
     }
     _renderUnbornTable();
+    if (!_unbornAutoRecalcDone) {
+      _unbornAutoRecalcDone = true;
+      setTimeout(() => {
+        document.querySelectorAll('#unborn-chain button[data-key]').forEach(btn => {
+          if (btn.textContent.trim() === 'Recalc' && !btn.disabled) {
+            const row = _unbornRows[btn.dataset.key];
+            if (!row || !row._run_at) btn.click();
+          }
+        });
+      }, 0);
+    }
   } catch(e) { /* silently ignore */ }
 }
 
 async function _saveUnbornToServer() {
   try {
-    await fetch('/api/unborn-rows', {
+    const r = await fetch('/api/unborn-rows', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(_unbornRows)
     });
-  } catch(e) { /* silently ignore */ }
+    if (!r.ok) {
+      const txt = await r.text().catch(() => r.status);
+      console.error('[unborn-save] Server error:', txt);
+      const bar = document.getElementById('error-bar');
+      if (bar) { bar.textContent = 'Failed to save unborn rows: ' + txt; bar.style.display = 'block'; }
+    }
+  } catch(e) {
+    console.error('[unborn-save] Network error:', e.message);
+    const bar = document.getElementById('error-bar');
+    if (bar) { bar.textContent = 'Failed to save unborn rows: ' + e.message; bar.style.display = 'block'; }
+  }
 }
 
 function _renderUnbornTable() {
@@ -2683,7 +2735,7 @@ function _renderUnbornTableInner() {
       <td style="white-space:nowrap">
         ${_blank ? '' : '<button data-key="' + esc(k) + '" onclick="placeTrade(this.dataset.key,this)" style="font-size:11px;padding:3px 8px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">Trade</button>'}
         <button data-key="${esc(k)}" onclick="deleteUnbornRow(this.dataset.key)" style="font-size:11px;padding:3px 6px;background:var(--danger-bg);color:var(--danger);border:1px solid var(--danger);border-radius:4px;cursor:pointer;${_blank?'':'margin-left:4px'}">&times;</button>
-        ${c._no_opt ? '' : '<button data-key="' + esc(k) + '" onclick="recalcUnbornRow(this.dataset.key,this)" title="Re-run analysis" style="font-size:11px;padding:3px 8px;background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;cursor:pointer;margin-left:4px">Recalc</button>'}
+        ${c._no_opt ? '' : (() => { const recalcRunning = _unbornInflight.has(k); return '<button data-key="' + esc(k) + '" ' + (recalcRunning ? 'disabled ' : '') + 'onclick="recalcUnbornRow(this.dataset.key,this)" title="Re-run analysis" style="font-size:11px;padding:3px 8px;background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;cursor:pointer;margin-left:4px;display:inline-flex;align-items:center;gap:4px">' + (recalcRunning ? '<span style="width:10px;height:10px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Recalculating…' : 'Recalc') + '</button>'; })()}
         ${c._run_at ? '<span style="font-size:10px;color:var(--muted);margin-left:6px;white-space:nowrap">' + esc(c._run_at) + '</span>' : ''}
       </td>
     </tr>`;
@@ -2790,7 +2842,7 @@ async function recalcUnbornRow(key, btn) {
   }
 }
 
-function recBadge(rec, key, chainCash, text) {
+function recBadge(rec, key, chainCash, text, runAt) {
   const cls = rec === 'ROLL' ? 'warn' : rec === 'ASSIGNMENT' ? 'danger'
     : rec === 'HOLD' ? 'hold' : rec === 'LET EXPIRE' ? 'muted' : 'ok';
   const label = rec;
@@ -2800,13 +2852,16 @@ function recBadge(rec, key, chainCash, text) {
       + `Net chain: ${chainCash >= 0 ? '+' : ''}$${chainCash.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}</div>`
     : '';
   const safeKey = key.replace(/'/g,"\\'");
-  return `<div style="display:inline-flex;align-items:center;gap:4px">
-    <div style="display:inline-block;text-align:center">
+  const dateSpan = runAt ? `<span style="font-size:10px;color:var(--muted);white-space:nowrap">${esc(runAt)}</span>` : '';
+  return `<div>
+    <div style="display:inline-flex;align-items:center;gap:4px">
       <a href="/analyze/${encodeURIComponent(key)}" target="_blank"
-        class="badge badge-${cls}" style="text-decoration:none;cursor:pointer"${tipAttr}>${label}</a>${cashLine}
+        class="badge badge-${cls}" style="text-decoration:none;cursor:pointer"${tipAttr}>${label}</a>
+      <button onclick="resetAnalysis('${safeKey}', this)" title="Reset to Analyze"
+        style="font-size:10px;padding:0 4px;line-height:14px;background:none;border:1px solid var(--muted);border-radius:3px;color:var(--muted);cursor:pointer">x</button>
+      ${dateSpan}
     </div>
-    <button onclick="resetAnalysis('${safeKey}', this)" title="Reset to Analyze"
-      style="font-size:10px;padding:0 4px;line-height:14px;background:none;border:1px solid var(--muted);border-radius:3px;color:var(--muted);cursor:pointer">x</button>
+    ${cashLine}
   </div>`;
 }
 
@@ -2862,10 +2917,11 @@ async function analyzePosition(key, btn) {
     console.log('[analyze] result:', d);
     if (d.error) throw new Error(d.error);
     const displayRec = (d.auto && d.recommendation === 'HOLD') ? 'LET EXPIRE' : d.recommendation;
-    _recommendations[key] = {rec: displayRec, chainCash: d.chain_cash ?? null, text: d.text ?? null};
+    const runAt = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
+    _recommendations[key] = {rec: displayRec, chainCash: d.chain_cash ?? null, text: d.text ?? null, runAt};
     _saveRecs(_recommendations);
     const cell = _actionCell(key);
-    if (cell) cell.innerHTML = recBadge(displayRec, key, d.chain_cash ?? null, d.text ?? null);
+    if (cell) cell.innerHTML = recBadge(displayRec, key, d.chain_cash ?? null, d.text ?? null, runAt);
   } catch(e) {
     console.error('[analyze] error for', key, ':', e.message);
     const cell = _actionCell(key);
@@ -2884,29 +2940,20 @@ async function analyzePosition(key, btn) {
 }
 
 async function autoFillCcQty() {
-  const ticker  = document.getElementById('ub-ticker').value.trim().toUpperCase();
-  const strat   = document.getElementById('ub-strat').value;
-  const cbGroup = document.getElementById('ub-cb-group');
-  if (strat !== 'CC' || !ticker) { cbGroup.style.display = 'none'; return; }
+  const ticker = document.getElementById('ub-ticker').value.trim().toUpperCase();
+  const strat  = document.getElementById('ub-strat').value;
+  if (strat !== 'CC' || !ticker) return;
   try {
     const r = await fetch('/api/cc-qty/' + encodeURIComponent(ticker));
     const d = await r.json();
     if (d.qty != null && d.qty > 0) document.getElementById('ub-qty').value = d.qty;
   } catch(e) { /* silently ignore */ }
-  try {
-    const r2 = await fetch('/api/cost-basis/' + encodeURIComponent(ticker));
-    const d2  = await r2.json();
-    const hasBasis = d2.ul_cost_basis > 0;
-    cbGroup.style.display = hasBasis ? 'none' : 'inline-flex';
-    if (hasBasis) document.getElementById('ub-cost-basis').value = '';
-  } catch(e) { cbGroup.style.display = 'inline-flex'; }
 }
 
 async function findUnborn() {
   const ticker    = document.getElementById('ub-ticker').value.trim().toUpperCase();
   const qty       = parseInt(document.getElementById('ub-qty').value) || 1;
   const strat     = document.getElementById('ub-strat').value;
-  const costBasis = parseFloat(document.getElementById('ub-cost-basis').value) || 0;
   const resultEl = document.getElementById('unborn-result');
   if (!ticker) { resultEl.innerHTML = '<span style="color:var(--danger);font-size:12px">Enter a ticker.</span>'; return; }
 
@@ -2917,7 +2964,7 @@ async function findUnborn() {
       const r = await fetch('/api/unborn', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ticker, qty, strat, cost_basis: costBasis})
+        body: JSON.stringify({ticker, qty, strat})
       });
       let raw;
       try { raw = await r.text(); d = JSON.parse(raw); }
@@ -2937,23 +2984,23 @@ async function findUnborn() {
       class="badge badge-${cls}" style="text-decoration:none;cursor:pointer;font-size:12px;padding:4px 10px">
       Details</a>`;
 
-    // Accumulate proposed trades — add/update this ticker|strat entry, keep others
+    // Accumulate proposed trades — always save the result, including DO NOTHING rows
     const chain = d.chain || [];
-    if (chain.length) {
-      const _runAt2 = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
-      const row = Object.assign({}, chain[0], {_qty: qty, _ubKey: ubKey, _ul_cost_basis: d.ul_cost_basis ?? null, _run_at: _runAt2});
-      _unbornRows[ticker + '|' + strat] = row;
-      await _saveUnbornToServer();
-      _renderUnbornTable();
-      document.getElementById('unborn-chain').scrollIntoView({behavior:'smooth', block:'nearest'});
-      // Clear inputs after successful display
-      document.getElementById('ub-ticker').value = '';
-      document.getElementById('ub-qty').value = '1';
-      document.getElementById('ub-strat').value = 'CC';
-      document.getElementById('ub-cost-basis').value = '';
-      document.getElementById('ub-cb-group').style.display = 'none';
-      resultEl.innerHTML = '';
-    }
+    const _runAt2 = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
+    const rowBase = chain.length ? chain[0] : {
+      symbol: ticker, option_type: strat,
+      _do_nothing: !!d._do_nothing, ideal_entry: d._do_nothing ? 'DO NOTHING' : null,
+    };
+    const row = Object.assign({}, rowBase, {_qty: qty, _ubKey: ubKey, _ul_cost_basis: d.ul_cost_basis ?? null, _run_at: _runAt2});
+    _unbornRows[ticker + '|' + strat] = row;
+    await _saveUnbornToServer();
+    _renderUnbornTable();
+    document.getElementById('unborn-chain').scrollIntoView({behavior:'smooth', block:'nearest'});
+    // Clear inputs after successful display
+    document.getElementById('ub-ticker').value = '';
+    document.getElementById('ub-qty').value = '1';
+    document.getElementById('ub-strat').value = 'CC';
+    resultEl.innerHTML = '';
   } catch(e) {
     resultEl.innerHTML = `<span class="err-tip" style="color:var(--danger);font-size:12px">&#9888; Error<span class="err-msg">${esc(e.message)}</span></span>`;
   }
@@ -3953,10 +4000,19 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         # recommendation badges after a manual refresh
         with _cache_lock:
             data["cached_recommendations"] = {
-                k: {"recommendation": v.get("recommendation"), "error": v.get("error")}
+                k: {
+                    "recommendation": v.get("recommendation"),
+                    "chain_cash": v.get("chain_cash"),
+                    "run_at": v.get("_run_at"),
+                    "error": v.get("error"),
+                }
                 for k, v in _analysis_cache.items()
                 if not v.get("error")
             }
+            data["inflight"] = list(_analysis_inflight)
+            data["unborn_inflight"] = list({
+                "|".join(k.split("|")[:2]) for k in _unborn_inflight
+            })
         return Response(json.dumps(_sanitize(data), default=_serial), mimetype="application/json")
 
     @app.route("/api/analyze", methods=["POST"])
@@ -4050,6 +4106,8 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
         with _cache_lock:
             if not result.get("error"):
+                import time as _time
+                result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
                 _analysis_cache[pos_key] = result
                 _save_cache(_analysis_cache)
         return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
@@ -4142,13 +4200,19 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         def _run_analysis():
             try:
                 result = asyncio.run(
-                    run_unborn_for_ticker(fresh_token, fresh_account_id, ticker, qty, strat,
-                                          notebook_id, ul_cost_basis=ul_cost_basis)
+                    asyncio.wait_for(
+                        run_unborn_for_ticker(fresh_token, fresh_account_id, ticker, qty, strat,
+                                              notebook_id, ul_cost_basis=ul_cost_basis),
+                        timeout=300,
+                    )
                 )
                 if result.get("error"):
                     log.error("[unborn] Error for %s: %s", ticker, result["error"])
                 else:
                     log.info("[unborn] %s → %s", ticker, result.get("recommendation"))
+            except asyncio.TimeoutError:
+                log.error("[unborn] Analysis timed out after 300s for %s", ticker)
+                result = {"error": "Analysis timed out", "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat}
             except Exception as exc:
                 log.exception("[unborn] Unhandled exception for %s", ticker)
                 result = {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat}
