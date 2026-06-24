@@ -1555,22 +1555,46 @@ async def run_roll_for_position(
             else:
                 log.warning("No position matched pos_key=%r in open_positions", pos_key)
 
+        chain = get_chain_net_cash(spread_id, fallback_ticker=ticker)
+        current_leg_price = float(matched_pos["current_price"]) if matched_pos and matched_pos.get("current_price") is not None else None
+
         text = await query_notebooklm(
             notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
             silent=True,
             ul_cost_basis=ul_cost_basis,
+            chain_data=chain,
+            current_leg_price=current_leg_price,
         )
         if not text:
             return {"error": "Empty response from NotebookLM", "recommendation": "HOLD", "text": "", "ticker": ticker}
-
-        chain = get_chain_net_cash(spread_id, fallback_ticker=ticker)
 
         # Expected PnL: close current position at 40% of sale price (keep 60%)
         pos_avg_price = float(matched_pos["avg_price"]) if matched_pos and matched_pos.get("avg_price") is not None else None
         pos_qty       = abs(int(matched_pos["net_qty"])) if matched_pos and matched_pos.get("net_qty") is not None else None
 
+        rec = _detect_recommendation(text)
+
+        # Hard PnL guard: if the projected chain PnL is negative, NotebookLM
+        # recommended a roll that doesn't recover the chain losses — force HOLD.
+        if rec == "ROLL":
+            pnl_match = re.search(
+                r"Projected Net Chain PnL[^:\n]*:\s*\*{0,2}\s*([+-]?\$?[\d,]+\.?\d*)",
+                text, re.IGNORECASE
+            )
+            if pnl_match:
+                try:
+                    projected = float(pnl_match.group(1).replace("$", "").replace(",", ""))
+                    if projected < 0:
+                        rec = "HOLD"
+                        log.warning(
+                            "Overriding ROLL→HOLD for %s: projected chain PnL %.2f < 0",
+                            ticker, projected
+                        )
+                except ValueError:
+                    pass
+
         return {
-            "recommendation": _detect_recommendation(text),
+            "recommendation": rec,
             "text": text,
             "ticker": ticker,
             "chain_cash":      chain["net_cash"],       # for dashboard badge
@@ -1796,6 +1820,8 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   .ok    { color: var(--ok); }
   .warn  { color: var(--warn); }
   .danger { color: var(--danger); }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+  .blink { animation: blink 1s step-start infinite; }
   .muted { color: var(--muted); }
   .actions { margin-left: auto; display: flex; align-items: center; gap: 12px; }
   button { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 12px; font-family: inherit; }
@@ -1861,6 +1887,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="stat"><span class="stat-label">Flagged</span><span class="stat-value" id="h-flagged">—</span></div>
   <div class="stat"><span class="stat-label">VIX</span><span class="stat-value" id="h-vix">—</span></div>
   <div class="stat"><span class="stat-label">As of</span><span class="stat-value muted" id="h-time" style="font-size:12px">—</span></div>
+  <div id="multiplier-files" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><!--MULTIPLIER_FILES--></div>
   <div class="actions">
     <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted)">
       <input type="checkbox" id="collapse-ok" onchange="applyCollapseOk()" style="cursor:pointer;accent-color:var(--accent)">
@@ -1999,6 +2026,14 @@ async function fetchData() {
     const d = await r.json();
     document.getElementById('error-bar').style.display = 'none';
     applyData(d);
+    fetch('/api/multiplier-status-html', {cache: 'no-store'}).then(r => {
+      if (!r.ok) return;
+      return r.text();
+    }).then(html => {
+      if (!html) return;
+      const el = document.getElementById('multiplier-files');
+      if (el) el.innerHTML = html;
+    }).catch(() => {});
     const ts = new Date().toLocaleTimeString('en-US', {hour12: false});
     document.getElementById('last-run').textContent = 'Last Run: ' + ts;
     localStorage.setItem(_LS_AR_LAST, String(Date.now()));
@@ -3218,6 +3253,7 @@ _loadUnbornFromServer();
 fetchData();
 _initAutoRefresh();
 _initPriceRefresh();
+
 </script>
 </body>
 </html>"""
@@ -3904,6 +3940,14 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
+    @app.errorhandler(Exception)
+    def _handle_exception(exc):
+        from werkzeug.exceptions import HTTPException
+        if isinstance(exc, HTTPException):
+            return exc
+        log.exception("[flask] unhandled exception in request: %s", exc)
+        return Response("", status=500, mimetype="text/html")
+
     # Persistent cache: posKey -> {recommendation, text, ticker, error, qa_thread}
     _CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".analysis_cache.json")
     _analysis_inflight: set[str] = set()
@@ -3960,7 +4004,181 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
     @app.route("/")
     def index():
-        return Response(_WEB_DASHBOARD_HTML, mimetype="text/html")
+        html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Options</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:40px}
+  h1{font-size:18px;font-weight:500;color:#8892a4;letter-spacing:.04em;text-transform:uppercase}
+  .cards{display:flex;gap:24px}
+  a.card{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+         width:200px;height:140px;background:#161b22;border:1px solid #30363d;border-radius:12px;
+         text-decoration:none;color:#e6edf3;font-size:15px;font-weight:500;transition:border-color .15s,background .15s}
+  a.card:hover{border-color:#58a6ff;background:#1c2230}
+  a.card svg{opacity:.6}
+</style>
+</head>
+<body>
+<h1>Options</h1>
+<div class="cards">
+  <a class="card" href="/dashboard">
+    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+      <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+    </svg>
+    Dashboard
+  </a>
+  <a class="card" href="/journal">
+    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+    </svg>
+    Trade Journal
+  </a>
+</div>
+</body>
+</html>"""
+        return Response(html, mimetype="text/html")
+
+    @app.route("/journal", defaults={"path": ""})
+    @app.route("/journal/<path:path>")
+    def journal_proxy(path):
+        import requests as _req
+        url = f"http://localhost:5001/{path}" if path else "http://localhost:5001/journal"
+        qs = flask_request.query_string.decode()
+        if qs:
+            url += f"?{qs}"
+        try:
+            resp = _req.request(
+                method=flask_request.method,
+                url=url,
+                headers={k: v for k, v in flask_request.headers if k.lower() not in ("host", "content-length", "transfer-encoding")},
+                data=flask_request.get_data(),
+                allow_redirects=False,
+                timeout=30,
+            )
+            excluded = {"content-encoding", "transfer-encoding", "connection"}
+            headers = {k: v for k, v in resp.headers.items() if k.lower() not in excluded}
+            return Response(resp.content, status=resp.status_code, headers=headers)
+        except _req.exceptions.ConnectionError:
+            return Response("Journal offline", status=503, mimetype="text/plain")
+
+    @app.route("/dashboard")
+    def dashboard():
+        try:
+            mf_html = _build_multiplier_files_html()
+        except BaseException:
+            log.exception("[multiplier] build failed — skipping header status")
+            mf_html = ""
+        return Response(
+            _WEB_DASHBOARD_HTML.replace("<!--MULTIPLIER_FILES-->", mf_html),
+            mimetype="text/html",
+        )
+
+    @app.route("/api/multiplier-status-html")
+    def api_multiplier_status_html():
+        try:
+            resp = Response(_build_multiplier_files_html(), mimetype="text/html")
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        except BaseException:
+            log.exception("[multiplier] build failed on status-html endpoint")
+            return Response("", mimetype="text/html", status=500)
+
+    def _fetch_notebook_titles() -> set[str]:
+        """Query NotebookLM source titles via subprocess to keep the Playwright/asyncio
+        stack fully isolated from Flask's WSGI threads."""
+        import subprocess, json as _json
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID", "")
+        if not notebook_id:
+            return set()
+        script = (
+            "import asyncio, json, sys\n"
+            "async def _main():\n"
+            "    from notebooklm import NotebookLMClient\n"
+            f"    async with NotebookLMClient.from_storage() as c:\n"
+            f"        titles = [s.title for s in await c.sources.list({_json.dumps(notebook_id)}) if s.title]\n"
+            "    print(json.dumps(titles))\n"
+            "asyncio.run(_main())\n"
+        )
+        try:
+            r = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True, text=True, timeout=30,
+                env=os.environ.copy(),
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return set(_json.loads(r.stdout.strip()))
+            if r.stderr:
+                log.warning("[multiplier] notebook subprocess stderr: %s", r.stderr[-500:])
+        except BaseException as exc:
+            log.warning("[multiplier] notebook subprocess failed: %s: %s", type(exc).__name__, exc)
+        return set()
+
+    def _build_multiplier_files_html() -> str:
+        MDIR = Path("/Users/joeandbabs/Documents/retirement/options")
+        today = datetime.date.today()
+        weekday = today.weekday()  # 0=Mon … 6=Sun
+
+        fwd  = (4 - weekday) % 7 or 7
+        back = (weekday - 4) % 7 or 7
+        next_fri_str = (today + datetime.timedelta(days=fwd)).strftime("%Y_%m_%d")
+        last_fri_str = (today - datetime.timedelta(days=back)).strftime("%Y_%m_%d")
+
+        def _latest_name(pattern):
+            hits = []
+            for f in MDIR.glob(pattern):
+                m = re.search(r"Week_(\d+)", f.name)
+                if m:
+                    hits.append((int(m.group(1)), f.name))
+            return max(hits)[1] if hits else None
+
+        def _disk_name(prefix, date_str, ext):
+            hits = list(MDIR.glob(f"{prefix}_{date_str}_Week_*.{ext}"))
+            return hits[0].name if hits else None
+
+        # Always query the notebook on every explicit refresh (browser or button).
+        nb = _fetch_notebook_titles()
+
+        # Find current-week titles in notebook by expected date prefix
+        def _nb_name(prefix, date_str, ext):
+            pfx = f"{prefix}_{date_str}_Week_"
+            return next((t for t in nb if t.startswith(pfx) and t.endswith(f".{ext}")), None)
+
+        nb_plan_pdf   = _nb_name("PLAN",   next_fri_str, "pdf")
+        nb_plan_csv   = _nb_name("PLAN",   next_fri_str, "csv")
+        nb_review_pdf = _nb_name("REVIEW", last_fri_str, "pdf")
+
+        def _label(nb_match, prefix, date_str, ext):
+            if nb_match:
+                return nb_match, False
+            # Not in notebook — show disk name for current week, or a placeholder
+            disk = _disk_name(prefix, date_str, ext)
+            return (disk or f"{prefix}_{date_str}_Week_??.{ext}"), True
+
+        items = [
+            _label(nb_plan_pdf,   "PLAN",   next_fri_str, "pdf"),
+            _label(nb_plan_csv,   "PLAN",   next_fri_str, "csv"),
+            _label(nb_review_pdf, "REVIEW", last_fri_str, "pdf"),
+        ]
+
+        parts = []
+        for label, stale in items:
+            if not label:
+                continue
+            color = "#ef4444" if stale else "#22c55e"
+            title = "Stale — not in notebook" if stale else "In notebook"
+            cls = ' class="blink"' if stale else ""
+            parts.append(
+                f'<span{cls} style="font-size:13px;color:{color};white-space:nowrap" title="{title}">'
+                f"{label}</span>"
+            )
+        sep = '<span style="color:#8892a4"> | </span>'
+        return sep.join(parts)
 
     @app.route("/api/prices")
     def api_prices():
@@ -4613,8 +4831,37 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
             text = cached.get("text", "")
             rec_cls = {"ROLL": "warn", "ASSIGNMENT": "danger", "HOLD": "hold"}.get(rec, "ok")
             # Convert markdown-ish text to simple HTML
+            def _md_cell(c: str) -> str:
+                return re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html_mod.escape(c))
+
             lines_out = []
-            for ln in text.splitlines():
+            text_lines = text.splitlines()
+            i = 0
+            while i < len(text_lines):
+                ln = text_lines[i]
+                # Detect markdown table block (line starts with |)
+                if ln.strip().startswith('|') and ln.strip().count('|') >= 2:
+                    tbl_lines = []
+                    while i < len(text_lines) and text_lines[i].strip().startswith('|'):
+                        tbl_lines.append(text_lines[i])
+                        i += 1
+                    header, body_rows = None, []
+                    for tl in tbl_lines:
+                        cells = [c.strip() for c in tl.strip().strip('|').split('|')]
+                        if all(re.match(r'^:?-+:?$', c) for c in cells if c):
+                            continue  # separator row
+                        if header is None:
+                            header = cells
+                        else:
+                            body_rows.append(cells)
+                    if header:
+                        ths = ''.join(f'<th>{_md_cell(c)}</th>' for c in header)
+                        trs = ''.join(
+                            '<tr>' + ''.join(f'<td>{_md_cell(c)}</td>' for c in row) + '</tr>'
+                            for row in body_rows
+                        )
+                        lines_out.append(f'<table class="atbl"><thead><tr>{ths}</tr></thead><tbody>{trs}</tbody></table>')
+                    continue
                 ln_esc = html_mod.escape(ln)
                 if ln_esc.startswith("## "):
                     lines_out.append(f"<h2>{ln_esc[3:]}</h2>")
@@ -4627,9 +4874,9 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                 elif ln_esc.strip() == "":
                     lines_out.append("<br>")
                 else:
-                    # Bold inline **text**
                     ln_esc = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', ln_esc)
                     lines_out.append(f"<p>{ln_esc}</p>")
+                i += 1
             # Net Chain Cash PnL footer
             chain_cash      = cached.get("chain_cash")
             sim_chain_cash  = cached.get("sim_chain_cash")
@@ -4754,6 +5001,10 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
   .rec-body li{{margin:2px 0 2px 20px;max-width:860px}}
   .rec-body strong{{color:var(--text)}}
   .rec-body br{{display:block;margin:6px 0;content:""}}
+  .rec-body table.atbl{{border-collapse:collapse;margin:12px 0;font-size:12px;width:100%;max-width:860px}}
+  .rec-body table.atbl th,.rec-body table.atbl td{{padding:5px 12px;border:1px solid var(--border);text-align:left;white-space:nowrap}}
+  .rec-body table.atbl th{{background:var(--surface);color:var(--accent);font-weight:600}}
+  .rec-body table.atbl tr:nth-child(even) td{{background:rgba(255,255,255,.03)}}
   .chain-pnl{{margin-top:28px;padding:14px 18px;background:var(--surface);border:1px solid var(--border);border-radius:8px;max-width:860px}}
   .chain-label{{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px}}
   .chain-working{{font-size:13px;color:var(--text)}}
@@ -4854,26 +5105,8 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
     import signal
 
     def _sigterm_handler(signum, frame):
-        log.warning("SIGTERM received — restarting server...")
-        print("\nSIGTERM received — bouncing server...", flush=True)
-        # Spawn a lightweight detached process (close_fds=True so it does NOT
-        # inherit the Flask socket) that waits for us to release the port, then
-        # starts a fresh server. Parent exits immediately via os._exit().
-        # Set _PORTFOLIO_BOUNCE=1 so the child knows not to open a new browser tab.
-        import subprocess
-        env_override = os.environ.copy()
-        env_override["_PORTFOLIO_BOUNCE"] = "1"
-        cmd = (
-            f"import time, os, sys; "
-            f"time.sleep(1.5); "
-            f"os.execv({sys.executable!r}, {[sys.executable] + sys.argv!r})"
-        )
-        subprocess.Popen(
-            [sys.executable, "-c", cmd],
-            close_fds=True,
-            start_new_session=True,
-            env=env_override,
-        )
+        # launchd owns the restart — just exit cleanly and let it respawn.
+        log.warning("SIGTERM received — exiting for launchd restart")
         os._exit(0)
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -5293,6 +5526,8 @@ async def query_notebooklm(
     vix: float | None = None,
     silent: bool = False,
     ul_cost_basis: float | None = None,
+    chain_data: dict | None = None,
+    current_leg_price: float | None = None,
 ) -> str | None:
     """Ask NotebookLM for the best CC or CSP choice given the ticker source."""
     try:
@@ -5373,13 +5608,71 @@ async def query_notebooklm(
             pos_context = "No open positions were found in the journal for this ticker. "
             total_contracts = 1  # fallback so the formula still appears
 
-        pnl_instruction = (
-            f"In the Execution Instructions section, add as the final bullet point "
-            f"the potential PnL if the recommended rolled-to option is bought back at "
-            f"40% of its sale price. Use this formula and show the working: "
-            f"PnL = Sale Price × 0.60 × 100 × {total_contracts} contract(s). "
-            f"Label it 'Expected PnL (buy-back at 40% of premium)'."
-        )
+        if chain_data and chain_data.get("num_positions", 0) > 0:
+            net   = chain_data["net_cash"]
+            coll  = chain_data["collected"]
+            paid_ = chain_data["paid"]
+            n_pos = chain_data["num_positions"]
+            net_sign = "+" if net >= 0 else ""
+
+            # BTC cost to close the current leg at market before rolling
+            btc_cost = round((current_leg_price or 0.0) * 100 * total_contracts, 2)
+            # Adjusted net after closing the current leg
+            adj_net  = round(net - btc_cost, 2)
+            adj_sign = "+" if adj_net >= 0 else ""
+
+            if adj_net < 0:
+                # min STO premium so that adj_net + P×0.60×100×C > 0
+                min_sto = round(abs(adj_net) / (0.60 * 100 * total_contracts), 2)
+                leg_clause = (
+                    f"Step 1 — close current leg: "
+                    f"${net_sign}{net:,.2f} (chain to date) "
+                    f"− ${btc_cost:,.2f} BTC current leg at ${current_leg_price:.2f} "
+                    f"= ${adj_sign}${abs(adj_net):,.2f} adjusted net. "
+                ) if current_leg_price else (
+                    f"Step 1 — close current leg at market (BTC cost unknown — use live mid). "
+                )
+                viability = (
+                    f"{leg_clause}"
+                    f"Step 2 — the new STO premium must exceed ${min_sto:.2f}/share "
+                    f"(= ${abs(adj_net):,.2f} ÷ (0.60 × 100 × {total_contracts} contracts)) "
+                    f"for the chain to break even. "
+                    f"REJECT any roll candidate with STO premium ≤ ${min_sto:.2f}. "
+                    f"If no candidate clears this threshold, recommend 'Do Nothing'."
+                )
+                formula_base = f"{adj_sign}${abs(adj_net):,.2f}"
+            else:
+                min_sto = 0.0
+                viability = (
+                    f"After closing the current leg at ${current_leg_price:.2f} "
+                    f"(BTC cost ${btc_cost:,.2f}), the adjusted chain net is "
+                    f"{adj_sign}${abs(adj_net):,.2f}. "
+                    f"Any roll collecting additional premium will improve it."
+                    if current_leg_price else
+                    f"The chain net is {net_sign}${net:,.2f}. Any roll collecting "
+                    f"additional premium improves it."
+                )
+                formula_base = f"{adj_sign}${abs(adj_net):,.2f}"
+
+            pnl_instruction = (
+                f"CHAIN PNL ANALYSIS — complete this before finalising your recommendation. "
+                f"Net chain cash to date: {net_sign}${net:,.2f} "
+                f"(${coll:,.2f} collected − ${paid_:,.2f} paid across {n_pos} position(s)). "
+                f"{viability} "
+                f"For the roll you recommend, show the projected net chain PnL in the "
+                f"Execution Instructions using this formula: "
+                f"Projected Net Chain PnL = {formula_base} + "
+                f"(new STO premium × 0.60 × 100 × {total_contracts} contracts). "
+                f"Label it 'Projected Net Chain PnL (assuming 40% BTC on new roll leg)'."
+            )
+        else:
+            pnl_instruction = (
+                f"In the Execution Instructions section, add as the final bullet point "
+                f"the potential PnL if the recommended rolled-to option is bought back at "
+                f"40% of its sale price. Use this formula and show the working: "
+                f"PnL = Sale Price × 0.60 × 100 × {total_contracts} contract(s). "
+                f"Label it 'Expected PnL (buy-back at 40% of premium)'."
+            )
         vix_clause = f", the VIX ({vix_note})," if vix_note else ""
         question = (
             f"Based on the updated {ticker} source, the latest economic release calendar, "
