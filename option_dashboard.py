@@ -39,6 +39,7 @@ import re
 import sys
 import textwrap
 import threading
+from functools import wraps
 from pathlib import Path
 
 try:
@@ -64,6 +65,7 @@ log = logging.getLogger("options")
 
 # Tracks when each ticker's CSV was last uploaded to NotebookLM {ticker: datetime}
 _last_upload_time: dict[str, datetime.datetime] = {}
+_last_source_ids:  dict[str, str] = {}          # ticker → most recent uploaded source_id
 _UPLOAD_TTL_MINUTES = 45  # skip re-upload if source is fresher than this
 
 
@@ -1510,8 +1512,9 @@ async def run_roll_for_position(
             writer.writeheader()
             writer.writerows(all_rows)
 
+        source_id = None
         try:
-            await upload_to_notebooklm(output_file, notebook_id)
+            source_id = await upload_to_notebooklm(output_file, notebook_id)
         finally:
             try:
                 os.unlink(output_file)
@@ -1548,7 +1551,10 @@ async def run_roll_for_position(
                         and str(p.get("expiry","")) == pk_expiry):
                     spread_id     = p.get("spread_id")
                     matched_pos   = p
-                    ul_cost_basis = float(p.get("ul_cost_basis") or 0)
+                    try:
+                        ul_cost_basis = float(p.get("ul_cost_basis") or 0)
+                    except (TypeError, ValueError):
+                        ul_cost_basis = 0.0
                     log.debug("Matched pos_key=%r → spread_id=%r ul_cost_basis=%.2f",
                               pos_key, spread_id, ul_cost_basis)
                     break
@@ -1558,6 +1564,9 @@ async def run_roll_for_position(
         chain = get_chain_net_cash(spread_id, fallback_ticker=ticker)
         current_leg_price = float(matched_pos["current_price"]) if matched_pos and matched_pos.get("current_price") is not None else None
 
+        # Give the source time to finish processing before querying (wait=False upload)
+        if source_id:
+            await asyncio.sleep(15)
         text = await query_notebooklm(
             notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
             silent=True,
@@ -1565,6 +1574,7 @@ async def run_roll_for_position(
             chain_data=chain,
             current_leg_price=current_leg_price,
         )
+        await delete_notebooklm_source(notebook_id, source_id)
         if not text:
             return {"error": "Empty response from NotebookLM", "recommendation": "HOLD", "text": "", "ticker": ticker}
 
@@ -1717,8 +1727,9 @@ async def run_unborn_for_ticker(
             writer.writeheader()
             writer.writerows(all_rows)
 
+        source_id = None
         try:
-            await upload_to_notebooklm(output_file, notebook_id)
+            source_id = await upload_to_notebooklm(output_file, notebook_id)
         finally:
             try:
                 os.unlink(output_file)
@@ -1732,18 +1743,32 @@ async def run_unborn_for_ticker(
         synthetic_positions = [{"symbol": ticker, "option_type": strat, "net_qty": -qty,
                                  "avg_price": None, "strike": None, "expiry": None}]
 
+        # Give the source time to finish processing before querying (wait=False upload)
+        if source_id:
+            await asyncio.sleep(15)
         text = await query_notebooklm(
             notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
             silent=True,
             ul_cost_basis=ul_cost_basis,
         )
+        await delete_notebooklm_source(notebook_id, source_id)
         if not text:
             return {"error": "Empty response from NotebookLM", "recommendation": "HOLD",
                     "text": "", "ticker": ticker, "strat": strat, "chain": display_rows}
 
         log.info("[unborn] display_rows count: %d, first: %s", len(display_rows), display_rows[0] if display_rows else None)
         rec = _detect_recommendation(text)
-        _do_nothing = bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", text[:600], re.IGNORECASE))
+        # Detect DO NOTHING:
+        # 1. _detect_recommendation already returned HOLD (covers "Doing Nothing", bold variants, etc.)
+        # 2. Explicit "Recommendation: DO NOTHING" heading as a belt-and-suspenders check.
+        # 3. No chain options found AND text mentions "do nothing" anywhere (original guard).
+        _explicit_do_nothing = bool(re.search(
+            r'\brecommendation\b[:\s\*]+do\s+nothing\b',
+            text, re.IGNORECASE
+        ))
+        _do_nothing = (rec == "HOLD") or _explicit_do_nothing or (
+            (not display_rows) and bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", text, re.IGNORECASE))
+        )
         if _do_nothing:
             # Return a placeholder row — option details are blank, ideal_entry = DO NOTHING
             chosen = {
@@ -1830,15 +1855,18 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   main { padding: 20px 24px; }
   .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 10px; margin-top: 20px; }
   table { width: 100%; border-collapse: collapse; }
-  th { background: var(--surface); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; white-space: nowrap; position: sticky; top: 0; z-index: 10; }
+  th { background: var(--surface); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; white-space: nowrap; position: sticky; top: 0; z-index: 10; overflow: visible; }
+  .col-rh { position:absolute; right:0; top:0; bottom:0; width:5px; cursor:col-resize; z-index:11; background:var(--border); opacity:.5; }
+  .col-rh:hover, .col-rh.dragging { background:var(--accent); opacity:.9; }
   th:hover { color: var(--text); }
   th.sorted-asc::after  { content: " ▲"; }
   th.sorted-desc::after { content: " ▼"; }
-  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; white-space: nowrap; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; white-space: nowrap; transition: font-size 80ms ease, padding-top 80ms ease, padding-bottom 80ms ease; }
   tr.ok-row   td { background: transparent; }
   tr.warn-row td { background: #1f1a0a; }
   tr.danger-row td { background: #1f0a0a; }
-  tr:hover td { filter: brightness(1.15); }
+  tr:hover td { filter: brightness(1.15); font-size: 15px; padding-top: 12px; padding-bottom: 12px; }
+  #unborn-chain tbody tr:hover td, #former-chain tbody tr:hover td { padding-top: 9px; padding-bottom: 9px; }
   .badge { display: inline-block; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 600; letter-spacing: 0.05em; }
   .badge-ok     { background: var(--ok-bg);   color: var(--ok);   }
   .badge-hold   { background: #0c1a2e; color: var(--accent); border: 1px solid var(--accent); }
@@ -1872,6 +1900,10 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   #unborn-chain table { border-collapse:collapse; font-size:12px; width:100%; }
   #unborn-chain th { background:var(--surface); color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.05em; padding:5px 10px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
   #unborn-chain td { padding:5px 10px; border-bottom:1px solid var(--border); white-space:nowrap; color:var(--text); }
+  #former-chain { margin-top:18px; overflow-x:auto; }
+  #former-chain table { border-collapse:collapse; font-size:12px; width:100%; }
+  #former-chain th { background:var(--surface); color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.05em; padding:5px 10px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; cursor:pointer; user-select:none; }
+  #former-chain td { padding:5px 10px; border-bottom:1px solid var(--border); white-space:nowrap; color:var(--text); }
   #spinner { display: none; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-left: 10px; }
   #spinner.active { display: inline-flex; }
   #spinner .spin-ring { width: 13px; height: 13px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; flex-shrink: 0; }
@@ -1953,6 +1985,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
     <tbody id="pos-body"></tbody>
   </table>
   <div id="skipped-section"></div>
+  <div id="former-chain"></div>
 </main>
 
 <!-- ── Alert Modal ──────────────────────────────────────────────────────── -->
@@ -2026,6 +2059,7 @@ async function fetchData() {
     const d = await r.json();
     document.getElementById('error-bar').style.display = 'none';
     applyData(d);
+    _loadFormerPositions();
     fetch('/api/multiplier-status-html', {cache: 'no-store'}).then(r => {
       if (!r.ok) return;
       return r.text();
@@ -2142,11 +2176,12 @@ function renderTable() {
     const qty  = Math.abs(p.net_qty||0);
     // Net chain cash PnL: if a test trade exists, sim_chain_cash is the full-chain answer
     // with the test buyback baked in — the honest number across all rolls.
-    let pnlAbs = null, pnlPct = null;
+    let pnlAbs = null, pnlPct = null, legPct = null;
     if (p.has_test_trade && p.sim_chain_cash != null) {
       pnlAbs = p.sim_chain_cash;
       pnlPct = p.chain_cash !== 0 && p.chain_cash != null
         ? (pnlAbs / Math.abs(p.chain_cash)) * 100 : null;
+      legPct = p.pct_pnl ?? null;
     } else if (p.chain_cash != null && p.current_price != null && qty > 0) {
       const buybackCost = p.current_price * 100 * qty;
       pnlAbs = p.chain_cash - buybackCost;
@@ -2159,8 +2194,15 @@ function renderTable() {
       : '<span class="' + (pnlAbs>=0?'pnl-pos':'pnl-neg') + '">'
         + (pnlAbs>=0?'+':'') + '$' + pnlAbs.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',') + '</span>';
     const pnlPctStr = pnlPct == null ? '—'
-      : '<span class="' + (pnlPct>=0?'pnl-pos':'pnl-neg') + '">'
-        + (pnlPct>=0?'+':'') + pnlPct.toFixed(1) + '%</span>';
+      : (() => {
+          const chainSpan = '<span class="' + (pnlPct>=0?'pnl-pos':'pnl-neg') + '">'
+            + (pnlPct>=0?'+':'') + pnlPct.toFixed(1) + '%</span>';
+          if (legPct == null) return chainSpan;
+          const legSpan = '<span class="' + (legPct>=0?'pnl-pos':'pnl-neg') + '">'
+            + (legPct>=0?'+':'') + legPct.toFixed(1) + '%</span>';
+          return legSpan + ' <span style="opacity:.6;font-size:10px">(leg)</span>'
+            + ' / ' + chainSpan + ' <span style="opacity:.6;font-size:10px">(chain)</span>';
+        })();
 
     // ── Server reasons: strip ATR breach + dividend/extrinsic (we re-evaluate both client-side) ──
     const serverReasons = (p.reasons||[]).filter(r => !r.includes('ATR buffer') && !r.includes('early assignment'));
@@ -2322,6 +2364,27 @@ function renderTable() {
     _autoQueued.add(posKey);
     analyzePosition(posKey, btn);
   }
+
+  // Auto-rerun analysis when flag tier, delta (±0.05), or underlying (±$0.50) changes
+  for (const p of rows) {
+    const posKey = [p.symbol, p.option_type, String(p.strike||''), p.expiry||''].join('|');
+    const newFP  = _analysisFP(p);
+    const oldFP  = _prevAnalysisFP[posKey];
+    _prevAnalysisFP[posKey] = newFP;
+    if (oldFP === undefined || oldFP === newFP) continue;
+    if (!_recommendations[posKey]) continue;
+    const now = Date.now();
+    if (_autoRerunAt[posKey] && now - _autoRerunAt[posKey] < _AUTO_RERUN_COOLDOWN_MS) continue;
+    _autoRerunAt[posKey] = now;
+    console.log('[auto-rerun]', posKey, ':', oldFP, '→', newFP);
+    delete _recommendations[posKey];
+    _saveRecs(_recommendations);
+    fetch('/api/reset-cache-entry', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({position_key: posKey})
+    }).catch(() => {});
+    analyzePosition(posKey, null);
+  }
 }
 
 function esc(s) {
@@ -2361,7 +2424,10 @@ let _unbornAutoRecalcDone = false;
 // ── Flag-change detection ────────────────────────────────────────────────────
 // Stores the flag fingerprint from the previous render so we can highlight
 // anything that changed on the next fetch.
-let _prevFlags = {}; // posKey -> "flagged|nFlags|reason0;reason1;..."
+let _prevFlags      = {}; // posKey → "flagged|nFlags|reason0;reason1;..."
+let _prevAnalysisFP = {}; // posKey → meaningful-state fingerprint from last render
+let _autoRerunAt    = {}; // posKey → Date.now() of last auto-rerun
+const _AUTO_RERUN_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
 
 // ── Live price polling state ─────────────────────────────────────────────────
 let _prevUlPrices  = (() => { try { return JSON.parse(localStorage.getItem(_LS_PR_PRICES) || '{}'); } catch { return {}; } })();
@@ -2372,6 +2438,14 @@ let _prevVix       = null; // VIX at last poll
 
 function _flagFingerprint(p) {
   return [(p.flagged ? '1' : '0'), (p.reasons||[]).length, (p.reasons||[]).join(';')].join('|');
+}
+
+function _analysisFP(p) {
+  // Buckets: flag tier (ok/warn/danger), delta ±0.05, underlying ±$0.50
+  const tier = !p.flagged ? 0 : (p.reasons||[]).length >= 3 ? 2 : 1;
+  const dBkt = (Math.round((p.delta||0) * 20) / 20).toFixed(2);
+  const uBkt = (Math.round((p.underlying||0) * 2) / 2).toFixed(1);
+  return tier + '|' + dBkt + '|' + uBkt;
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2641,7 +2715,8 @@ function _initAutoRefresh() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Proposed trades — server-side persistence via /api/unborn-rows
-const _unbornRows = {};   // populated on load from server
+const _unbornRows = {};          // populated on load from server
+const _deletedUnbornKeys = new Set(); // rows explicitly deleted this session
 
 async function _loadUnbornFromServer() {
   try {
@@ -2657,6 +2732,7 @@ async function _loadUnbornFromServer() {
       }
     }
     _renderUnbornTable();
+    _renderFormerTable();
     if (!_unbornAutoRecalcDone) {
       _unbornAutoRecalcDone = true;
       setTimeout(() => {
@@ -2671,12 +2747,42 @@ async function _loadUnbornFromServer() {
   } catch(e) { /* silently ignore */ }
 }
 
+function _parseRunAt(s) {
+  if (!s) return 0;
+  const m = s.match(/(\d+)\/(\d+)\s+(\d+):(\d+)\s+(AM|PM)/i);
+  if (!m) return 0;
+  let [, mon, day, hr, min, ampm] = m;
+  hr = parseInt(hr);
+  if (ampm.toUpperCase() === 'PM' && hr !== 12) hr += 12;
+  if (ampm.toUpperCase() === 'AM' && hr === 12) hr = 0;
+  return new Date(new Date().getFullYear(), parseInt(mon) - 1, parseInt(day), hr, parseInt(min)).getTime();
+}
+
 async function _saveUnbornToServer() {
+  // Merge with server state before saving:
+  // - Rows the browser doesn't have: keep server's version (unless explicitly deleted)
+  // - Rows both have: keep whichever has the newer _run_at, preserving browser's _ul_cost_basis
+  let payload = {..._unbornRows};
+  try {
+    const sr = await fetch('/api/unborn-rows');
+    if (sr.ok) {
+      const serverRows = await sr.json();
+      for (const [k, v] of Object.entries(serverRows)) {
+        if (_deletedUnbornKeys.has(k)) continue;
+        if (!(k in payload)) {
+          payload[k] = v;
+        } else if (_parseRunAt(v._run_at) > _parseRunAt(payload[k]._run_at)) {
+          payload[k] = Object.assign({}, v, {_ul_cost_basis: payload[k]._ul_cost_basis});
+          _unbornRows[k] = payload[k]; // keep browser in sync
+        }
+      }
+    }
+  } catch (_) {}
   try {
     const r = await fetch('/api/unborn-rows', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(_unbornRows)
+      body: JSON.stringify(payload)
     });
     if (!r.ok) {
       const txt = await r.text().catch(() => r.status);
@@ -2805,7 +2911,167 @@ async function _setUnbornCostBasis(key, val) {
   _renderUnbornTable();
 }
 
+// ── Former Positions ──────────────────────────────────────────────────────────
+let _formerPositions = [];
+let _formerSortCol = 0, _formerSortDir = 1;
+
+const _LS_FMR_HIDE_KEY = 'optionsHiddenFormerRows';
+function _loadHiddenFormer() {
+  try { return new Set(JSON.parse(localStorage.getItem(_LS_FMR_HIDE_KEY) || '[]')); } catch { return new Set(); }
+}
+function _saveHiddenFormer() {
+  try { localStorage.setItem(_LS_FMR_HIDE_KEY, JSON.stringify([..._hiddenFormerRows])); } catch {}
+}
+const _hiddenFormerRows = _loadHiddenFormer();
+function _toggleHideFormer(key, checked) {
+  if (checked) _hiddenFormerRows.add(key);
+  else _hiddenFormerRows.delete(key);
+  _saveHiddenFormer();
+  _renderFormerTable();
+}
+
+async function _loadFormerPositions() {
+  try {
+    const r = await fetch('/api/former-positions');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    _formerPositions = await r.json();
+    // Seed _prevUlPrices so the price-poll tick logic works for former tickers
+    for (const p of _formerPositions) {
+      const sym = (p.symbol || '').toUpperCase();
+      if (p.ul_price != null && _prevUlPrices[sym] == null) _prevUlPrices[sym] = p.ul_price;
+    }
+    _renderFormerTable();
+  } catch(e) {
+    const el = document.getElementById('former-chain');
+    if (el) el.innerHTML = `<p style="color:var(--danger);font-size:12px">Former positions load error: ${esc(e.message)}</p>`;
+    console.error('[former-positions]', e);
+  }
+}
+
+function _renderFormerTable() {
+  const el = document.getElementById('former-chain');
+  if (!el) return;
+  try {
+    _renderFormerTableInner(el);
+  } catch(e) {
+    el.innerHTML = `<p style="color:var(--danger);font-size:12px">Former render error: ${esc(e.message)}</p>`;
+    console.error('[former render]', e);
+  }
+}
+
+function _renderFormerTableInner(el) {
+  const unbornTickers = new Set(Object.values(_unbornRows).map(r => (r.symbol||'').toUpperCase()));
+  const rows = _formerPositions.filter(p => !unbornTickers.has(p.symbol.toUpperCase()));
+  if (!rows.length) { el.innerHTML = ''; return; }
+
+  const fmtCb = v => (v > 0) ? '$' + parseFloat(v).toFixed(2) : '—';
+  const sortFns = [
+    p => p.symbol, p => p.strat, p => 0, p => '', p => '',
+    p => p.qty, p => 999, p => -99, p => 0, p => 0,
+    p => p.ul_cost_basis ?? 0, p => '',
+  ];
+  const fn = sortFns[_formerSortCol] || (p => 0);
+  rows.sort((a, b) => {
+    const av = fn(a), bv = fn(b);
+    return _formerSortDir * (av < bv ? -1 : av > bv ? 1 : 0);
+  });
+
+  const arrow = (i) => _formerSortCol === i ? (_formerSortDir === 1 ? ' ▲' : ' ▼') : '';
+  const th = (label, i) => `<th onclick="_fmrSort(${i})">${label}${arrow(i)}</th>`;
+
+  const hdrs = [th('Symbol',0),th('Type',1),th('Strike',2),th('Expiry',3),th('Side',4),
+                th('Qty',5),th('DTE',6),th('Delta',7),th('U/L Price',8),th('Opt Price',9),
+                th('Cost Basis',10),th('Ideal Entry',11),
+                '<th>Actions</th>',
+                '<th style="text-align:center">Hide</th>'].join('');
+
+  const trs = rows.map(p => {
+    const sym = esc(p.symbol);
+    const rawKey = p.symbol + '|' + p.strat;
+    const key = esc(rawKey);
+    const hidden = _hiddenFormerRows.has(rawKey);
+    return `<tr${hidden ? ' style="display:none"' : ''}>
+      <td><b>${sym}</b></td>
+      <td>${esc(p.strat)}</td>
+      <td>—</td><td>—</td><td>—</td>
+      <td>${p.qty}</td>
+      <td>—</td><td>—</td>
+      <td>${(() => { if (p.ul_price == null) return '—'; const t = _ulPriceTick[(p.symbol||'').toUpperCase()]; const pr = '$' + parseFloat(p.ul_price).toFixed(2); return t === 'up' ? `<span style="color:var(--ok);font-weight:700" title="Price up since last poll">&#9650; ${pr}</span>` : t === 'down' ? `<span style="color:var(--danger);font-weight:700" title="Price down since last poll">&#9660; ${pr}</span>` : pr; })()}</td>
+      <td>—</td>
+      <td>${fmtCb(p.ul_cost_basis)}</td>
+      <td>—</td>
+      <td><button data-key="${key}" onclick="analyzeFormerPosition(this.dataset.key,this)"
+          style="font-size:11px;padding:3px 8px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">Analyze</button></td>
+      <td style="text-align:center">
+        <input type="checkbox" ${hidden ? 'checked' : ''}
+          onchange="_toggleHideFormer('${rawKey.replace(/'/g,"\\'")}',this.checked)"
+          style="cursor:pointer;accent-color:var(--accent);width:14px;height:14px">
+      </td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `<div class="section-title" style="margin-top:0;margin-bottom:8px">Former Positions</div>
+    <table><thead><tr>${hdrs}</tr></thead><tbody>${trs}</tbody></table>`;
+}
+
+function _fmrSort(col) {
+  if (_formerSortCol === col) _formerSortDir = -_formerSortDir;
+  else { _formerSortCol = col; _formerSortDir = 1; }
+  _renderFormerTable();
+}
+
+async function analyzeFormerPosition(key, btn) {
+  const parts = key.split('|');
+  const ticker = parts[0], strat = parts[1] || 'CC';
+  const pos = _formerPositions.find(p => p.symbol === ticker && p.strat === strat);
+  const qty = pos ? pos.qty : 1;
+  const cb  = pos ? (pos.ul_cost_basis || 0) : 0;
+
+  btn.disabled = true;
+  btn.innerHTML = '<span style="display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle"></span>';
+
+  await fetch('/api/unborn-cache-delete', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({row_key: key})
+  });
+
+  try {
+    let d;
+    while (true) {
+      const r = await fetch('/api/unborn', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ticker, qty, strat, cost_basis: cb})
+      });
+      let raw;
+      try { raw = await r.text(); d = JSON.parse(raw); }
+      catch { throw new Error('Non-JSON: ' + (raw||'').slice(0,200)); }
+      if (r.status === 202 && d.status === 'in_progress') {
+        await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
+        continue;
+      }
+      break;
+    }
+    if (d.error) throw new Error(d.error);
+    const chain = d.chain || [];
+    if (chain.length) {
+      const ubKey = encodeURIComponent(ticker + '|' + strat + '|' + qty);
+      const _runAt = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
+      _unbornRows[key] = Object.assign({}, chain[0], {_qty: qty, _ubKey: ubKey, _ul_cost_basis: (d.ul_cost_basis ?? cb) || null, _run_at: _runAt});
+      _deletedUnbornKeys.delete(key);
+    }
+    await _saveUnbornToServer();
+    _renderUnbornTable();
+    _renderFormerTable();
+  } catch(e) {
+    btn.disabled = false;
+    btn.textContent = 'Analyze';
+    alert('Analysis failed for ' + ticker + ': ' + e.message);
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function deleteUnbornRow(key) {
+  _deletedUnbornKeys.add(key);
   delete _unbornRows[key];
   await _saveUnbornToServer();
   await fetch('/api/unborn-cache-delete', {
@@ -2814,6 +3080,7 @@ async function deleteUnbornRow(key) {
     body: JSON.stringify({row_key: key})
   });
   _renderUnbornTable();
+  _renderFormerTable();
 }
 
 async function recalcUnbornRow(key, btn) {
@@ -2918,14 +3185,19 @@ function _actionCell(key) {
 }
 
 async function analyzePosition(key, btn) {
-  btn.disabled = true;
-  btn.style.background = 'orange';
-  btn.style.color = '#000';
-  btn.style.borderColor = 'orange';
-  btn.style.display = 'inline-flex';
-  btn.style.alignItems = 'center';
-  btn.style.gap = '5px';
-  btn.innerHTML = '<span style="width:11px;height:11px;border:2px solid rgba(0,0,0,0.25);border-top-color:#000;border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Analyzing…';
+  if (btn) {
+    btn.disabled = true;
+    btn.style.background = 'orange';
+    btn.style.color = '#000';
+    btn.style.borderColor = 'orange';
+    btn.style.display = 'inline-flex';
+    btn.style.alignItems = 'center';
+    btn.style.gap = '5px';
+    btn.innerHTML = '<span style="width:11px;height:11px;border:2px solid rgba(0,0,0,0.25);border-top-color:#000;border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Analyzing…';
+  } else {
+    const _c = _actionCell(key);
+    if (_c) _c.innerHTML = '<span style="color:var(--muted);font-size:11px;display:inline-flex;align-items:center;gap:5px"><span style="width:10px;height:10px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Re-analyzing…</span>';
+  }
   console.log('[analyze] starting:', key);
   try {
     let d;
@@ -2963,7 +3235,7 @@ async function analyzePosition(key, btn) {
     if (cell) {
       cell.innerHTML = `<span class="err-tip" style="color:var(--danger);font-size:11px">&#9888; Error<span class="err-msg">${esc(e.message)}</span></span>
         <button onclick="retryAnalysis('${key.replace(/'/g,"\\'")}', this)" style="font-size:10px;padding:2px 6px;margin-left:4px">Retry</button>`;
-    } else {
+    } else if (btn) {
       btn.disabled = false;
       btn.textContent = 'Retry';
       btn.title = e.message;
@@ -2994,6 +3266,12 @@ async function findUnborn() {
 
   resultEl.innerHTML = '<span style="display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px"><span style="width:13px;height:13px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Analyzing…</span>';
   try {
+    // Always run fresh — clear any stale cached result for this ticker+strat
+    await fetch('/api/unborn-cache-delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({row_key: ticker + '|' + strat})
+    });
     let d;
     while (true) {
       const r = await fetch('/api/unborn', {
@@ -3227,8 +3505,25 @@ async function fetchPrices() {
       }
       _unbornRows[k].ul_price = newPrice;
     }
+    // ── Update former position ul_price + tick ────────────────────────────
+    let fmrUpdated = false;
+    for (const p of _formerPositions) {
+      const sym = (p.symbol || '').toUpperCase();
+      const info = prices[sym];
+      if (!info || info.price == null) continue;
+      const newPrice = info.price;
+      if (!_seenSyms.has(sym)) {
+        const prev = _prevUlPrices[sym];
+        _ulPriceTick[sym] = (prev == null) ? null : (newPrice > prev ? 'up' : newPrice < prev ? 'down' : null);
+        _prevUlPrices[sym] = newPrice;
+        _seenSyms.add(sym);
+      }
+      p.ul_price = newPrice;
+      fmrUpdated = true;
+    }
     renderTable();
     _renderUnbornTable();
+    if (fmrUpdated) _renderFormerTable();
     _checkAlerts();
   } catch(e) { /* silent — don't disrupt the UI */ }
 }
@@ -3247,12 +3542,115 @@ function _initPriceRefresh() {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Analysis-updates poller ───────────────────────────────────────────────────
+// Polls /api/analysis-updates to pick up scheduled-refresh results without a
+// full page reload. Runs every 60s normally; speeds up to 12s when inflight
+// analyses are in progress or new results just appeared.
+const _AU_SLOW_MS = 60_000;
+const _AU_FAST_MS = 12_000;
+let   _auPollTimer = null;
+
+async function _pollAnalysisUpdates() {
+  let nextDelay = _AU_SLOW_MS;
+  try {
+    // Open-position analysis cache
+    const r = await fetch('/api/analysis-updates');
+    if (r.ok) {
+      const data = await r.json();
+      let anyNew = false;
+      for (const [posKey, val] of Object.entries(data.updates || {})) {
+        const existing = _recommendations[posKey];
+        if (!existing || existing.runAt !== val.run_at) {
+          _recommendations[posKey] = {
+            rec: val.rec,
+            chainCash: val.chain_cash ?? null,
+            text: val.text ?? null,
+            runAt: val.run_at,
+          };
+          const cell = _actionCell(posKey);
+          if (cell) cell.innerHTML = recBadge(val.rec, posKey, val.chain_cash ?? null, val.text ?? null, val.run_at);
+          anyNew = true;
+        }
+      }
+      if (anyNew || (data.inflight || []).length > 0 || (data.unborn_inflight || []).length > 0) nextDelay = _AU_FAST_MS;
+    }
+    // Unborn rows — merge in any rows whose _run_at changed
+    const ru = await fetch('/api/unborn-rows');
+    if (ru.ok) {
+      const serverRows = await ru.json();
+      let unbornUpdated = false;
+      for (const [key, row] of Object.entries(serverRows)) {
+        if (_unbornRows[key] && row._run_at && _unbornRows[key]._run_at !== row._run_at) {
+          _unbornRows[key] = row;
+          unbornUpdated = true;
+        }
+      }
+      if (unbornUpdated) _renderUnbornTable();
+    }
+  } catch (_) {}
+  _auPollTimer = setTimeout(_pollAnalysisUpdates, nextDelay);
+}
+
+function _initAnalysisUpdatePoller() {
+  _auPollTimer = setTimeout(_pollAnalysisUpdates, _AU_SLOW_MS);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Resizable columns (pos-table only) ───────────────────────────────────────
+const _COL_WIDTHS_KEY = 'pos-col-widths';
+
+function _saveColWidths() {
+  const ths = document.querySelectorAll('#pos-table thead th');
+  localStorage.setItem(_COL_WIDTHS_KEY, JSON.stringify([...ths].map(t => t.offsetWidth)));
+}
+
+function initResizableCols() {
+  const table = document.getElementById('pos-table');
+  if (!table) return;
+  const ths = table.querySelectorAll('thead th');
+  const saved = JSON.parse(localStorage.getItem(_COL_WIDTHS_KEY) || 'null');
+  if (saved) {
+    ths.forEach((th, i) => {
+      if (saved[i]) { th.style.minWidth = saved[i] + 'px'; th.style.width = saved[i] + 'px'; }
+    });
+  }
+  ths.forEach((th, i) => {
+    if (th.querySelector('.col-rh')) return; // already wired
+    const handle = document.createElement('div');
+    handle.className = 'col-rh';
+    handle.addEventListener('mousedown', e => {
+      e.stopPropagation();
+      e.preventDefault();
+      handle.classList.add('dragging');
+      const startX = e.pageX;
+      const startW = th.offsetWidth;
+      const onMove = e => {
+        const w = Math.max(40, startW + e.pageX - startX);
+        th.style.minWidth = w + 'px';
+        th.style.width = w + 'px';
+      };
+      const onUp = () => {
+        handle.classList.remove('dragging');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        _saveColWidths();
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+    th.appendChild(handle);
+  });
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Sort by expiry by default (col 5, ascending)
 document.querySelectorAll('th')[3].classList.add('sorted-asc');
 _loadUnbornFromServer();
-fetchData();
+_loadFormerPositions();
+fetchData().then(() => initResizableCols());
 _initAutoRefresh();
 _initPriceRefresh();
+_initAnalysisUpdatePoller();
 
 </script>
 </body>
@@ -3940,6 +4338,20 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
+    _AUTH_USER = os.environ["OTJ_USER"]
+    _AUTH_PASS = os.environ["OTJ_PASS"]
+
+    def require_auth(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            auth = flask_request.authorization
+            if not auth or auth.username != _AUTH_USER or auth.password != _AUTH_PASS:
+                log.warning("AUTH FAIL  %s %s from %s", flask_request.method, flask_request.path, flask_request.remote_addr)
+                return Response("Login required", 401,
+                                {"WWW-Authenticate": 'Basic realm="Options"'})
+            return f(*args, **kwargs)
+        return decorated
+
     @app.errorhandler(Exception)
     def _handle_exception(exc):
         from werkzeug.exceptions import HTTPException
@@ -4003,6 +4415,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         return obj
 
     @app.route("/")
+    @require_auth
     def index():
         html = """<!DOCTYPE html>
 <html lang="en">
@@ -4044,8 +4457,10 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 </html>"""
         return Response(html, mimetype="text/html")
 
-    @app.route("/journal", defaults={"path": ""})
-    @app.route("/journal/<path:path>")
+    _JOURNAL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    @app.route("/journal", defaults={"path": ""}, methods=_JOURNAL_METHODS)
+    @app.route("/journal/<path:path>", methods=_JOURNAL_METHODS)
+    @require_auth
     def journal_proxy(path):
         import requests as _req
         url = f"http://localhost:5001/{path}" if path else "http://localhost:5001/journal"
@@ -4068,6 +4483,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             return Response("Journal offline", status=503, mimetype="text/plain")
 
     @app.route("/dashboard")
+    @require_auth
     def dashboard():
         try:
             mf_html = _build_multiplier_files_html()
@@ -4080,6 +4496,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         )
 
     @app.route("/api/multiplier-status-html")
+    @require_auth
     def api_multiplier_status_html():
         try:
             resp = Response(_build_multiplier_files_html(), mimetype="text/html")
@@ -4089,13 +4506,29 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             log.exception("[multiplier] build failed on status-html endpoint")
             return Response("", mimetype="text/html", status=500)
 
-    def _fetch_notebook_titles() -> set[str]:
-        """Query NotebookLM source titles via subprocess to keep the Playwright/asyncio
-        stack fully isolated from Flask's WSGI threads."""
+    # Cache notebook titles so a single timeout doesn't blank the status display.
+    # Tuple of (fetched_at: datetime, titles: set[str]) or None if never succeeded.
+    _nb_titles_cache: list = [None]   # mutable container so closure can write to it
+    _NB_CACHE_TTL_S  = 300            # serve cached result for up to 5 min
+    _NB_CACHE_STALE_S = 900           # show amber only after 15 min without a good fetch
+
+    def _fetch_notebook_titles() -> set[str] | None:
+        """Query NotebookLM source titles via subprocess.
+        Returns a set on success, a cached set if the fetch fails but cache is fresh,
+        or None (amber) only when the cache is older than _NB_CACHE_STALE_S."""
         import subprocess, json as _json
         notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID", "")
         if not notebook_id:
             return set()
+
+        # Serve from cache if it's still within TTL
+        cached = _nb_titles_cache[0]
+        now = datetime.datetime.now()
+        if cached is not None:
+            age = (now - cached[0]).total_seconds()
+            if age < _NB_CACHE_TTL_S:
+                return cached[1]
+
         script = (
             "import asyncio, json, sys\n"
             "async def _main():\n"
@@ -4108,26 +4541,50 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         try:
             r = subprocess.run(
                 [sys.executable, "-c", script],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=60,
                 env=os.environ.copy(),
             )
             if r.returncode == 0 and r.stdout.strip():
-                return set(_json.loads(r.stdout.strip()))
+                titles = set(_json.loads(r.stdout.strip()))
+                _nb_titles_cache[0] = (now, titles)
+                return titles
             if r.stderr:
                 log.warning("[multiplier] notebook subprocess stderr: %s", r.stderr[-500:])
         except BaseException as exc:
             log.warning("[multiplier] notebook subprocess failed: %s: %s", type(exc).__name__, exc)
-        return set()
+
+        # Fetch failed — return stale cache if it's not too old, else None (amber)
+        if cached is not None:
+            age = (now - cached[0]).total_seconds()
+            if age < _NB_CACHE_STALE_S:
+                log.info("[multiplier] serving stale notebook cache (%.0fs old)", age)
+                return cached[1]
+        return None
 
     def _build_multiplier_files_html() -> str:
         MDIR = Path("/Users/joeandbabs/Documents/retirement/options")
         today = datetime.date.today()
         weekday = today.weekday()  # 0=Mon … 6=Sun
 
-        fwd  = (4 - weekday) % 7 or 7
-        back = (weekday - 4) % 7 or 7
-        next_fri_str = (today + datetime.timedelta(days=fwd)).strftime("%Y_%m_%d")
-        last_fri_str = (today - datetime.timedelta(days=back)).strftime("%Y_%m_%d")
+        # this_fri = most recent Friday (today if today is Friday)
+        # next_fri = the Friday after this_fri
+        this_fri_date = today - datetime.timedelta(days=(weekday - 4) % 7)
+        next_fri_date = this_fri_date + datetime.timedelta(days=7)
+
+        # PLAN files have a grace period: csv due Sunday, pdf due Monday.
+        # next_fri - 5 = Sunday, next_fri - 4 = Monday.
+        plan_csv_due = next_fri_date - datetime.timedelta(days=5)  # Sunday
+        plan_pdf_due = next_fri_date - datetime.timedelta(days=4)  # Monday
+
+        # PLAN shows this week's files until Sunday, then flips to next week
+        plan_fri_date = next_fri_date if today >= plan_csv_due else this_fri_date
+        plan_fri_str  = plan_fri_date.strftime("%Y_%m_%d")
+        plan_fri_week = plan_fri_date.isocalendar()[1]
+
+        # REVIEW shows last week until Sunday, then flips to this week
+        review_fri_date = this_fri_date if today >= plan_csv_due else this_fri_date - datetime.timedelta(days=7)
+        last_fri_str    = review_fri_date.strftime("%Y_%m_%d")
+        last_fri_week   = review_fri_date.isocalendar()[1]
 
         def _latest_name(pattern):
             hits = []
@@ -4142,37 +4599,52 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             return hits[0].name if hits else None
 
         # Always query the notebook on every explicit refresh (browser or button).
-        nb = _fetch_notebook_titles()
+        nb = _fetch_notebook_titles()  # None = unreachable, set() = reachable but empty
 
         # Find current-week titles in notebook by expected date prefix
         def _nb_name(prefix, date_str, ext):
+            if nb is None:
+                return None
             pfx = f"{prefix}_{date_str}_Week_"
             return next((t for t in nb if t.startswith(pfx) and t.endswith(f".{ext}")), None)
 
-        nb_plan_pdf   = _nb_name("PLAN",   next_fri_str, "pdf")
-        nb_plan_csv   = _nb_name("PLAN",   next_fri_str, "csv")
+        nb_plan_pdf   = _nb_name("PLAN",   plan_fri_str, "pdf")
+        nb_plan_csv   = _nb_name("PLAN",   plan_fri_str, "csv")
         nb_review_pdf = _nb_name("REVIEW", last_fri_str, "pdf")
 
-        def _label(nb_match, prefix, date_str, ext):
+        def _label(nb_match, prefix, date_str, week_num, ext, due_date=None):
+            # Returns (label, status) where status is:
+            #   "ok"      — in notebook (green)
+            #   "unknown" — notebook unreachable (amber)
+            #   "pending" — not in notebook, not yet due (gray)
+            #   "overdue" — not in notebook, past due (red)
             if nb_match:
-                return nb_match, False
-            # Not in notebook — show disk name for current week, or a placeholder
+                return nb_match, "ok"
             disk = _disk_name(prefix, date_str, ext)
-            return (disk or f"{prefix}_{date_str}_Week_??.{ext}"), True
+            label = disk or f"{prefix}_{date_str}_Week_{week_num:02d}.{ext}"
+            if nb is None:
+                return label, "unknown"
+            past_due = due_date is None or today >= due_date
+            return label, "overdue" if past_due else "pending"
 
         items = [
-            _label(nb_plan_pdf,   "PLAN",   next_fri_str, "pdf"),
-            _label(nb_plan_csv,   "PLAN",   next_fri_str, "csv"),
-            _label(nb_review_pdf, "REVIEW", last_fri_str, "pdf"),
+            _label(nb_plan_pdf,   "PLAN",   plan_fri_str, plan_fri_week, "pdf", plan_pdf_due),
+            _label(nb_plan_csv,   "PLAN",   plan_fri_str, plan_fri_week, "csv", plan_csv_due),
+            _label(nb_review_pdf, "REVIEW", last_fri_str, last_fri_week, "pdf", plan_csv_due),
         ]
 
         parts = []
-        for label, stale in items:
+        for label, status in items:
             if not label:
                 continue
-            color = "#ef4444" if stale else "#22c55e"
-            title = "Stale — not in notebook" if stale else "In notebook"
-            cls = ' class="blink"' if stale else ""
+            if status == "ok":
+                color, title, cls = "#22c55e", "In notebook", ""
+            elif status == "unknown":
+                color, title, cls = "#f59e0b", "NotebookLM unreachable", ""
+            elif status == "pending":
+                color, title, cls = "#6b7280", "Not yet due", ""
+            else:
+                color, title, cls = "#ef4444", "Overdue — not in notebook", ' class="blink"'
             parts.append(
                 f'<span{cls} style="font-size:13px;color:{color};white-space:nowrap" title="{title}">'
                 f"{label}</span>"
@@ -4181,8 +4653,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         return sep.join(parts)
 
     @app.route("/api/prices")
+    @require_auth
     def api_prices():
-        """Return live underlying prices + ATR values for all open + unborn positions (yfinance)."""
+        """Return live underlying prices + ATR values for all open + unborn + former positions (yfinance)."""
         positions = get_all_open_positions()
         tickers = {p["symbol"].upper() for p in positions}
         # Also include tickers from unborn rows so the poller updates them too
@@ -4194,6 +4667,23 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     sym = (row.get("symbol") or "").upper()
                     if sym:
                         tickers.add(sym)
+        except Exception:
+            pass
+        # Also include former position tickers (closed positions not in open/unborn)
+        try:
+            import sqlite3 as _sq
+            _db = os.path.normpath(JOURNAL_DB)
+            con = _sq.connect(f"file:{_db}?mode=ro", uri=True)
+            open_syms = {r[0].upper() for r in con.execute(
+                "SELECT DISTINCT symbol FROM positions WHERE status='open'"
+            ).fetchall()}
+            for (sym,) in con.execute(
+                "SELECT DISTINCT symbol FROM positions WHERE status != 'open'"
+            ).fetchall():
+                sym = sym.upper()
+                if sym not in open_syms:
+                    tickers.add(sym)
+            con.close()
         except Exception:
             pass
         result = {}
@@ -4209,6 +4699,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
 
     @app.route("/api/eval")
+    @require_auth
     def api_eval():
         import datetime as _dt
         log.info("[DASHBOARD-REFRESH] eval requested at %s", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -4234,6 +4725,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         return Response(json.dumps(_sanitize(data), default=_serial), mimetype="application/json")
 
     @app.route("/api/analyze", methods=["POST"])
+    @require_auth
     def api_analyze():
         body = flask_request.get_json(force=True, silent=True) or {}
         pos_key = body.get("position_key", "")
@@ -4241,9 +4733,14 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             return Response(json.dumps({"error": "Missing position_key"}), status=400, mimetype="application/json")
 
         with _cache_lock:
-            # Already have a result — return it immediately (skip cached errors so they re-run)
-            if pos_key in _analysis_cache and not _analysis_cache[pos_key].get("error"):
-                return Response(json.dumps(_analysis_cache[pos_key]), mimetype="application/json")
+            _cached = _analysis_cache.get(pos_key)
+            if _cached and not _cached.get("error"):
+                return Response(json.dumps(_cached), mimetype="application/json")
+            # Re-run errors only after a 5-minute cooldown
+            if _cached and _cached.get("error"):
+                import time as _t
+                if _t.time() - _cached.get("_error_at", 0) < 300:
+                    return Response(json.dumps(_cached), mimetype="application/json")
             # Already running — tell the client to retry
             if pos_key in _analysis_inflight:
                 return Response(
@@ -4323,11 +4820,14 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 _analysis_inflight.discard(pos_key)
 
         with _cache_lock:
+            import time as _time
             if not result.get("error"):
-                import time as _time
                 result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
                 _analysis_cache[pos_key] = result
                 _save_cache(_analysis_cache)
+            else:
+                result["_error_at"] = _time.time()
+                _analysis_cache[pos_key] = result
         return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
 
     # ── Unborn routes ──────────────────────────────────────────────────────────
@@ -4362,6 +4862,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     _unborn_inflight: set[str] = set()
 
     @app.route("/api/unborn", methods=["POST"])
+    @require_auth
     def api_unborn():
         body          = flask_request.get_json(force=True, silent=True) or {}
         ticker        = body.get("ticker", "").upper().strip()
@@ -4387,8 +4888,14 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         ub_key = f"{ticker}|{strat}|{qty}|{cb_key}"
 
         with _cache_lock:
-            if ub_key in _unborn_cache and not _unborn_cache[ub_key].get("error"):
-                return Response(json.dumps(_unborn_cache[ub_key]), mimetype="application/json")
+            cached = _unborn_cache.get(ub_key)
+            if cached and not cached.get("error"):
+                return Response(json.dumps(cached), mimetype="application/json")
+            # Re-run errors only after a 5-minute cooldown
+            if cached and cached.get("error"):
+                import time as _t
+                if _t.time() - cached.get("_error_at", 0) < 300:
+                    return Response(json.dumps(cached), mimetype="application/json")
             if ub_key in _unborn_inflight:
                 return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
                                 status=202, mimetype="application/json")
@@ -4438,9 +4945,14 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 with _cache_lock:
                     _unborn_inflight.discard(ub_key)
             with _cache_lock:
+                import time as _time
                 if not result.get("error"):
+                    result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
                     _unborn_cache[ub_key] = result
                     _save_unborn_cache(_unborn_cache)
+                else:
+                    result["_error_at"] = _time.time()
+                    _unborn_cache[ub_key] = result
 
         t = threading.Thread(target=_run_analysis, daemon=True)
         t.start()
@@ -4450,6 +4962,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     _UNBORN_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unborn_rows.json")
 
     @app.route("/api/unborn-rows", methods=["GET"])
+    @require_auth
     def api_unborn_rows_get():
         try:
             if os.path.exists(_UNBORN_ROWS_FILE):
@@ -4460,6 +4973,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         return Response("{}", mimetype="application/json")
 
     @app.route("/api/unborn-rows", methods=["POST"])
+    @require_auth
     def api_unborn_rows_post():
         try:
             data = flask_request.get_json(force=True) or {}
@@ -4472,18 +4986,21 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         return Response(json.dumps({"status": "ok"}), mimetype="application/json")
 
     @app.route("/api/cc-qty/<ticker>", methods=["GET"])
+    @require_auth
     def api_cc_qty(ticker: str):
         """Return the number of CC contracts available for ticker from trades.db."""
         qty = get_stock_qty_from_db(ticker.upper().strip())
         return Response(json.dumps({"ticker": ticker.upper(), "qty": qty}), mimetype="application/json")
 
     @app.route("/api/cost-basis/<ticker>", methods=["GET"])
+    @require_auth
     def api_cost_basis(ticker: str):
         """Return the underlying cost basis for ticker from trades.db (0 if not found)."""
         cb = get_ul_cost_basis_from_db(ticker.upper().strip())
         return Response(json.dumps({"ticker": ticker.upper(), "ul_cost_basis": cb}), mimetype="application/json")
 
     @app.route("/api/send-alert", methods=["POST"])
+    @require_auth
     def api_send_alert():
         body      = flask_request.get_json(force=True) or {}
         message   = body.get("message", "Options alert triggered")
@@ -4509,6 +5026,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         return Response(json.dumps({"status": "ok", "pushover": result}), mimetype="application/json")
 
     @app.route("/api/trade", methods=["POST"])
+    @require_auth
     def api_trade():
         trade = flask_request.get_json(force=True) or {}
         log.info("[trade] Received trade request: %s", trade)
@@ -4517,6 +5035,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         return Response(json.dumps({"status": "launched", "trade": trade}), mimetype="application/json")
 
     @app.route("/unborn/<path:ub_key>")
+    @require_auth
     def unborn_detail(ub_key: str):
         ub_key = urllib.parse.unquote(ub_key)
         # Exact match first; fall back to prefix match (handles cost-basis suffix added server-side)
@@ -4547,26 +5066,67 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             body_html = f"<p style='color:var(--danger)'>Error: {html_mod.escape(cached['error'])}</p>"
         else:
             strat    = cached.get("strat", "")
-            if cached.get("_do_nothing"):
+            if cached.get("_do_nothing") or cached.get("recommendation") == "HOLD":
                 rec     = "DO NOTHING"
                 rec_cls = "warn"
             else:
                 rec     = "SELL TO OPEN" if strat in ("CC", "CSP") else "OPEN"
-                rec_cls = "ok"   # unborn = new open trade, always shown as affirmative
+                rec_cls = "ok"
             text     = cached.get("text", "")
+            def _md_cell_ub(c: str) -> str:
+                return re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html_mod.escape(c))
             lines_out = []
-            for ln in text.splitlines():
+            text_lines = text.splitlines()
+            i = 0
+            while i < len(text_lines):
+                ln = text_lines[i]
+                if ln.strip().startswith('|') and ln.strip().count('|') >= 2:
+                    tbl_lines = []
+                    while i < len(text_lines):
+                        stripped = text_lines[i].strip()
+                        if stripped.startswith('|'):
+                            tbl_lines.append(text_lines[i])
+                            i += 1
+                        elif stripped == '':
+                            i += 1
+                        else:
+                            break
+                    header, body_rows = None, []
+                    for tl in tbl_lines:
+                        cells = [c.strip() for c in tl.strip().strip('|').split('|')]
+                        if all(re.match(r'^:?-+:?$', c) for c in cells if c):
+                            continue
+                        if header is None:
+                            header = cells
+                        else:
+                            body_rows.append(cells)
+                    if header:
+                        ths = ''.join(f'<th>{_md_cell_ub(c)}</th>' for c in header)
+                        trs = ''.join(
+                            '<tr>' + ''.join(f'<td>{_md_cell_ub(c)}</td>' for c in row) + '</tr>'
+                            for row in body_rows
+                        )
+                        lines_out.append(f'<table class="atbl"><thead><tr>{ths}</tr></thead><tbody>{trs}</tbody></table>')
+                    continue
                 ln_esc = html_mod.escape(ln)
-                if ln_esc.startswith("## "):   lines_out.append(f"<h2>{ln_esc[3:]}</h2>")
-                elif ln_esc.startswith("# "): lines_out.append(f"<h1>{ln_esc[2:]}</h1>")
+                if ln_esc.startswith("### "):
+                    lines_out.append(f"<h3>{re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', ln_esc[4:])}</h3>")
+                elif ln_esc.startswith("## "):  lines_out.append(f"<h2>{ln_esc[3:]}</h2>")
+                elif ln_esc.startswith("# "):   lines_out.append(f"<h1>{ln_esc[2:]}</h1>")
                 elif ln_esc.startswith("- ") or ln_esc.startswith("• "): lines_out.append(f"<li>{ln_esc[2:]}</li>")
-                elif ln_esc.strip() == "":    lines_out.append("<br>")
+                elif ln_esc.strip() == "":      lines_out.append("<br>")
                 else:
                     ln_esc = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', ln_esc)
                     lines_out.append(f"<p>{ln_esc}</p>")
+                i += 1
+            run_at_html = (
+                f'<div style="font-size:11px;color:var(--muted);margin-bottom:12px">Updated {html_mod.escape(cached["_run_at"])}</div>'
+                if cached.get("_run_at") else ""
+            )
             body_html = (
                 f'<div style="margin-bottom:16px">'
                 f'<span class="badge badge-{rec_cls}" style="font-size:15px;padding:6px 16px">{html_mod.escape(rec)}</span>'
+                f'{run_at_html}'
                 f'</div>'
                 f'<div class="rec-body">{"".join(lines_out)}</div>'
             )
@@ -4684,6 +5244,7 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
         return Response(page, mimetype="text/html")
 
     @app.route("/favicon/<ticker>.svg")
+    @require_auth
     def ticker_favicon(ticker):
         t   = html_mod.escape(ticker.upper()[:6])
         fs  = {1: 36, 2: 32, 3: 24, 4: 18}.get(len(t), 14)
@@ -4698,6 +5259,7 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                         headers={"Cache-Control": "no-store"})
 
     @app.route("/api/ask", methods=["POST"])
+    @require_auth
     def api_ask():
         body     = flask_request.get_json(force=True, silent=True) or {}
         pos_key  = body.get("position_key", "")
@@ -4776,6 +5338,7 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
             return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
 
     @app.route("/api/reset-cache-entry", methods=["POST"])
+    @require_auth
     def api_reset_cache_entry():
         body    = flask_request.get_json(force=True, silent=True) or {}
         pos_key = body.get("position_key", "")
@@ -4786,6 +5349,7 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
         return Response(json.dumps({"status": "ok"}), mimetype="application/json")
 
     @app.route("/api/unborn-cache-delete", methods=["POST"])
+    @require_auth
     def api_unborn_cache_delete():
         body    = flask_request.get_json(force=True, silent=True) or {}
         row_key = body.get("row_key", "")   # e.g. "SLB|CC"
@@ -4800,6 +5364,7 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
         return Response(json.dumps({"deleted": to_delete}), mimetype="application/json")
 
     @app.route("/api/reset-cache", methods=["POST"])
+    @require_auth
     def api_reset_cache():
         with _cache_lock:
             _analysis_cache.clear()
@@ -4807,7 +5372,75 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
         log.info("[reset] analysis cache cleared")
         return Response(json.dumps({"status": "ok"}), mimetype="application/json")
 
+    @app.route("/api/former-positions", methods=["GET"])
+    @require_auth
+    def api_former_positions():
+        """Tickers with past positions but no current open position, for the Former Positions table."""
+        import sqlite3 as _sq
+        _db = os.path.normpath(JOURNAL_DB)
+        try:
+            con = _sq.connect(f"file:{_db}?mode=ro", uri=True)
+            con.row_factory = _sq.Row
+            open_tickers = {r["symbol"].upper() for r in con.execute(
+                "SELECT DISTINCT symbol FROM positions WHERE status='open'"
+            ).fetchall()}
+            rows = con.execute("""
+                SELECT p.symbol, p.option_type, p.ul_cost_basis,
+                       ABS(SUM(CASE WHEN t.action='sell' THEN t.quantity ELSE 0 END)) AS qty
+                FROM positions p
+                LEFT JOIN trades t ON t.position_id = p.id AND t.is_test = 0
+                WHERE p.status != 'open'
+                  AND p.id IN (
+                      SELECT MAX(p2.id) FROM positions p2
+                      WHERE p2.symbol = p.symbol AND p2.status != 'open'
+                      GROUP BY p2.symbol
+                  )
+                GROUP BY p.symbol
+                ORDER BY p.symbol
+            """).fetchall()
+            con.close()
+            result = []
+            for r in rows:
+                sym = r["symbol"].upper()
+                if sym in open_tickers:
+                    continue
+                opt = (r["option_type"] or "call").lower()
+                result.append({
+                    "symbol": sym,
+                    "strat": "CSP" if opt == "put" else "CC",
+                    "ul_cost_basis": r["ul_cost_basis"] or 0,
+                    "qty": int(r["qty"] or 1),
+                    "ul_price": get_underlying_price(sym),
+                })
+            return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
+        except Exception as exc:
+            log.error("[former-positions] %s", exc)
+            return Response(json.dumps([]), mimetype="application/json")
+
+    @app.route("/api/analysis-updates", methods=["GET"])
+    @require_auth
+    def api_analysis_updates():
+        """Lightweight cache snapshot — no DB query. Used by the browser to pick up
+        scheduled-refresh results in real time without a full page reload."""
+        with _cache_lock:
+            updates = {
+                k: {
+                    "rec":        v.get("recommendation"),
+                    "run_at":     v.get("_run_at"),
+                    "chain_cash": v.get("chain_cash"),
+                    "text":       v.get("text"),
+                }
+                for k, v in _analysis_cache.items()
+                if not v.get("error") and v.get("recommendation")
+            }
+            inflight = list(_analysis_inflight)
+            unborn_inflight = list({
+                "|".join(k.split("|")[:2]) for k in _unborn_inflight
+            })
+        return Response(json.dumps({"updates": updates, "inflight": inflight, "unborn_inflight": unborn_inflight}), mimetype="application/json")
+
     @app.route("/analyze/<path:pos_key>")
+    @require_auth
     def analyze_detail(pos_key: str):
         pos_key = urllib.parse.unquote(pos_key)
         cached  = _analysis_cache.get(pos_key)
@@ -4842,9 +5475,15 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                 # Detect markdown table block (line starts with |)
                 if ln.strip().startswith('|') and ln.strip().count('|') >= 2:
                     tbl_lines = []
-                    while i < len(text_lines) and text_lines[i].strip().startswith('|'):
-                        tbl_lines.append(text_lines[i])
-                        i += 1
+                    while i < len(text_lines):
+                        stripped = text_lines[i].strip()
+                        if stripped.startswith('|'):
+                            tbl_lines.append(text_lines[i])
+                            i += 1
+                        elif stripped == '':
+                            i += 1  # skip blank lines between table rows
+                        else:
+                            break
                     header, body_rows = None, []
                     for tl in tbl_lines:
                         cells = [c.strip() for c in tl.strip().strip('|').split('|')]
@@ -4863,7 +5502,9 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                         lines_out.append(f'<table class="atbl"><thead><tr>{ths}</tr></thead><tbody>{trs}</tbody></table>')
                     continue
                 ln_esc = html_mod.escape(ln)
-                if ln_esc.startswith("## "):
+                if ln_esc.startswith("### "):
+                    lines_out.append(f"<h3>{re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', ln_esc[4:])}</h3>")
+                elif ln_esc.startswith("## "):
                     lines_out.append(f"<h2>{ln_esc[3:]}</h2>")
                 elif ln_esc.startswith("# "):
                     lines_out.append(f"<h1>{ln_esc[2:]}</h1>")
@@ -4947,9 +5588,14 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
             else:
                 chain_html = ""
 
+            run_at_html = (
+                f'<div style="font-size:11px;color:var(--muted);margin-bottom:12px">Updated {html_mod.escape(cached["_run_at"])}</div>'
+                if cached.get("_run_at") else ""
+            )
             body_html = (
                 f'<div style="margin-bottom:16px">'
                 f'<span class="badge badge-{rec_cls}" style="font-size:15px;padding:6px 16px">{html_mod.escape(rec)}</span>'
+                f'{run_at_html}'
                 f'</div>'
                 f'<div class="rec-body">{"".join(lines_out)}</div>'
                 f'{chain_html}'
@@ -4997,14 +5643,17 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
   .badge-warn{{background:var(--warn-bg);color:var(--warn)}}
   .badge-danger{{background:var(--danger-bg);color:var(--danger)}}
   .rec-body h1,.rec-body h2{{color:var(--accent);margin:16px 0 6px;font-size:14px}}
+  .rec-body h3{{color:var(--text);margin:14px 0 4px;font-size:13px;font-weight:600}}
   .rec-body p{{margin:4px 0;max-width:860px}}
   .rec-body li{{margin:2px 0 2px 20px;max-width:860px}}
   .rec-body strong{{color:var(--text)}}
   .rec-body br{{display:block;margin:6px 0;content:""}}
-  .rec-body table.atbl{{border-collapse:collapse;margin:12px 0;font-size:12px;width:100%;max-width:860px}}
-  .rec-body table.atbl th,.rec-body table.atbl td{{padding:5px 12px;border:1px solid var(--border);text-align:left;white-space:nowrap}}
-  .rec-body table.atbl th{{background:var(--surface);color:var(--accent);font-weight:600}}
-  .rec-body table.atbl tr:nth-child(even) td{{background:rgba(255,255,255,.03)}}
+  .rec-body table.atbl{{border-collapse:collapse;margin:14px 0;font-size:12px;max-width:860px}}
+  .rec-body table.atbl th,.rec-body table.atbl td{{padding:7px 14px;border:1px solid var(--border);text-align:left;vertical-align:top;white-space:normal;line-height:1.5}}
+  .rec-body table.atbl th{{background:rgba(255,255,255,.07);color:var(--accent);font-weight:600;white-space:nowrap}}
+  .rec-body table.atbl td:first-child{{font-weight:600;color:var(--text);background:rgba(255,255,255,.03);white-space:nowrap}}
+  .rec-body table.atbl tr:nth-child(even) td{{background:rgba(255,255,255,.025)}}
+  .rec-body table.atbl tr:nth-child(even) td:first-child{{background:rgba(255,255,255,.055)}}
   .chain-pnl{{margin-top:28px;padding:14px 18px;background:var(--surface);border:1px solid var(--border);border-radius:8px;max-width:860px}}
   .chain-label{{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px}}
   .chain-working{{font-size:13px;color:var(--text)}}
@@ -5286,18 +5935,23 @@ def print_key_dates(ticker: str, dates: dict) -> None:
     print_box(lines, title=f"  {ticker} — Key Dates  ")
 
 
+def _is_ticker_csv_source(title: str) -> bool:
+    """True if a notebook source title looks like a {TICKER}.csv upload."""
+    stem = title.split(".")[0]
+    return 1 <= len(stem) <= 5 and stem.isupper() and title.endswith(".csv")
+
+
 async def _purge_stale_ticker_sources(client, notebook_id: str, uploading_ticker: str | None = None) -> None:
     """
-    Delete notebook sources that look like ticker CSV uploads when either:
-      • The stem matches ``uploading_ticker`` exactly (always delete before re-upload), OR
-      • The source is ≥1 day old (routine age-based cleanup).
+    Before uploading a new ticker CSV, remove any existing sources for that
+    same ticker (prevents same-ticker dupes). Also age out any other ticker
+    CSV sources that are more than 1 day old (catches leaked sources whose
+    post-query delete failed).
 
     A "ticker source" is identified by:
-      • filename stem (left of the first '.') is all-uppercase
-      • filename stem is 1–5 characters long   (e.g. IBM, CLX, AAPL)
+      • filename ends with .csv
+      • filename stem (left of the first '.') is all-uppercase, 1–5 characters
     """
-    import datetime
-
     now    = datetime.datetime.now(datetime.timezone.utc)
     cutoff = now - datetime.timedelta(days=1)
     target = (uploading_ticker or "").upper()
@@ -5310,14 +5964,11 @@ async def _purge_stale_ticker_sources(client, notebook_id: str, uploading_ticker
 
     for source in sources:
         title = source.title or ""
-        stem  = title.split(".")[0]          # filename left of first '.'
-
-        if not (1 <= len(stem) <= 5):
+        if not _is_ticker_csv_source(title):
             continue
-        if not stem.isupper():
-            continue
+        stem = title.split(".")[0].upper()
 
-        # Always remove if this is the ticker we're about to upload
+        # Always remove existing copies of the ticker we're about to upload
         if target and stem == target:
             try:
                 await client.sources.delete(notebook_id, source.id)
@@ -5326,26 +5977,50 @@ async def _purge_stale_ticker_sources(client, notebook_id: str, uploading_ticker
                 log.error("[cleanup] Failed to delete %r: %s", title, exc)
             continue
 
-        # Also remove any other ticker source that's gone stale (≥1 day old)
+        # Age out other ticker sources whose post-query delete apparently failed
         created_at = source.created_at
         if created_at is None:
             continue
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=datetime.timezone.utc)
         if created_at > cutoff:
-            continue                         # less than 1 day old — keep it
-
+            continue
         try:
             await client.sources.delete(notebook_id, source.id)
-            log.info("[cleanup] Removed old source: %r (uploaded %s)", title, created_at.date())
+            log.info("[cleanup] Aged out source: %r (uploaded %s)", title, created_at.date())
         except Exception as exc:
             log.error("[cleanup] Failed to delete %r: %s", title, exc)
 
 
-async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
+async def _purge_all_ticker_sources(notebook_id: str) -> None:
+    """Remove every {TICKER}.csv source from the notebook. Used by --purge-notebook."""
+    from notebooklm import NotebookLMClient
+    async with NotebookLMClient.from_storage() as client:
+        try:
+            sources = await client.sources.list(notebook_id)
+        except Exception as exc:
+            print(f"ERROR: Could not list sources: {exc}")
+            return
+        for source in sources:
+            title = source.title or ""
+            if not _is_ticker_csv_source(title):
+                continue
+            try:
+                await client.sources.delete(notebook_id, source.id)
+                print(f"  Deleted: {title}")
+            except Exception as exc:
+                print(f"  ERROR deleting {title!r}: {exc}")
+
+
+async def upload_to_notebooklm(file_path: str, notebook_id: str) -> str | None:
     """Upload a file as a new source to the specified NotebookLM notebook.
-    Stale ticker CSV sources (≥1 day old, ALL-CAPS stem, 1–5 chars) are
-    removed first to keep the notebook tidy.
+
+    Uses wait=False to avoid the GET_NOTEBOOK polling that causes timeouts.
+    Deletes any previously tracked source for this ticker before uploading
+    a new one (avoids duplicates without needing sources.list()).
+
+    Returns the new source ID, or None if the upload was skipped or failed.
+    Callers should sleep ~15s before querying to let the source process.
     """
     try:
         from notebooklm import NotebookLMClient
@@ -5353,12 +6028,11 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
         log.error("notebooklm-py is not installed — pip install 'notebooklm-py[browser]'")
         raise ImportError("notebooklm-py is not installed")
 
-    # Extract ticker from the filename stem (e.g. "IBM.csv" → "IBM")
     base = os.path.basename(file_path)
     stem = base.split(".")[0].upper()
     uploading_ticker = stem if (1 <= len(stem) <= 5 and stem.isupper()) else None
 
-    # Skip upload if we recently uploaded this ticker (avoids burning rate-limit quota on retries)
+    # Skip upload if we recently uploaded this ticker
     if uploading_ticker:
         last = _last_upload_time.get(uploading_ticker)
         if last and (datetime.datetime.now() - last).total_seconds() < _UPLOAD_TTL_MINUTES * 60:
@@ -5366,19 +6040,46 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> None:
                      uploading_ticker,
                      (datetime.datetime.now() - last).total_seconds() / 60,
                      _UPLOAD_TTL_MINUTES)
-            return
+            return None
 
     log.info("Uploading %s to NotebookLM notebook %s ...", file_path, notebook_id)
     try:
         async with NotebookLMClient.from_storage() as client:
-            await _purge_stale_ticker_sources(client, notebook_id, uploading_ticker)
-            await client.sources.add_file(notebook_id, file_path, wait=True)
+            # Delete previous source for this ticker by tracked ID (no GET_NOTEBOOK needed)
+            prev_id = _last_source_ids.pop(uploading_ticker, None) if uploading_ticker else None
+            if prev_id:
+                try:
+                    await client.sources.delete(notebook_id, prev_id)
+                    log.info("[cleanup] Deleted previous source %s for %s", prev_id, uploading_ticker)
+                except Exception as exc:
+                    log.warning("[cleanup] Could not delete previous source %s: %s", prev_id, exc)
+
+            # wait=False avoids the GET_NOTEBOOK polling that times out
+            source = await client.sources.add_file(notebook_id, file_path, wait=False)
+
+        source_id = source.id if source else None
         if uploading_ticker:
             _last_upload_time[uploading_ticker] = datetime.datetime.now()
-        log.info("Upload complete: %s", os.path.basename(file_path))
+            if source_id:
+                _last_source_ids[uploading_ticker] = source_id
+        log.info("Upload complete: %s (source_id=%s)", os.path.basename(file_path), source_id)
+        return source_id
     except Exception as exc:
         log.error("Upload failed — %s", exc)
         raise
+
+
+async def delete_notebooklm_source(notebook_id: str, source_id: str | None) -> None:
+    """Delete a single source from the notebook by ID. No-op if source_id is None."""
+    if not source_id:
+        return
+    try:
+        from notebooklm import NotebookLMClient
+        async with NotebookLMClient.from_storage() as client:
+            await client.sources.delete(notebook_id, source_id)
+        log.info("[cleanup] Deleted source %s from notebook", source_id)
+    except Exception as exc:
+        log.warning("[cleanup] Could not delete source %s: %s", source_id, exc)
 
 
 STRAT_LABELS = {
@@ -5674,7 +6375,11 @@ async def query_notebooklm(
                 f"Label it 'Expected PnL (buy-back at 40% of premium)'."
             )
         vix_clause = f", the VIX ({vix_note})," if vix_note else ""
+        import zoneinfo as _zi
+        _now_et = datetime.datetime.now(_zi.ZoneInfo("America/New_York"))
+        _today_preamble = _now_et.strftime("Today is %A, %B %-d, %Y at %-I:%M %p ET. ")
         question = (
+            f"{_today_preamble}"
             f"Based on the updated {ticker} source, the latest economic release calendar, "
             f"and the latest PLAN and REVIEW sources{vix_clause} determine the best roll or "
             f"do nothing strategy. "
@@ -5686,7 +6391,11 @@ async def query_notebooklm(
         )
     else:
         vix_clause = f", the VIX ({vix_note})," if vix_note else ""
+        import zoneinfo as _zi
+        _now_et = datetime.datetime.now(_zi.ZoneInfo("America/New_York"))
+        _today_preamble = _now_et.strftime("Today is %A, %B %-d, %Y at %-I:%M %p ET. ")
         question = (
+            f"{_today_preamble}"
             f"Given the {ticker} source, what is the best {strat_label} choice, "
             f"taking into consideration the economic calendar releases, "
             f"the latest PLAN and REVIEW sources{vix_clause} and the upcoming "
@@ -5711,7 +6420,7 @@ async def query_notebooklm(
     if not silent:
         print(f"\nQuerying NotebookLM...")
 
-    _TRANSPORT_KEYWORDS = ("timeout", "transport", "network", "connection", "reset", "eof", "read")
+    _TRANSPORT_KEYWORDS = ("timeout", "timed out", "transport", "network", "connection", "reset", "eof", "read", "rpc")
     _MAX_ATTEMPTS = 4
     _TRANSPORT_BACKOFF = [15, 30, 60]  # seconds between transport-error retries
 
@@ -5909,7 +6618,23 @@ def main():
              "  ROLL = Roll or hold — reads open position from the journal,\n"
              "         downloads/loads the chain, then queries NotebookLM",
     )
+    parser.add_argument(
+        "--purge-notebook",
+        action="store_true",
+        help="Remove all {TICKER}.csv sources from the NotebookLM notebook and exit",
+    )
     args = parser.parse_args()
+
+    # ── --purge-notebook: remove all ticker CSVs from notebook and exit ───────
+    if args.purge_notebook:
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            print("ERROR: NOTEBOOKLM_NOTEBOOK_ID not set", file=sys.stderr)
+            sys.exit(1)
+        print("Removing all {TICKER}.csv sources from notebook...")
+        asyncio.run(_purge_all_ticker_sources(notebook_id))
+        print("Done.")
+        sys.exit(0)
 
     # ── --eval / --web: require PUBLIC_API_SECRET ─────────────────────────────
     if args.eval or args.web:
@@ -6054,8 +6779,14 @@ def main():
             print("unavailable")
 
     # Step 8 — Optionally upload to NotebookLM
+    _cli_source_id = None
     if not strat_only and (args.upload or args.onlyload):
-        asyncio.run(upload_to_notebooklm(output_file, notebook_id))
+        _cli_source_id = asyncio.run(upload_to_notebooklm(output_file, notebook_id))
+        if not args.onlyload:
+            try:
+                os.unlink(output_file)
+            except OSError:
+                pass
 
     # Step 9 — Optionally query NotebookLM for strategy recommendation
     if args.strat:
@@ -6064,6 +6795,7 @@ def main():
                 notebook_id, ticker, args.strat, key_dates, open_positions, current_vix
             )
         )
+        asyncio.run(delete_notebooklm_source(notebook_id, _cli_source_id))
 
 
 if __name__ == "__main__":
