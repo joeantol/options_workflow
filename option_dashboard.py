@@ -1567,14 +1567,16 @@ async def run_roll_for_position(
         # Give the source time to finish processing before querying (wait=False upload)
         if source_id:
             await asyncio.sleep(15)
-        text = await query_notebooklm(
-            notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
-            silent=True,
-            ul_cost_basis=ul_cost_basis,
-            chain_data=chain,
-            current_leg_price=current_leg_price,
-        )
-        await delete_notebooklm_source(notebook_id, source_id)
+        try:
+            text = await query_notebooklm(
+                notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
+                silent=True,
+                ul_cost_basis=ul_cost_basis,
+                chain_data=chain,
+                current_leg_price=current_leg_price,
+            )
+        finally:
+            await delete_notebooklm_source(notebook_id, source_id)
         if not text:
             return {"error": "Empty response from NotebookLM", "recommendation": "HOLD", "text": "", "ticker": ticker}
 
@@ -1746,12 +1748,14 @@ async def run_unborn_for_ticker(
         # Give the source time to finish processing before querying (wait=False upload)
         if source_id:
             await asyncio.sleep(15)
-        text = await query_notebooklm(
-            notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
-            silent=True,
-            ul_cost_basis=ul_cost_basis,
-        )
-        await delete_notebooklm_source(notebook_id, source_id)
+        try:
+            text = await query_notebooklm(
+                notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
+                silent=True,
+                ul_cost_basis=ul_cost_basis,
+            )
+        finally:
+            await delete_notebooklm_source(notebook_id, source_id)
         if not text:
             return {"error": "Empty response from NotebookLM", "recommendation": "HOLD",
                     "text": "", "ticker": ticker, "strat": strat, "chain": display_rows}
@@ -2160,9 +2164,131 @@ function renderTable() {
     return _sortDir * (av < bv ? -1 : av > bv ? 1 : 0);
   });
 
+  // ── Collar detection ─────────────────────────────────────────────────────
+  // A collar = spread_id group that has both a call leg and a put leg.
+  const _collarMap = new Map(); // spread_id → {call, put}
+  for (const p of rows) {
+    if (!p.spread_id) continue;
+    const g = _collarMap.get(p.spread_id) || {call: null, put: null};
+    if ((p.option_type||'').toLowerCase() === 'call') g.call = p;
+    else if ((p.option_type||'').toLowerCase() === 'put') g.put = p;
+    _collarMap.set(p.spread_id, g);
+  }
+  const _collars = new Map(); // spread_id → {call, put} for confirmed collars only
+  for (const [sid, g] of _collarMap) {
+    if (g.call && g.put) _collars.set(sid, g);
+  }
+
+  // Regroup: move second collar leg immediately after the first so sort order
+  // never splits them (e.g. sorting by Side puts Long before Short).
+  if (_collars.size) {
+    for (const [sid] of _collars) {
+      const firstIdx  = rows.findIndex(p => p.spread_id === sid);
+      const secondIdx = rows.findIndex((p, i) => p.spread_id === sid && i !== firstIdx);
+      if (firstIdx >= 0 && secondIdx >= 0 && secondIdx !== firstIdx + 1) {
+        const [leg] = rows.splice(secondIdx, 1);
+        rows.splice(firstIdx + 1, 0, leg);
+      }
+    }
+  }
+
+  const _collarHeaderRendered = new Set();
+
   const tbody = document.getElementById('pos-body');
   tbody.innerHTML = '';
   for (const p of rows) {
+    // ── Collar group header (rendered once, before the first leg) ──────────
+    if (p.spread_id && _collars.has(p.spread_id) && !_collarHeaderRendered.has(p.spread_id)) {
+      _collarHeaderRendered.add(p.spread_id);
+      const cg  = _collars.get(p.spread_id);
+      const sym = (cg.call.symbol || cg.put.symbol || '').toUpperCase();
+      const callStrike = parseFloat(cg.call.strike || 0).toFixed(2);
+      const putStrike  = parseFloat(cg.put.strike  || 0).toFixed(2);
+      const expiry     = cg.call.expiry || cg.put.expiry || '';
+      const qty        = Math.abs(cg.call.net_qty || 0);
+      const ulPrice    = cg.call.underlying;
+      const ulTick     = _ulPriceTick[sym];
+      const ulHtml     = ulPrice == null ? '—'
+        : ulTick === 'up'   ? `<span style="color:var(--ok);font-weight:700" title="Price up since last poll">&#9650; $${ulPrice.toFixed(2)}</span>`
+        : ulTick === 'down' ? `<span style="color:var(--danger);font-weight:700" title="Price down since last poll">&#9660; $${ulPrice.toFixed(2)}</span>`
+        : `$${ulPrice.toFixed(2)}`;
+
+      // Combined PnL: chain_cash (net entry for both legs) + current put value - current cc cost
+      // chain_cash on the call leg already includes both legs since they share spread_id
+      let collarPnlHtml = '—';
+      const chainCash = cg.call.chain_cash;
+      const ccPrice   = cg.call.current_price;
+      const putPrice  = cg.put.current_price;
+      if (chainCash != null && ccPrice != null && putPrice != null && qty > 0) {
+        const collarPnl = chainCash - (ccPrice - putPrice) * 100 * qty;
+        collarPnlHtml = `<span class="${collarPnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${collarPnl >= 0 ? '+' : ''}$${collarPnl.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')}</span>`;
+      }
+
+      // Net position delta: short call contributes -call_delta; long put contributes put_delta (already negative)
+      const netDelta = (cg.call.delta != null && cg.put.delta != null)
+        ? (-cg.call.delta + cg.put.delta) : null;
+      const netDeltaHtml = netDelta != null
+        ? `<span style="color:${Math.abs(netDelta)<0.40?'var(--ok)':Math.abs(netDelta)<=0.60?'var(--warn)':'var(--danger)'}">${(netDelta>=0?'+':'')+netDelta.toFixed(3)}</span>`
+        : '—';
+      const dte = cg.call.dte ?? cg.put.dte ?? null;
+      const dteHtml = dte == null ? '—'
+        : `<span style="color:${dte>21?'var(--ok)':dte>=10?'var(--warn)':'var(--danger)'}">${dte}</span>`;
+
+      const isCollapsed = _collarCollapsed.has(p.spread_id);
+      const safeId = p.spread_id.replace(/'/g, "\\'");
+
+      // Moneyness color: danger if either leg ITM, warn if either within 3%, else ok
+      let collarSymColor = '';
+      if (ulPrice != null) {
+        const callStrikeV = parseFloat(cg.call.strike || 0);
+        const putStrikeV  = parseFloat(cg.put.strike  || 0);
+        const callItm = callStrikeV > 0 && ulPrice > callStrikeV;
+        const putItm  = putStrikeV  > 0 && ulPrice < putStrikeV;
+        if (callItm || putItm) {
+          collarSymColor = 'color:var(--danger)';
+        } else {
+          const callAway = callStrikeV > 0 ? Math.abs(ulPrice - callStrikeV) / ulPrice * 100 : 999;
+          const putAway  = putStrikeV  > 0 ? Math.abs(ulPrice - putStrikeV)  / ulPrice * 100 : 999;
+          collarSymColor = Math.min(callAway, putAway) <= 3.0 ? 'color:var(--warn)' : 'color:var(--ok)';
+        }
+      }
+
+      // Flag state: worst across both legs
+      const maxFlags = Math.max((cg.call.reasons||[]).length, (cg.put.reasons||[]).length);
+      const hdrRowCls = maxFlags >= 3 ? 'danger-row' : maxFlags >= 1 ? 'warn-row' : 'ok-row';
+      const hdrBadge = maxFlags >= 3
+        ? `<span class="badge badge-danger">&#9888; ${maxFlags} flags</span>`
+        : maxFlags >= 1
+          ? `<span class="badge badge-warn">&#9888; ${maxFlags} flag${maxFlags>1?'s':''}</span>`
+          : '<span class="badge badge-ok">&#10003; OK</span>';
+
+      const hdrTr = document.createElement('tr');
+      hdrTr.className = hdrRowCls;
+      hdrTr.style.cssText = 'border-top:2px solid rgba(168,85,247,.35);cursor:pointer';
+      hdrTr.onclick = () => _toggleCollar(p.spread_id);
+      hdrTr.innerHTML = `
+        <td>
+          <span data-collar-arrow="${esc(p.spread_id)}" style="display:inline-block;font-size:9px;color:var(--muted);transition:transform .18s;transform:${isCollapsed?'rotate(-90deg)':'rotate(0deg)'};margin-right:5px">▼</span>
+          <strong style="font-size:13px;${collarSymColor}">${esc(sym)}</strong>
+        </td>
+        <td colspan="2" style="white-space:nowrap">
+          <span class="badge b-call" style="font-size:10px;margin-right:2px">C</span><strong>$${callStrike}</strong>
+          <span style="color:var(--muted);margin:0 4px">/</span>
+          <span class="badge b-put" style="font-size:10px;margin-right:2px">P</span><strong>$${putStrike}</strong>
+        </td>
+        <td>${esc(expiry)}</td>
+        <td>Long</td>
+        <td>${qty}</td>
+        <td>${dteHtml}</td>
+        <td>${netDeltaHtml}</td>
+        <td>${ulHtml}</td>
+        <td>—</td>
+        <td>${collarPnlHtml}</td>
+        <td>${hdrBadge} <span class="badge" style="background:rgba(168,85,247,.18);color:#a855f7;font-size:10px">COLLAR</span></td>
+        <td colspan="3"></td>`;
+      tbody.appendChild(hdrTr);
+    }
+
     const flagged = p.flagged;
     const nFlags  = (p.reasons||[]).length;
     const rowCls  = flagged ? (nFlags >= 3 ? 'danger-row' : 'warn-row') : 'ok-row';
@@ -2300,8 +2426,13 @@ function renderTable() {
     const tr = document.createElement('tr');
     tr.className = rowCls;
     if (isHidden) tr.style.display = 'none';
+    const isCollarLeg = p.spread_id && _collars.has(p.spread_id);
+    if (isCollarLeg) {
+      tr.dataset.collarId = p.spread_id;
+      if (_collarCollapsed.has(p.spread_id)) tr.style.display = 'none';
+    }
     tr.innerHTML = `
-      <td><b style="${symColor}">${esc(p.symbol)}</b></td>
+      <td style="${isCollarLeg ? 'padding-left:22px' : ''}"><b style="${symColor}">${esc(p.symbol)}</b>${isCollarLeg ? '<br><span style="font-size:10px;color:#a855f7">collar</span>' : ''}</td>
       <td>${esc((p.option_type||'').toUpperCase())}</td>
       <td>$${parseFloat(p.strike||0).toFixed(2)}</td>
       <td>${esc(p.expiry||'')}</td>
@@ -2493,6 +2624,18 @@ function _toggleHide(posKey, checked, snapshot, trEl) {
 }
 // ────────────────────────────────────────────────────────────────────────────
 
+// ── Collar expand/collapse ────────────────────────────────────────────────────
+const _collarCollapsed = new Set(); // spread_ids that are currently collapsed
+
+function _toggleCollar(sid) {
+  const collapsing = !_collarCollapsed.has(sid);
+  if (collapsing) _collarCollapsed.add(sid); else _collarCollapsed.delete(sid);
+  document.querySelectorAll(`tr[data-collar-id]`).forEach(tr => {
+    if (tr.dataset.collarId === sid) tr.style.display = collapsing ? 'none' : '';
+  });
+  const arrow = document.querySelector(`[data-collar-arrow="${sid}"]`);
+  if (arrow) arrow.style.transform = collapsing ? 'rotate(-90deg)' : 'rotate(0deg)';
+}
 // ── Alert system ─────────────────────────────────────────────────────────────
 const _LS_ALERT_KEY = 'optionAlerts';
 let _alerts = {};          // posKey -> {priceDir, priceVal, deltaDir, deltaVal, condition}
@@ -4874,7 +5017,10 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             return Response(json.dumps({"error": f"Unknown strat: {strat}"}), status=400, mimetype="application/json")
 
         # Look up cost basis from DB (CC only); fall back to UI-supplied value if DB has none
-        ui_cost_basis = float(body.get("cost_basis") or 0)
+        try:
+            ui_cost_basis = float(body.get("cost_basis") or 0)
+        except (TypeError, ValueError):
+            ui_cost_basis = 0.0
         ul_cost_basis = 0.0
         if strat == "CC":
             ul_cost_basis = get_ul_cost_basis_from_db(ticker)
@@ -5405,10 +5551,14 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                 if sym in open_tickers:
                     continue
                 opt = (r["option_type"] or "call").lower()
+                try:
+                    cb = float(r["ul_cost_basis"] or 0)
+                except (TypeError, ValueError):
+                    cb = 0.0
                 result.append({
                     "symbol": sym,
                     "strat": "CSP" if opt == "put" else "CC",
-                    "ul_cost_basis": r["ul_cost_basis"] or 0,
+                    "ul_cost_basis": cb,
                     "qty": int(r["qty"] or 1),
                     "ul_price": get_underlying_price(sym),
                 })
@@ -5830,6 +5980,7 @@ def get_key_dates(ticker: str) -> dict:
     t = yf.Ticker(ticker)
 
     # ── Earnings date (skip for ETFs — they have no earnings calendar) ─────────
+    all_cal_dates = []  # every earnings date the calendar knows about, past or future
     try:
         fi_check = t.fast_info
         # ETFs report quoteType as "ETF"; skip earnings lookup to avoid quoteSummary 404s
@@ -5847,6 +5998,7 @@ def get_key_dates(ticker: str) -> dict:
         for d in dates:
             try:
                 dt = d.date() if hasattr(d, "date") else datetime.date.fromisoformat(str(d)[:10])
+                all_cal_dates.append(dt)
                 if dt >= today:
                     future.append(dt)
             except Exception:
@@ -5857,20 +6009,24 @@ def get_key_dates(ticker: str) -> dict:
     except Exception:
         pass
 
-    # Estimate earnings if not found: last earnings + ~91 days (skip for ETFs)
+    # Estimate earnings if not found: anchor off the most recent *report* date
+    # + ~91 days (one quarter). Prefer the calendar's own past earnings date
+    # over quarterly_income_stmt, whose columns are fiscal quarter-end dates
+    # (not report dates) and understate the gap to the next report by weeks.
     if result["earnings_source"] != "confirmed":
         try:
             if getattr(t.fast_info, "quote_type", "").upper() == "ETF":
                 raise StopIteration
-            hist_earnings = []
-            fin = t.quarterly_income_stmt
-            if fin is not None and not fin.empty:
-                for col in fin.columns:
-                    try:
-                        dt = col.date() if hasattr(col, "date") else datetime.date.fromisoformat(str(col)[:10])
-                        hist_earnings.append(dt)
-                    except Exception:
-                        pass
+            hist_earnings = list(all_cal_dates)
+            if not hist_earnings:
+                fin = t.quarterly_income_stmt
+                if fin is not None and not fin.empty:
+                    for col in fin.columns:
+                        try:
+                            dt = col.date() if hasattr(col, "date") else datetime.date.fromisoformat(str(col)[:10])
+                            hist_earnings.append(dt)
+                        except Exception:
+                            pass
             if hist_earnings:
                 last = max(hist_earnings)
                 estimated = last + datetime.timedelta(days=91)
@@ -6045,14 +6201,12 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> str | None:
     log.info("Uploading %s to NotebookLM notebook %s ...", file_path, notebook_id)
     try:
         async with NotebookLMClient.from_storage() as client:
-            # Delete previous source for this ticker by tracked ID (no GET_NOTEBOOK needed)
-            prev_id = _last_source_ids.pop(uploading_ticker, None) if uploading_ticker else None
-            if prev_id:
-                try:
-                    await client.sources.delete(notebook_id, prev_id)
-                    log.info("[cleanup] Deleted previous source %s for %s", prev_id, uploading_ticker)
-                except Exception as exc:
-                    log.warning("[cleanup] Could not delete previous source %s: %s", prev_id, exc)
+            # Sweep any leaked source for this ticker (or aged-out sources from other
+            # tickers) before uploading. Catches dupes left behind when a previous
+            # run's delete-after-query never fired (process restart, crashed mid-query,
+            # etc.) — the in-memory _last_source_ids dict alone can't recover from that.
+            _last_source_ids.pop(uploading_ticker, None) if uploading_ticker else None
+            await _purge_stale_ticker_sources(client, notebook_id, uploading_ticker)
 
             # wait=False avoids the GET_NOTEBOOK polling that times out
             source = await client.sources.add_file(notebook_id, file_path, wait=False)
