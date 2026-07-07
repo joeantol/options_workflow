@@ -1,0 +1,9 @@
+.env
+.env.pushover
+.claude/
+.fidelity_session/
+__pycache__/
+logs/
+*.log
+.analysis_cache.json
+.unborn_cache.json

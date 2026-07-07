@@ -4705,7 +4705,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         return None
 
     def _build_multiplier_files_html() -> str:
-        MDIR = Path("/Users/joeandbabs/Documents/retirement/options")
+        MDIR = Path("/Users/joeandbabs/work/retirement/options")
         today = datetime.date.today()
         weekday = today.weekday()  # 0=Mon … 6=Sun
 
