@@ -42,6 +42,8 @@ import threading
 from functools import wraps
 from pathlib import Path
 
+import greeks_pricing
+
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env")
@@ -369,6 +371,13 @@ def get_all_open_positions(ticker: str | None = None) -> list[dict]:
             p.notes,
             p.spread_id,
             COALESCE(p.ul_cost_basis, 0)                           AS ul_cost_basis,
+            p.entry_iv,
+            p.entry_underlying_price,
+            p.entry_delta,
+            p.entry_gamma,
+            p.entry_theta,
+            p.entry_vega,
+            p.entry_snapshot_at,
             SUM(CASE WHEN t.action = 'sell' THEN  t.quantity
                      WHEN t.action = 'buy'  THEN -t.quantity
                      ELSE 0 END)                                    AS net_qty,
@@ -401,17 +410,59 @@ def get_all_open_positions(ticker: str | None = None) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def get_chain_net_cash(spread_id, fallback_ticker: str | None = None) -> dict:
+# Mirrors the journal's autoComm/autoFees (templates/index.html, "Auto fee /
+# commission calculation (Fidelity schedule)") exactly, so a PROJECTED roll's
+# commission/fee estimate lines up with what the journal would actually record
+# once the trades are entered for real. Keep these two in sync if the schedule
+# ever changes on the journal side.
+_FEE_INDEX_SYMS = {"SPX", "SPXW", "XSP", "NDX", "NDXP", "VIX", "VIXW", "RUT", "RUTW", "MNX", "MNXW"}
+_FEE_COMM_RATE  = 0.65      # $ per contract
+_FEE_ORF_RATE   = 0.03      # $ per contract — Options Regulatory Fee (all options)
+_FEE_SEC_RATE   = 0.000020  # $ per $ of principal — SRO/SEC assessment (sell orders only)
+_FEE_INDEX_FEE  = 0.25      # $ per contract — index/proprietary surcharge
+
+
+def auto_comm(action: str, price: float, qty: int, is_close: bool) -> float:
+    """Estimated commission for a trade that hasn't happened yet, per the same
+    schedule the journal auto-fills with. Fidelity waives commission on a
+    buy-to-close at $0.65/share or under."""
+    if qty <= 0:
+        return 0.0
+    if is_close and action == "buy" and price <= _FEE_COMM_RATE:
+        return 0.0
+    return round(_FEE_COMM_RATE * qty, 2)
+
+
+def auto_fees(action: str, price: float, qty: int, symbol: str) -> float:
+    """Estimated regulatory fees for a trade that hasn't happened yet, per the
+    same schedule the journal auto-fills with."""
+    if qty <= 0:
+        return 0.0
+    principal = price * 100 * qty
+    fees = _FEE_ORF_RATE * qty
+    if action == "sell":
+        fees += _FEE_SEC_RATE * principal
+    if (symbol or "").upper().strip() in _FEE_INDEX_SYMS:
+        fees += _FEE_INDEX_FEE * qty
+    return round(fees, 2)
+
+
+def get_chain_net_cash(spread_id, fallback_pos_id: int | None = None) -> dict:
     """
     Return a breakdown of net cash for all positions sharing the same spread_id.
-    If spread_id is NULL, falls back to all positions for fallback_ticker.
+    If spread_id is NULL, falls back to just fallback_pos_id's own trades (a
+    standalone position with no roll chain) — NOT the ticker's whole trading
+    history, which would silently pull in unrelated past chains on the same symbol.
+
+    Commission and fees are netted into collected/paid per trade, matching the
+    journal's CF_SQL, so this figure reconciles with the journal's own totals.
 
     Returns dict with:
-        net_cash     : float  — (collected − paid) × 100
-        collected    : float  — total sell proceeds × 100
-        paid         : float  — total buy costs × 100
+        net_cash     : float  — (collected − paid), each already net of commission/fees
+        collected    : float  — net sell proceeds (× 100, minus commission/fees)
+        paid         : float  — net buy cost (× 100, plus commission/fees)
         num_positions: int    — number of positions in the chain
-        scoped_by    : str    — 'spread_id' or 'symbol' (indicates which filter was used)
+        scoped_by    : str    — 'spread_id' or 'position' (indicates which filter was used)
     Positive net_cash means net credit received.
     """
     import sqlite3
@@ -425,18 +476,20 @@ def get_chain_net_cash(spread_id, fallback_ticker: str | None = None) -> dict:
         param  = spread_id
         scoped = "spread_id"
         log.debug("get_chain_net_cash: using spread_id=%r", spread_id)
-    elif fallback_ticker:
-        where  = "UPPER(p.symbol) = UPPER(?)"
-        param  = fallback_ticker
-        scoped = "symbol"
-        log.debug("get_chain_net_cash: spread_id is NULL, falling back to symbol=%r", fallback_ticker)
+    elif fallback_pos_id is not None:
+        where  = "p.id = ?"
+        param  = fallback_pos_id
+        scoped = "position"
+        log.debug("get_chain_net_cash: spread_id is NULL, falling back to pos_id=%r", fallback_pos_id)
     else:
         return {"net_cash": 0.0, "collected": 0.0, "paid": 0.0, "num_positions": 0, "scoped_by": "none"}
 
+    # Cash flow netted per trade against commission/fees — mirrors the journal's CF_SQL
+    # exactly (sell proceeds minus fees; buy cost plus fees) so totals reconcile.
     sql = f"""
         SELECT
-            SUM(CASE WHEN t.action = 'sell' THEN  t.price * t.quantity ELSE 0 END) AS gross_collected,
-            SUM(CASE WHEN t.action = 'buy'  THEN  t.price * t.quantity ELSE 0 END) AS gross_paid,
+            SUM(CASE WHEN t.action = 'sell' THEN (t.price * t.quantity * 100) - t.commission - t.fees ELSE 0 END) AS collected,
+            SUM(CASE WHEN t.action = 'buy'  THEN (t.price * t.quantity * 100) + t.commission + t.fees ELSE 0 END) AS paid,
             COUNT(DISTINCT p.id) AS num_positions
         FROM positions p
         JOIN trades t ON t.position_id = p.id
@@ -446,8 +499,8 @@ def get_chain_net_cash(spread_id, fallback_ticker: str | None = None) -> dict:
     # Second query: include test trades to get simulated (test-close) PnL
     sql_sim = f"""
         SELECT
-            SUM(CASE WHEN t.action = 'sell' THEN  t.price * t.quantity ELSE 0 END) AS gross_collected,
-            SUM(CASE WHEN t.action = 'buy'  THEN  t.price * t.quantity ELSE 0 END) AS gross_paid
+            SUM(CASE WHEN t.action = 'sell' THEN (t.price * t.quantity * 100) - t.commission - t.fees ELSE 0 END) AS collected,
+            SUM(CASE WHEN t.action = 'buy'  THEN (t.price * t.quantity * 100) + t.commission + t.fees ELSE 0 END) AS paid
         FROM positions p
         JOIN trades t ON t.position_id = p.id
         WHERE {where}
@@ -457,11 +510,11 @@ def get_chain_net_cash(spread_id, fallback_ticker: str | None = None) -> dict:
         row     = con.execute(sql,     (param,)).fetchone()
         row_sim = con.execute(sql_sim, (param,)).fetchone()
         con.close()
-        collected = round(float(row[0] or 0.0) * 100, 2)
-        paid      = round(float(row[1] or 0.0) * 100, 2)
+        collected = round(float(row[0] or 0.0), 2)
+        paid      = round(float(row[1] or 0.0), 2)
         n_pos     = int(row[2] or 0)
-        sim_collected = round(float(row_sim[0] or 0.0) * 100, 2)
-        sim_paid      = round(float(row_sim[1] or 0.0) * 100, 2)
+        sim_collected = round(float(row_sim[0] or 0.0), 2)
+        sim_paid      = round(float(row_sim[1] or 0.0), 2)
         has_test  = (sim_collected != collected or sim_paid != paid)
         log.debug("get_chain_net_cash: collected=%.2f paid=%.2f positions=%d has_test=%s",
                   collected, paid, n_pos, has_test)
@@ -831,6 +884,136 @@ def get_option_greeks_batch(token: str, account_id: str, osi_symbols: list[str])
     return result
 
 
+def compute_decay_signals(
+    pos: dict,
+    dte: int | None,
+    underlying: float | None,
+    current_price: float | None,
+    delta: float | None,
+    gamma: float | None,
+    opt_theta: float | None,
+    opt_vega: float | None,
+    current_iv: float | None,
+) -> dict:
+    """
+    Greeks-based decay-quality analysis for a short option position — replaces
+    the flat "60% profit captured" rule of thumb with a P&L decomposition that
+    distinguishes genuine time decay from a price move that could reverse.
+
+    Decomposition method: sequential re-pricing ("waterfall" attribution) using
+    greeks_pricing's BAW pricer, not a linear Taylor expansion off point Greeks —
+    each step is an exact re-price along one dimension, so there's no truncation
+    error to worry about getting the cross-terms (vanna, charm) exactly right in
+    the additive breakdown. Standalone vanna/charm are still computed and
+    returned as secondary risk flags, per the plan (their marginal value here is
+    real but smaller than spot/time/vol attribution, and they're noisier on the
+    thin, wide-spread small-cap chains several of these positions are on).
+
+    Returns a dict; every field the entry snapshot or a live quote can't support
+    is None — the UI renders that as "--", not a guess.
+    """
+    out = {
+        "spot_component": None, "time_component": None, "vega_component": None,
+        "residual": None, "decay_quality": None, "capital_efficiency": None,
+        "dollar_gamma": None, "gamma_risk": False, "theta_per_day": None,
+        "vanna": None, "charm": None, "note": None,
+    }
+
+    net_qty = pos.get("net_qty") or 0
+    qty = abs(net_qty)
+
+    # Gamma-risk zone, theta/day, and capital efficiency only need CURRENT data —
+    # compute regardless of whether an entry snapshot exists for this position.
+    if gamma is not None and underlying:
+        out["dollar_gamma"] = round(gamma * (underlying ** 2) / 100.0 * 100 * qty, 2)
+    if delta is not None and dte is not None:
+        out["gamma_risk"] = bool(dte <= 14 and abs(delta) >= 0.30)
+    if opt_theta is not None and qty:
+        out["theta_per_day"] = round(opt_theta * 100 * qty, 2)
+    if out["theta_per_day"] is not None and current_price and qty:
+        capital_at_risk = current_price * 100 * qty
+        if capital_at_risk > 0:
+            out["capital_efficiency"] = round(abs(out["theta_per_day"]) / capital_at_risk, 5)
+
+    entry_iv = pos.get("entry_iv")
+    entry_S  = pos.get("entry_underlying_price")
+    if entry_iv is None or entry_S is None:
+        out["note"] = "no entry snapshot captured for this position"
+        return out
+
+    strike      = pos.get("strike")
+    expiry      = pos.get("expiry")
+    option_type = (pos.get("option_type") or "").lower()
+    avg_price   = pos.get("avg_price")
+    if not (strike and expiry and option_type in ("call", "put")):
+        out["note"] = "incomplete position data"
+        return out
+    if current_price is None or underlying is None or current_iv is None:
+        out["note"] = "missing live quote"
+        return out
+
+    try:
+        today = datetime.date.today()
+        expiry_d = datetime.date.fromisoformat(expiry)
+        T_now = max((expiry_d - today).days, 0) / 365.0
+    except (ValueError, TypeError):
+        out["note"] = "bad expiry"
+        return out
+    if T_now <= 0:
+        out["note"] = "expired"
+        return out
+
+    entry_dt_str = (pos.get("entry_snapshot_at") or pos.get("entry_date") or "")[:10]
+    try:
+        entry_d = datetime.date.fromisoformat(entry_dt_str)
+        T_entry = max((expiry_d - entry_d).days, 1) / 365.0
+    except (ValueError, TypeError):
+        out["note"] = "bad entry date"
+        return out
+
+    is_call = option_type == "call"
+    q = greeks_pricing.dividend_yield_from_quarterly(pos.get("dividend_amount"), underlying)
+
+    try:
+        V0 = greeks_pricing.price(entry_S, strike, T_entry, entry_iv, is_call, q=q)     # entry, theoretical
+        V1 = greeks_pricing.price(underlying, strike, T_entry, entry_iv, is_call, q=q)  # + spot moves
+        V2 = greeks_pricing.price(underlying, strike, T_now, entry_iv, is_call, q=q)    # + time passes
+        V3 = greeks_pricing.price(underlying, strike, T_now, current_iv, is_call, q=q)  # + vol moves (== current theoretical)
+    except (ValueError, OverflowError, ZeroDivisionError):
+        out["note"] = "pricing error"
+        return out
+
+    spot_component = V1 - V0
+    time_component = V2 - V1
+    vega_component = V3 - V2
+    residual       = current_price - V3   # actual vs theoretical — bid/ask noise, model gap
+
+    out["spot_component"] = round(spot_component, 4)
+    out["time_component"] = round(time_component, 4)
+    out["vega_component"] = round(vega_component, 4)
+    out["residual"]       = round(residual, 4)
+
+    # Decay quality: what share of the position's total favorable move (price
+    # cheapening, good for a short seller) is attributable to time decay
+    # specifically, vs a spot/vol move that could reverse. 0 when there's no
+    # favorable move yet to attribute (a real answer, not a missing one).
+    total_move = (current_price - avg_price) if avg_price is not None else (V3 - V0) + residual
+    price_drop = -total_move
+    if price_drop > 0 and time_component < 0:
+        out["decay_quality"] = round(min(1.0, max(0.0, (-time_component) / price_drop)), 3)
+    elif price_drop <= 0:
+        out["decay_quality"] = 0.0
+
+    try:
+        g = greeks_pricing.greeks(underlying, strike, T_now, current_iv, is_call, q=q)
+        out["vanna"] = round(g["vanna"], 5) if g.get("vanna") is not None else None
+        out["charm"] = round(g["charm"], 5) if g.get("charm") is not None else None
+    except Exception:
+        pass
+
+    return out
+
+
 def get_eval_data(
     token: str,
     account_id: str,
@@ -962,9 +1145,14 @@ def get_eval_data(
 
         osi = build_osi_symbol(sym, expiry, opt_type, strike).replace(" ", "")
 
-        # Delta from greeks endpoint
+        # Greeks + IV from the greeks endpoint (gamma/theta/vega/IV needed for the
+        # entry-vs-current decay decomposition; delta was already used elsewhere).
         greeks = greeks_data.get(osi, {})
         delta: float | None = _to_f(greeks.get("delta"))
+        gamma: float | None = _to_f(greeks.get("gamma"))
+        opt_theta: float | None = _to_f(greeks.get("theta"))
+        opt_vega: float | None = _to_f(greeks.get("vega"))
+        current_iv: float | None = _to_f(greeks.get("impliedVolatility"))
 
         # Current price: prefer mid=(bid+ask)/2, then last
         quote = quotes.get(osi, {})
@@ -986,10 +1174,13 @@ def get_eval_data(
         pct_pnl: float | None = None
         if current_price is not None and avg_price is not None and avg_price != 0:
             qty = abs(net_qty)
+            # avg_price is signed: positive = credit received (short), negative =
+            # debit paid (long) — see read_open_position(). For longs it's already
+            # negative, so adding it (not subtracting) nets out the debit paid.
             abs_pnl = (
-                (avg_price - current_price) if net_qty > 0 else (current_price - avg_price)
+                (avg_price - current_price) if net_qty > 0 else (current_price + avg_price)
             ) * 100 * qty
-            pct_pnl = abs_pnl / (avg_price * 100 * qty) * 100
+            pct_pnl = abs_pnl / (abs(avg_price) * 100 * qty) * 100
 
         reasons: list[str] = []
 
@@ -1078,10 +1269,16 @@ def get_eval_data(
         else:
             pos_hypo_cash = None
 
+        decay = compute_decay_signals(pos, dte, underlying, current_price, delta, gamma, opt_theta, opt_vega, current_iv)
+
         result_positions.append({
             **pos,
             "dte": dte,
             "delta": delta,
+            "gamma": gamma,
+            "opt_theta": opt_theta,
+            "opt_vega": opt_vega,
+            "current_iv": current_iv,
             "underlying": underlying,
             "atr": atr_val,
             "buffer": buffer,
@@ -1095,6 +1292,7 @@ def get_eval_data(
             "reasons": reasons,
             "flagged": bool(reasons),
             "dividend_amount": dividend_amount,
+            "decay": decay,
         })
 
     flagged_count = sum(1 for p in result_positions if p["flagged"])
@@ -1168,17 +1366,23 @@ def eval_open_positions(token: str, account_id: str, ticker: str | None = None) 
         )
 
 
-def _parse_recommended_option(text: str, chain_rows: list[dict]) -> dict | None:
+def _parse_recommended_option(text: str, chain_rows: list[dict], prefer_type: str | None = None) -> dict | None:
     """
     Try to extract the recommended strike and expiry from NotebookLM response text
     and return the matching chain row, or None if not found.
+
+    prefer_type ("CALL"/"PUT"), when given, makes a wrong-type row effectively
+    disqualifying during matching — without it, a same-strike/same-expiry row of
+    the OTHER type can win purely because it happens to appear earlier in
+    chain_rows (calls are listed before puts), which is a real option contract
+    but not the one that was actually recommended.
     """
     # Extract strike: $12.50, $12, 12.50 strike, strike of 12.50, etc.
     strike_match = re.search(
         r'\$\s*(\d+(?:\.\d+)?)\s*strike'
         r'|strike\s+(?:of\s+|price\s+(?:of\s+)?)?\$?\s*(\d+(?:\.\d+)?)'
         r'|\$\s*(\d+(?:\.\d+)?)\s+(?:put|call|strike)'
-        r'|\b(\d+(?:\.\d+)?)\s+(?:call|put)\b',
+        r'|\b(\d+(?:\.\d+)?)\s+(?:calls?|puts?)\b',
         text, re.IGNORECASE
     )
     if not strike_match:
@@ -1215,7 +1419,8 @@ def _parse_recommended_option(text: str, chain_rows: list[dict]) -> dict | None:
         if target_expiry:
             break
 
-    # Find best matching row: must match strike exactly; prefer exact expiry too
+    # Find best matching row: must match strike exactly; prefer exact expiry too;
+    # a type mismatch (when prefer_type is given) is effectively disqualifying.
     best = None
     best_dist = float("inf")
     for row in chain_rows:
@@ -1225,7 +1430,8 @@ def _parse_recommended_option(text: str, chain_rows: list[dict]) -> dict | None:
             continue
         dist = abs(row_strike - target_strike)
         expiry_match = (target_expiry is None or row.get("expiry") == target_expiry)
-        score = dist + (0 if expiry_match else 1000)
+        type_match = (prefer_type is None or str(row.get("option_type", "")).upper() == prefer_type.upper())
+        score = dist + (0 if expiry_match else 1000) + (0 if type_match else 10000)
         if score < best_dist:
             best_dist = score
             best = row
@@ -1261,7 +1467,7 @@ def _parse_recommended_option(text: str, chain_rows: list[dict]) -> dict | None:
             opt_price = price_match.group(1) if price_match else None
             # Use ul_price from chain if available
             ul_price = chain_rows[0].get("ul_price") if chain_rows else None
-            opt_type = chain_rows[0].get("option_type", "CALL") if chain_rows else "CALL"
+            opt_type = prefer_type or (chain_rows[0].get("option_type", "CALL") if chain_rows else "CALL")
             try:
                 today = datetime.date.today()
                 dte = (datetime.date.fromisoformat(target_expiry) - today).days
@@ -1463,7 +1669,7 @@ async def run_roll_for_position(
     open_positions: list[dict],
     notebook_id: str,
     pos_key: str | None = None,
-    num_expirations: int = 10,
+    max_days_out: int = 90,
 ) -> dict:
     """
     Full ROLL workflow for one position (web mode):
@@ -1483,7 +1689,20 @@ async def run_roll_for_position(
                 "text": "",
                 "ticker": ticker,
             }
-        expirations = all_expirations[:num_expirations]
+        # Include every expiration within max_days_out, not a fixed count — heavily
+        # optioned names (MSFT, weeklies) can have 10+ expirations inside a single
+        # month, while thin names have only a handful in 3 months. Cap at 40 as a
+        # sanity ceiling against pathological (e.g. daily-expiry) chains.
+        _cutoff = datetime.date.today() + datetime.timedelta(days=max_days_out)
+        def _parse_exp(_e: str) -> datetime.date | None:
+            try:
+                return datetime.date.fromisoformat(_e)
+            except (ValueError, TypeError):
+                return None
+        expirations = [
+            e for e in all_expirations
+            if (_d := _parse_exp(e)) is not None and _d <= _cutoff
+        ][:40] or all_expirations[:10]
 
         all_rows: list[dict] = []
         for exp_date in expirations:
@@ -1561,7 +1780,7 @@ async def run_roll_for_position(
             else:
                 log.warning("No position matched pos_key=%r in open_positions", pos_key)
 
-        chain = get_chain_net_cash(spread_id, fallback_ticker=ticker)
+        chain = get_chain_net_cash(spread_id, fallback_pos_id=matched_pos.get("id") if matched_pos else None)
         current_leg_price = float(matched_pos["current_price"]) if matched_pos and matched_pos.get("current_price") is not None else None
 
         # Give the source time to finish processing before querying (wait=False upload)
@@ -1586,24 +1805,175 @@ async def run_roll_for_position(
 
         rec = _detect_recommendation(text)
 
-        # Hard PnL guard: if the projected chain PnL is negative, NotebookLM
-        # recommended a roll that doesn't recover the chain losses — force HOLD.
-        if rec == "ROLL":
-            pnl_match = re.search(
-                r"Projected Net Chain PnL[^:\n]*:\s*\*{0,2}\s*([+-]?\$?[\d,]+\.?\d*)",
-                text, re.IGNORECASE
-            )
-            if pnl_match:
+        # Confirmed BTC/STO prices from the exact option chain snapshot uploaded to
+        # NotebookLM — used below for the hard PnL guard, and returned so the
+        # Execution Instructions can show verified prices next to Action 1/2
+        # instead of whatever the LLM estimated (it sometimes pulls a stale-ish
+        # number from PLAN/REVIEW prose rather than reading the uploaded chain).
+        btc_chain_price = sto_chain_price = None
+        sto_chain_desc  = None
+        projected_roll_pnl = None
+        if rec == "ROLL" and pos_qty and matched_pos:
+            _adapted_rows = [
+                {
+                    "strike": r["strike_price"], "expiry": r["expiration_date"],
+                    "option_type": r["option_type"], "symbol": ticker,
+                    "mid_price": r.get("mid_price"), "last": r.get("last"),
+                }
+                for r in all_rows
+            ]
+
+            # Current (BTC) leg's price from the same chain snapshot.
+            try:
+                _cur_strike = float(matched_pos.get("strike"))
+            except (TypeError, ValueError):
+                _cur_strike = None
+            _cur_type   = str(matched_pos.get("option_type", "")).upper()
+            _cur_expiry = matched_pos.get("expiry")
+            for _r in _adapted_rows:
                 try:
-                    projected = float(pnl_match.group(1).replace("$", "").replace(",", ""))
-                    if projected < 0:
-                        rec = "HOLD"
-                        log.warning(
-                            "Overriding ROLL→HOLD for %s: projected chain PnL %.2f < 0",
-                            ticker, projected
-                        )
-                except ValueError:
-                    pass
+                    _r_strike = float(_r.get("strike") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if (_r.get("option_type") == _cur_type and _r_strike == _cur_strike
+                        and _r.get("expiry") == _cur_expiry):
+                    try:
+                        btc_chain_price = float(_r.get("mid_price") or _r.get("last") or 0) or None
+                    except (TypeError, ValueError):
+                        btc_chain_price = None
+                    break
+
+            # New (STO) leg's price — whatever NotebookLM recommended, matched
+            # against the same chain snapshot.
+            #
+            # Execution Instructions consistently list "1. BTC ... 2. STO ..."
+            # in that order, and the BTC line always restates the CURRENT leg's
+            # exact strike/expiry verbatim (e.g. "BTC 4x LULU 115.00 Put exp
+            # 2026-07-10") before the STO line ever states the actual new one.
+            # A naive first-match search over the whole text reliably grabs the
+            # BTC line's strike instead — not just when it happens to produce an
+            # exact current-leg match (the old guard below only caught that
+            # narrow case), but whenever chain-matching then resolves to some
+            # OTHER type/expiry at that same wrong strike, which looks distinct
+            # from the current leg without actually being the recommendation.
+            # Scope the search to the STO/"sell to open" sentence first so this
+            # can't happen. There can be more than one "STO" mention (e.g. a
+            # summary line like "(simultaneous BTC/STO)" before the actual
+            # detailed one) — try each candidate in turn and keep the first
+            # that actually yields a strike, rather than just the first mention.
+            _rec_opt = None
+            _sto_snippet = None
+            for _sto_m in re.finditer(r'(?:sell\s+to\s+open|\bSTO\b)[^\n]{0,150}', text, re.IGNORECASE):
+                _candidate = _parse_recommended_option(_sto_m.group(0), _adapted_rows)
+                if _candidate and _candidate.get("strike") is not None:
+                    _rec_opt = _candidate
+                    _sto_snippet = _sto_m.group(0)
+                    break
+
+            if _rec_opt and _sto_snippet:
+                # The snippet almost always states the type explicitly ("...105.00
+                # Put exp..."); re-run matching with that as a hard preference so a
+                # same-strike/same-expiry row of the OTHER type can't win the tie
+                # (chain rows list calls before puts, so it otherwise would).
+                # Rolls also essentially never change instrument type, so the
+                # current leg's own type is a solid fallback if the snippet
+                # doesn't spell it out.
+                _type_m = re.search(r'\b(call|put)s?\b', _sto_snippet, re.IGNORECASE)
+                _prefer_type = _type_m.group(1).upper() if _type_m else _cur_type
+                _rec_opt = _parse_recommended_option(_sto_snippet, _adapted_rows, prefer_type=_prefer_type) or _rec_opt
+
+            if not _rec_opt:
+                _rec_opt = _parse_recommended_option(text, _adapted_rows, prefer_type=_cur_type)
+            # Still landed on the current leg's own strike (whole-text fallback
+            # only) — strip those mentions and retry so it lands on the next
+            # distinct strike/expiry actually being recommended.
+            if (_rec_opt and not _sto_snippet and _cur_strike is not None
+                    and str(_rec_opt.get("option_type", "")).upper() == _cur_type
+                    and _rec_opt.get("expiry") == _cur_expiry):
+                try:
+                    _same_strike = float(_rec_opt.get("strike") or -1) == _cur_strike
+                except (TypeError, ValueError):
+                    _same_strike = False
+                if _same_strike:
+                    _masked_text = re.sub(
+                        rf'{_cur_strike:g}(\.0+)?\s*(?:CALL|PUT)', '', text, flags=re.IGNORECASE
+                    )
+                    if _cur_expiry:
+                        _masked_text = _masked_text.replace(_cur_expiry, '')
+                    _rec_opt = _parse_recommended_option(_masked_text, _adapted_rows, prefer_type=_cur_type)
+                    # Still landed on the current leg (or nothing distinct found) —
+                    # there's no genuinely new leg to confirm a price for.
+                    if (_rec_opt and str(_rec_opt.get("option_type", "")).upper() == _cur_type
+                            and _rec_opt.get("expiry") == _cur_expiry):
+                        try:
+                            if float(_rec_opt.get("strike") or -1) == _cur_strike:
+                                _rec_opt = None
+                        except (TypeError, ValueError):
+                            _rec_opt = None
+            if _rec_opt:
+                try:
+                    sto_chain_price = float(
+                        _rec_opt.get("mid_price") or _rec_opt.get("last")
+                        or _rec_opt.get("opt_price") or 0
+                    ) or None
+                except (TypeError, ValueError):
+                    sto_chain_price = None
+                if sto_chain_price:
+                    sto_chain_desc = (
+                        f"{ticker} {_rec_opt.get('strike')} "
+                        f"{str(_rec_opt.get('option_type','')).upper()} "
+                        f"exp {_rec_opt.get('expiry')}"
+                    )
+
+            # Full projected roll-chain PnL: net cash to date, minus the real cost
+            # to BTC the current leg, plus the new leg's STO credit, minus the cost
+            # to close that new leg at 40% of its own premium (60% profit capture) —
+            # i.e. "if I execute this exact roll and then eventually take my usual
+            # profit on the new leg, is the WHOLE chain profitable." Computed from
+            # the same verified chain-snapshot prices as the Confirmed Prices line,
+            # not from NotebookLM's own (previously unreliable) arithmetic. This also
+            # doubles as the hard PnL guard: a ROLL recommendation that fails this
+            # check gets forced to HOLD.
+            #
+            # Commission/fees on the three hypothetical legs (BTC current, STO new,
+            # eventual BTC of new at 40%) are estimated via the journal's own
+            # Fidelity fee schedule (auto_comm/auto_fees) so this lines up with what
+            # the journal will actually record once the trades are entered for real
+            # — chain["net_cash"] already has the real leg's fees baked in, so only
+            # these three projected legs need it added here.
+            roll_btc_cost = roll_sto_credit = roll_close_cost = roll_close_price = None
+            if sto_chain_price:
+                _btc_price = btc_chain_price if btc_chain_price is not None else current_leg_price
+                _btc_price = _btc_price or 0.0
+                roll_btc_cost = round(
+                    _btc_price * 100 * pos_qty
+                    + auto_comm("buy", _btc_price, pos_qty, is_close=True)
+                    + auto_fees("buy", _btc_price, pos_qty, ticker),
+                    2,
+                )
+                _adj_net = round(chain["net_cash"] - roll_btc_cost, 2)
+
+                roll_sto_credit = round(
+                    sto_chain_price * 100 * pos_qty
+                    - auto_comm("sell", sto_chain_price, pos_qty, is_close=False)
+                    - auto_fees("sell", sto_chain_price, pos_qty, ticker),
+                    2,
+                )
+                roll_close_price = round(sto_chain_price * 0.40, 4)
+                roll_close_cost = round(
+                    roll_close_price * 100 * pos_qty
+                    + auto_comm("buy", roll_close_price, pos_qty, is_close=True)
+                    + auto_fees("buy", roll_close_price, pos_qty, ticker),
+                    2,
+                )
+                projected_roll_pnl = round(_adj_net + roll_sto_credit - roll_close_cost, 2)
+                if projected_roll_pnl < 0:
+                    rec = "HOLD"
+                    log.warning(
+                        "Overriding ROLL→HOLD for %s: deterministic projected chain PnL "
+                        "%.2f < 0 (recommended premium ~$%.2f)",
+                        ticker, projected_roll_pnl, sto_chain_price
+                    )
 
         return {
             "recommendation": rec,
@@ -1618,6 +1988,14 @@ async def run_roll_for_position(
             "pos_avg_price":   pos_avg_price,
             "pos_qty":         pos_qty,
             "ul_cost_basis":   ul_cost_basis,
+            "btc_chain_price": btc_chain_price,
+            "sto_chain_price": sto_chain_price,
+            "sto_chain_desc":  sto_chain_desc,
+            "projected_roll_pnl": projected_roll_pnl,
+            "roll_btc_cost":    roll_btc_cost,     # incl. estimated commission/fees
+            "roll_sto_credit":  roll_sto_credit,   # incl. estimated commission/fees
+            "roll_close_cost":  roll_close_cost,   # incl. estimated commission/fees
+            "roll_close_price": roll_close_price,  # 40% of sto_chain_price
             "error": None,
         }
 
@@ -1886,12 +2264,13 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
     pointer-events: none;
   }
   .err-tip:hover .err-msg { display: block; }
+  .info-tip { cursor: help; display: inline-block; padding: 2px 4px; margin: -2px -4px; }
   .reasons li { margin-top: 3px; }
   .pnl-pos { color: var(--ok); }
   .pnl-neg { color: var(--danger); }
   .skipped-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin-top: 16px; }
   .skipped-box li { color: var(--muted); font-size: 12px; margin-top: 4px; }
-  .unborn-bar { display:flex; align-items:center; gap:10px; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px 14px; margin-bottom:18px; flex-wrap:wrap; }
+  .unborn-bar { position:relative; display:flex; align-items:center; gap:10px; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px 14px; margin-bottom:18px; flex-wrap:wrap; }
   .unborn-bar label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
   .unborn-bar input[type=text], .unborn-bar input[type=number], .unborn-bar select {
     background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px;
@@ -1963,27 +2342,36 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
     </select>
     <button onclick="findUnborn()">Find</button>
     <span id="unborn-result"></span>
+    <div id="pos-search-wrap" style="display:flex;align-items:center;gap:6px">
+      <label for="pos-search">Search</label>
+      <input type="text" id="pos-search" placeholder="Filter by ticker…" maxlength="10"
+        style="text-transform:uppercase;width:140px" oninput="onPosSearchInput(this.value)">
+      <button id="pos-search-clear" onclick="clearPosSearch()" title="Clear"
+        style="display:none;background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 2px">&#10005;</button>
+    </div>
   </div>
   <div id="unborn-chain"></div>
   <div class="section-title">Open Positions</div>
   <table id="pos-table">
     <thead>
       <tr>
-        <th onclick="sortTable(0)">Symbol</th>
-        <th onclick="sortTable(1)">Type</th>
-        <th onclick="sortTable(2)">Strike</th>
-        <th onclick="sortTable(3)">Expiry</th>
-        <th onclick="sortTable(4)">Side</th>
-        <th onclick="sortTable(5)">Qty</th>
-        <th onclick="sortTable(6)">DTE</th>
-        <th onclick="sortTable(7)">Δ</th>
-        <th onclick="sortTable(8)">U/L Price</th>
-        <th onclick="sortTable(9)">Opt Price</th>
-        <th onclick="sortTable(10)">PnL</th>
-        <th>Status / Flags</th>
-        <th>Action<br><button onclick="resetRecommendations()" style="font-size:10px;padding:2px 7px;margin-top:4px;font-weight:normal">Reset</button></th>
-        <th style="text-align:center">Alert</th>
-        <th style="text-align:center;cursor:pointer" onclick="unhideAll()" title="Click to unhide all">Hide</th>
+        <th data-col="symbol" onclick="sortTable(0)">Symbol</th>
+        <th data-col="type" onclick="sortTable(1)">Type</th>
+        <th data-col="strike" onclick="sortTable(2)">Strike</th>
+        <th data-col="expiry" onclick="sortTable(3)">Expiry</th>
+        <th data-col="side" onclick="sortTable(4)">Side</th>
+        <th data-col="qty" onclick="sortTable(5)">Qty</th>
+        <th data-col="dte" onclick="sortTable(6)">DTE</th>
+        <th data-col="delta" onclick="sortTable(7)">Δ</th>
+        <th data-col="decay" onclick="sortTable(8)" title="Share of the price move since entry attributable to time decay vs. spot/vol movement — replaces the flat 60%-profit rule of thumb">Decay</th>
+        <th data-col="ul_price" onclick="sortTable(9)">U/L Price</th>
+        <th data-col="cost_basis" onclick="sortTable(10)">Cost Basis</th>
+        <th data-col="opt_price" onclick="sortTable(11)">Opt Price</th>
+        <th data-col="pnl" onclick="sortTable(12)">PnL</th>
+        <th data-col="status">Status / Flags</th>
+        <th data-col="action">Action<br><button onclick="resetRecommendations()" style="font-size:10px;padding:2px 7px;margin-top:4px;font-weight:normal">Reset</button></th>
+        <th data-col="alert" style="text-align:center">Alert</th>
+        <th data-col="hide" style="text-align:center;cursor:pointer" onclick="unhideAll()" title="Click to unhide all">Hide</th>
       </tr>
     </thead>
     <tbody id="pos-body"></tbody>
@@ -2055,6 +2443,30 @@ function _ubSort(col) {
   _renderUnbornTable();
 }
 
+// ── Position search (filters Open + Former Positions by ticker) ─────────
+let _posSearch = '';
+function onPosSearchInput(val) {
+  _posSearch = val.trim().toUpperCase();
+  document.getElementById('pos-search-clear').style.display = _posSearch ? '' : 'none';
+  renderTable();
+  _renderFormerTable();
+}
+function clearPosSearch() {
+  document.getElementById('pos-search').value = '';
+  onPosSearchInput('');
+}
+function _alignPosSearch() {
+  const anchor = document.getElementById('last-run');
+  const bar = document.querySelector('.unborn-bar');
+  const wrap = document.getElementById('pos-search-wrap');
+  if (!anchor || !bar || !wrap) return;
+  const left = anchor.getBoundingClientRect().left - bar.getBoundingClientRect().left;
+  wrap.style.position = 'absolute';
+  wrap.style.left = Math.max(0, left) + 'px';
+}
+window.addEventListener('load', _alignPosSearch);
+window.addEventListener('resize', _alignPosSearch);
+
 async function fetchData() {
   document.getElementById('spinner').classList.add('active');
   try {
@@ -2071,10 +2483,12 @@ async function fetchData() {
       if (!html) return;
       const el = document.getElementById('multiplier-files');
       if (el) el.innerHTML = html;
+      _alignPosSearch();
     }).catch(() => {});
     const ts = new Date().toLocaleTimeString('en-US', {hour12: false});
     document.getElementById('last-run').textContent = 'Last Run: ' + ts;
     localStorage.setItem(_LS_AR_LAST, String(Date.now()));
+    _alignPosSearch();
   } catch(e) {
     const bar = document.getElementById('error-bar');
     bar.textContent = 'Refresh failed: ' + e.message;
@@ -2142,6 +2556,97 @@ function fmt(v, digits, prefix='') {
   return v == null ? '—' : prefix + v.toFixed(digits);
 }
 
+// Greeks-based decay-quality cell (replaces the flat 60%-profit rule of thumb).
+// decay_quality: share of the price move since entry attributable to time decay
+// vs. a spot/vol move that could reverse. '—' whenever entry-snapshot data is
+// missing (older positions, or the capture call failed) — never a guess.
+function _decayCellHtml(d, dte, delta, symbol) {
+  if (!d) return '—';
+  const parts = [];
+  if (d.spot_component != null) parts.push(`Spot: ${d.spot_component>=0?'+':''}$${d.spot_component.toFixed(3)}`);
+  if (d.time_component != null) parts.push(`Time: ${d.time_component>=0?'+':''}$${d.time_component.toFixed(3)}`);
+  if (d.vega_component != null) parts.push(`Vol: ${d.vega_component>=0?'+':''}$${d.vega_component.toFixed(3)}`);
+  if (d.residual != null)       parts.push(`Residual: ${d.residual>=0?'+':''}$${d.residual.toFixed(3)}`);
+  if (d.theta_per_day != null)  parts.push(`Theta: $${d.theta_per_day.toFixed(2)}/day`);
+  if (d.capital_efficiency != null) parts.push(`Capital eff: ${(d.capital_efficiency*100).toFixed(3)}%/day`);
+  if (d.dollar_gamma != null)   parts.push(`$Gamma: ${d.dollar_gamma.toFixed(0)}`);
+  if (d.vanna != null)          parts.push(`Vanna: ${d.vanna.toFixed(4)}`);
+  if (d.charm != null)          parts.push(`Charm: ${d.charm.toFixed(4)}/day`);
+  if (d.note && d.decay_quality == null) parts.push(`(${d.note})`);
+  const msg = esc(parts.join('\\n'));
+
+  let gammaBadge = '';
+  if (d.gamma_risk) {
+    const sym    = symbol || 'the stock';
+    const dgStr  = d.dollar_gamma != null ? `$${d.dollar_gamma.toFixed(0)}` : 'unknown';
+    const dteStr = dte != null ? dte : '?';
+    const absD   = delta != null ? Math.abs(delta).toFixed(3) : '?';
+    const gammaMsg = esc([
+      'Gamma = how fast delta (your directional exposure) changes as the stock moves \\u2014 the "convexity" of the position.',
+      'High gamma means small stock moves cause outsized swings in P&L, because your effective exposure is changing under you as the stock moves, not staying fixed like it would for a plain shares position.',
+      '',
+      `This position's $Gamma: ${dgStr} \\u2014 a 1% move in ${sym} would shift your delta exposure by roughly that many dollars.`,
+      '',
+      `Flagged because DTE \\u2264 14 AND |delta| \\u2265 0.30 (this position: ${dteStr} DTE, |delta| ${absD}).`,
+      'That combination matters because gamma accelerates sharply as expiry nears, and is largest for strikes near the money (moderate-to-high delta) \\u2014 so small stock moves swing this position\\u2019s value disproportionately to the theta reward left on the table.',
+    ].join('\\n'));
+    gammaBadge = `<span class="info-tip" data-tip="${gammaMsg}" style="color:var(--danger);margin-left:3px">&#9650;</span>`;
+  }
+
+  if (d.decay_quality == null) {
+    return `<span class="info-tip" data-tip="${msg}" style="color:var(--muted)">—</span>${gammaBadge}`;
+  }
+  const pct = d.decay_quality * 100;
+  const color = pct >= 70 ? 'var(--ok)' : pct >= 35 ? 'var(--warn)' : 'var(--danger)';
+  return `<span class="info-tip" data-tip="${msg}" style="color:${color}">${pct.toFixed(0)}%</span>${gammaBadge}`;
+}
+
+// Shared, JS-positioned tooltip for .info-tip elements. Deliberately NOT a
+// CSS-only nested-absolute child (that was the original approach): the table's
+// sticky header has its own z-index'd layer, and a tooltip nested inside a
+// table row can end up painted underneath it regardless of a nominally higher
+// z-index, since stacking-context comparison doesn't just compare raw numbers
+// across arbitrarily nested ancestors. A single `position:fixed` element
+// appended directly to <body> sits outside the table's DOM/stacking context
+// entirely, so this can't happen — and it lets us clamp/flip the position to
+// stay inside the viewport on any edge, not just the top.
+let _tipEl = null;
+function _showInfoTip(target) {
+  const text = target.getAttribute('data-tip');
+  if (!text) return;
+  if (!_tipEl) {
+    _tipEl = document.createElement('div');
+    _tipEl.id = '_infoTooltip';
+    _tipEl.style.cssText = 'display:none;position:fixed;z-index:99999;background:#1e1e2e;' +
+      'color:var(--text);border:1px solid var(--border);border-radius:6px;padding:9px 12px;' +
+      'font-size:11px;line-height:1.5;white-space:pre-wrap;max-width:380px;min-width:200px;' +
+      'word-break:break-word;box-shadow:0 4px 16px #0008;pointer-events:none;text-align:left';
+    document.body.appendChild(_tipEl);
+  }
+  _tipEl.textContent = text;
+  _tipEl.style.display = 'block';
+  const r = target.getBoundingClientRect();
+  const tw = _tipEl.offsetWidth, th = _tipEl.offsetHeight;
+  let left = r.right + 6;
+  if (left + tw > window.innerWidth - 8) left = r.left - tw - 6;   // flip left if it'd overflow the right edge
+  if (left < 8) left = 8;
+  let top = r.top + r.height / 2 - th / 2;
+  top = Math.max(8, Math.min(top, window.innerHeight - th - 8));   // clamp within the viewport vertically
+  _tipEl.style.left = left + 'px';
+  _tipEl.style.top  = top + 'px';
+}
+function _hideInfoTip() {
+  if (_tipEl) _tipEl.style.display = 'none';
+}
+document.addEventListener('mouseover', e => {
+  const t = e.target.closest('.info-tip');
+  if (t) _showInfoTip(t);
+});
+document.addEventListener('mouseout', e => {
+  const t = e.target.closest('.info-tip');
+  if (t) _hideInfoTip();
+});
+
 function _applySortHeader() {
   const ths = document.querySelectorAll('th');
   ths.forEach(th => th.classList.remove('sorted-asc','sorted-desc'));
@@ -2150,13 +2655,16 @@ function _applySortHeader() {
 
 function renderTable() {
   _applySortHeader();
-  const rows = [..._data];
+  const rows = _posSearch ? _data.filter(p => (p.symbol||'').toUpperCase().includes(_posSearch)) : [..._data];
   rows.sort((a, b) => {
     const cols = [
       r => r.symbol, r => r.option_type, r => parseFloat(r.strike||0),
       r => r.expiry, r => (r.net_qty > 0 ? 'Short' : 'Long'),
       r => Math.abs(r.net_qty||0), r => r.dte??999, r => r.delta??-99,
-      r => r.underlying??0, r => r.current_price??0,
+      r => (r.decay && r.decay.decay_quality != null) ? r.decay.decay_quality : -1,
+      r => r.underlying??0,
+      r => (r.option_type||'').toLowerCase() === 'put' ? -1 : (r.ul_cost_basis??0),
+      r => r.current_price??0,
       r => { if (r.has_test_trade && r.sim_chain_cash != null) { return r.chain_cash !== 0 && r.chain_cash != null ? (r.sim_chain_cash / Math.abs(r.chain_cash)) * 100 : r.sim_chain_cash; } if (r.chain_cash != null && r.current_price != null) { const abs = r.chain_cash - r.current_price * 100 * Math.abs(r.net_qty||0); return r.chain_cash !== 0 ? (abs / Math.abs(r.chain_cash)) * 100 : abs; } return r.pct_pnl ?? -999999; },
     ];
     const fn = cols[_sortCol] || (r => 0);
@@ -2281,7 +2789,9 @@ function renderTable() {
         <td>${qty}</td>
         <td>${dteHtml}</td>
         <td>${netDeltaHtml}</td>
+        <td>—</td>
         <td>${ulHtml}</td>
+        <td>${cg.call.ul_cost_basis > 0 ? '$' + parseFloat(cg.call.ul_cost_basis).toFixed(2) : '—'}</td>
         <td>—</td>
         <td>${collarPnlHtml}</td>
         <td>${hdrBadge} <span class="badge" style="background:rgba(168,85,247,.18);color:#a855f7;font-size:10px">COLLAR</span></td>
@@ -2303,7 +2813,15 @@ function renderTable() {
     // Net chain cash PnL: if a test trade exists, sim_chain_cash is the full-chain answer
     // with the test buyback baked in — the honest number across all rolls.
     let pnlAbs = null, pnlPct = null, legPct = null;
-    if (p.has_test_trade && p.sim_chain_cash != null) {
+    const _isCollarLegRow = p.spread_id && _collars.has(p.spread_id);
+    if (_isCollarLegRow) {
+      // Collar legs share one chain_cash across both legs (correct for the combined
+      // total shown on the collar header row above) — it can't be attributed to a
+      // single leg without double-counting, so show this leg's own mark-to-market
+      // PnL instead.
+      pnlAbs = p.abs_pnl;
+      pnlPct = p.pct_pnl;
+    } else if (p.has_test_trade && p.sim_chain_cash != null) {
       pnlAbs = p.sim_chain_cash;
       pnlPct = p.chain_cash !== 0 && p.chain_cash != null
         ? (pnlAbs / Math.abs(p.chain_cash)) * 100 : null;
@@ -2440,7 +2958,9 @@ function renderTable() {
       <td>${qty}</td>
       <td>${p.dte==null ? '—' : `<span style="color:${p.dte>21?'var(--ok)':p.dte>=10?'var(--warn)':'var(--danger)'}">${p.dte}</span>`}</td>
       <td>${p.delta!=null ? `<span style="color:${Math.abs(p.delta)<0.40?'var(--ok)':Math.abs(p.delta)<=0.60?'var(--warn)':'var(--danger)'}">${(p.delta>=0?'+':'')+p.delta.toFixed(3)}</span>` : '—'}</td>
+      <td>${_decayCellHtml(p.decay, p.dte, p.delta, p.symbol)}</td>
       <td>${ulPriceHtml}</td>
+      <td>${(p.option_type||'').toLowerCase() === 'put' ? '—' : (p.ul_cost_basis > 0 ? '$' + parseFloat(p.ul_cost_basis).toFixed(2) : '—')}</td>
       <td>${(() => {
         if (p.current_price == null) return '—';
         const priceStr = '$' + p.current_price.toFixed(2);
@@ -3073,6 +3593,12 @@ function _toggleHideFormer(key, checked) {
   _renderFormerTable();
 }
 
+function unhideAllFormer() {
+  _hiddenFormerRows.clear();
+  _saveHiddenFormer();
+  _renderFormerTable();
+}
+
 async function _loadFormerPositions() {
   try {
     const r = await fetch('/api/former-positions');
@@ -3104,8 +3630,13 @@ function _renderFormerTable() {
 
 function _renderFormerTableInner(el) {
   const unbornTickers = new Set(Object.values(_unbornRows).map(r => (r.symbol||'').toUpperCase()));
-  const rows = _formerPositions.filter(p => !unbornTickers.has(p.symbol.toUpperCase()));
-  if (!rows.length) { el.innerHTML = ''; return; }
+  const base = _formerPositions.filter(p => !unbornTickers.has(p.symbol.toUpperCase()));
+  const rows = _posSearch ? base.filter(p => p.symbol.toUpperCase().includes(_posSearch)) : base;
+  if (!base.length) { el.innerHTML = ''; return; }
+  if (!rows.length) {
+    el.innerHTML = '<div class="section-title" style="margin-top:0;margin-bottom:8px">Former Positions</div>';
+    return;
+  }
 
   const fmtCb = v => (v > 0) ? '$' + parseFloat(v).toFixed(2) : '—';
   const sortFns = [
@@ -3126,7 +3657,7 @@ function _renderFormerTableInner(el) {
                 th('Qty',5),th('DTE',6),th('Delta',7),th('U/L Price',8),th('Opt Price',9),
                 th('Cost Basis',10),th('Ideal Entry',11),
                 '<th>Actions</th>',
-                '<th style="text-align:center">Hide</th>'].join('');
+                '<th style="text-align:center;cursor:pointer" onclick="unhideAllFormer()" title="Click to unhide all">Hide</th>'].join('');
 
   const trs = rows.map(p => {
     const sym = esc(p.symbol);
@@ -3744,7 +4275,9 @@ const _COL_WIDTHS_KEY = 'pos-col-widths';
 
 function _saveColWidths() {
   const ths = document.querySelectorAll('#pos-table thead th');
-  localStorage.setItem(_COL_WIDTHS_KEY, JSON.stringify([...ths].map(t => t.offsetWidth)));
+  const widths = {};
+  ths.forEach(t => { if (t.dataset.col) widths[t.dataset.col] = t.offsetWidth; });
+  localStorage.setItem(_COL_WIDTHS_KEY, JSON.stringify(widths));
 }
 
 function initResizableCols() {
@@ -3753,8 +4286,9 @@ function initResizableCols() {
   const ths = table.querySelectorAll('thead th');
   const saved = JSON.parse(localStorage.getItem(_COL_WIDTHS_KEY) || 'null');
   if (saved) {
-    ths.forEach((th, i) => {
-      if (saved[i]) { th.style.minWidth = saved[i] + 'px'; th.style.width = saved[i] + 'px'; }
+    ths.forEach(th => {
+      const w = saved[th.dataset.col];
+      if (w) { th.style.minWidth = w + 'px'; th.style.width = w + 'px'; }
     });
   }
   ths.forEach((th, i) => {
@@ -4425,7 +4959,9 @@ def _launch_fidelity_trade(trade: dict) -> None:
 
 
 def _migrate_db_ul_cost_basis() -> None:
-    """Add ul_cost_basis column to positions table if not already present."""
+    """Add ul_cost_basis and entry-snapshot columns to positions table if not
+    already present. Defensive mirror of option_trade_journal.py's init_db()
+    migration — either process may start up first against the shared DB."""
     import sqlite3
     db_path = os.path.normpath(JOURNAL_DB)
     if not os.path.exists(db_path):
@@ -4437,9 +4973,22 @@ def _migrate_db_ul_cost_basis() -> None:
             con.execute("ALTER TABLE positions ADD COLUMN ul_cost_basis REAL DEFAULT 0")
             con.commit()
             log.info("DB migrated: added ul_cost_basis column to positions")
+        for col, decl in [
+            ("entry_iv",               "REAL DEFAULT NULL"),
+            ("entry_underlying_price", "REAL DEFAULT NULL"),
+            ("entry_delta",            "REAL DEFAULT NULL"),
+            ("entry_gamma",            "REAL DEFAULT NULL"),
+            ("entry_theta",            "REAL DEFAULT NULL"),
+            ("entry_vega",             "REAL DEFAULT NULL"),
+            ("entry_snapshot_at",      "TEXT DEFAULT NULL"),
+        ]:
+            if col not in cols:
+                con.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
+                con.commit()
+                log.info("DB migrated: added %s column to positions", col)
         con.close()
     except Exception as exc:
-        log.warning("DB migration (ul_cost_basis) failed: %s", exc)
+        log.warning("DB migration (ul_cost_basis/entry-snapshot) failed: %s", exc)
 
 
 def run_web_dashboard(token: str, account_id: str) -> None:
@@ -5145,6 +5694,62 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         cb = get_ul_cost_basis_from_db(ticker.upper().strip())
         return Response(json.dumps({"ticker": ticker.upper(), "ul_cost_basis": cb}), mimetype="application/json")
 
+    @app.route("/api/entry-snapshot", methods=["POST"])
+    @require_auth
+    def api_entry_snapshot():
+        """
+        Live IV/spot/Greeks for one contract, at the moment a brand-new position
+        is opened. Called by the journal process right after it inserts a new
+        position — the journal has no Public.com/market-data access of its own,
+        this dashboard process is the only place that does. Best-effort by
+        design: the caller (journal) treats any non-200 or error response as
+        "couldn't capture," leaves the entry_* columns NULL, and moves on —
+        trade recording must never be blocked by this.
+        """
+        body = flask_request.get_json(force=True, silent=True) or {}
+        symbol      = str(body.get("symbol", "")).upper().strip()
+        option_type = str(body.get("option_type", "")).upper().strip()
+        expiry      = str(body.get("expiry", "")).strip()
+        try:
+            strike = float(body.get("strike"))
+        except (TypeError, ValueError):
+            return Response(json.dumps({"error": "bad or missing strike"}), status=400, mimetype="application/json")
+        if not symbol or option_type not in ("CALL", "PUT") or not expiry:
+            return Response(json.dumps({"error": "missing symbol/option_type/expiry"}), status=400, mimetype="application/json")
+
+        def _f(v):
+            try:
+                return float(v) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            tok = _get_valid_token()
+            pos_like = {"symbol": symbol, "expiry": expiry, "option_type": option_type, "strike": strike}
+            quotes = get_option_quotes(tok, account_id, [pos_like])
+            osi = build_osi_symbol(symbol, expiry, option_type, strike).replace(" ", "")
+            q = quotes.get(osi, {})
+            bid, ask, last = _f(q.get("bid")), _f(q.get("ask")), _f(q.get("last"))
+            opt_price = (bid + ask) / 2 if bid is not None and ask is not None else last
+
+            greeks_data = get_option_greeks_batch(tok, account_id, [osi])
+            g = greeks_data.get(osi, {})
+            spot = get_underlying_price(symbol)
+
+            result = {
+                "underlying_price": spot,
+                "iv":    _f(g.get("impliedVolatility")),
+                "delta": _f(g.get("delta")),
+                "gamma": _f(g.get("gamma")),
+                "theta": _f(g.get("theta")),
+                "vega":  _f(g.get("vega")),
+                "opt_price": opt_price,
+            }
+            return Response(json.dumps(result), mimetype="application/json")
+        except Exception as exc:
+            log.warning("[entry-snapshot] failed for %s %s %s %s: %s", symbol, option_type, strike, expiry, exc)
+            return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
+
     @app.route("/api/send-alert", methods=["POST"])
     @require_auth
     def api_send_alert():
@@ -5668,15 +6273,72 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                     ln_esc = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', ln_esc)
                     lines_out.append(f"<p>{ln_esc}</p>")
                 i += 1
-            # Net Chain Cash PnL footer
-            chain_cash      = cached.get("chain_cash")
-            sim_chain_cash  = cached.get("sim_chain_cash")
-            has_test_trade  = cached.get("has_test_trade", False)
-            collected       = cached.get("chain_collected")
-            paid            = cached.get("chain_paid")
-            n_pos           = cached.get("chain_positions")
-            pos_avg_price   = cached.get("pos_avg_price")
-            pos_qty         = cached.get("pos_qty")
+            # Net Chain Cash PnL footer — recomputed live from the DB (not the frozen
+            # analysis-cache snapshot) so test trades added after the analysis ran
+            # (the normal workflow: analyze, then model a prospective roll via test
+            # trades) show up immediately without re-running the LLM analysis.
+            chain_cash = sim_chain_cash = collected = paid = n_pos = None
+            has_test_trade = False
+            pos_avg_price = pos_qty = None
+            decay_info = None
+            if len(parts) >= 4:
+                pk_sym, pk_type = parts[0].upper(), parts[1].upper()
+                try:
+                    pk_strike = float(parts[2])
+                except ValueError:
+                    pk_strike = None
+                pk_expiry = parts[3]
+                for _p in get_all_open_positions(pk_sym):
+                    try:
+                        _p_strike = float(_p.get("strike", ""))
+                    except (TypeError, ValueError):
+                        _p_strike = None
+                    if (str(_p.get("option_type", "")).upper() == pk_type
+                            and _p_strike == pk_strike
+                            and str(_p.get("expiry", "")) == pk_expiry):
+                        _chain = get_chain_net_cash(_p.get("spread_id"), fallback_pos_id=_p.get("id"))
+                        chain_cash     = _chain["net_cash"]
+                        sim_chain_cash = _chain["sim_net_cash"]
+                        has_test_trade = _chain["has_test"]
+                        collected      = _chain["collected"]
+                        paid           = _chain["paid"]
+                        n_pos          = _chain["num_positions"]
+                        pos_avg_price  = _p.get("avg_price")
+                        pos_qty        = abs(_p.get("net_qty") or 0)
+
+                        # Decay-quality decomposition — one live quote+greeks
+                        # fetch for this single contract (analyze page only,
+                        # not the main table refresh, so the extra call is fine).
+                        def _f2(v):
+                            try:
+                                return float(v) if v not in (None, "") else None
+                            except (TypeError, ValueError):
+                                return None
+                        try:
+                            _tok = _get_valid_token()
+                            _osi = build_osi_symbol(pk_sym, pk_expiry, pk_type, pk_strike).replace(" ", "")
+                            _quotes = get_option_quotes(_tok, account_id, [
+                                {"symbol": pk_sym, "expiry": pk_expiry, "option_type": pk_type, "strike": pk_strike}
+                            ])
+                            _q = _quotes.get(_osi, {})
+                            _bid, _ask, _last = _f2(_q.get("bid")), _f2(_q.get("ask")), _f2(_q.get("last"))
+                            _cur_price = (_bid + _ask) / 2 if _bid is not None and _ask is not None else _last
+                            _g = get_option_greeks_batch(_tok, account_id, [_osi]).get(_osi, {})
+                            _underlying = get_underlying_price(pk_sym)
+                            try:
+                                _dte = (datetime.date.fromisoformat(pk_expiry) - datetime.date.today()).days
+                            except ValueError:
+                                _dte = None
+                            _delta_val = _f2(_g.get("delta"))
+                            decay_info = compute_decay_signals(
+                                _p, _dte, _underlying, _cur_price,
+                                _delta_val, _f2(_g.get("gamma")),
+                                _f2(_g.get("theta")), _f2(_g.get("vega")),
+                                _f2(_g.get("impliedVolatility")),
+                            )
+                        except Exception as _decay_exc:
+                            log.warning("[analyze decay] failed for %s: %s", pos_key, _decay_exc)
+                        break
 
             if chain_cash is not None and collected is not None and paid is not None:
                 pos_lbl = f"{n_pos} position{'s' if n_pos != 1 else ''}" if n_pos else "positions"
@@ -5691,22 +6353,61 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                 base = f"${collected:,.2f} collected − ${paid:,.2f} paid"
 
                 if has_test_trade and sim_chain_cash is not None:
-                    # Test trade present: sim_chain_cash is the locked-in chain PnL
+                    # Test trade present: sim_chain_cash is the locked-in chain PnL —
+                    # this is the deterministic "birth to death" figure (STO, test BTC
+                    # of the old leg, test STO of the new leg, test BTC of the new leg),
+                    # fees and commissions included, matching the journal exactly.
                     working = (
                         f"{base} (+ test close) = {_fmt_pnl(round(sim_chain_cash, 2))}"
                         f"&nbsp;<span style='color:var(--muted);font-size:11px'>[simulated close]</span>"
                     )
                     exp_note = ""
 
-                elif rec == "ROLL" and has_pos:
-                    # ROLL: close open leg at 40% (keep 60% profit), then roll
-                    buy_back_cost = round(pos_avg_price * 0.40 * 100 * pos_qty, 2)
-                    final_pnl     = round(chain_cash - buy_back_cost, 2)
+                elif (rec == "ROLL" and has_pos and cached.get("sto_chain_price") is not None
+                      and cached.get("btc_chain_price") is not None):
+                    # No test trade entered yet — project the FULL chain if the
+                    # suggested roll is executed and the new leg is later closed at
+                    # 40% of its own premium (60% profit capture): net chain cash to
+                    # date, minus the real cost to BTC the current leg (at its
+                    # confirmed chain price), plus the new leg's STO credit, minus
+                    # the cost to close that new leg at 40%. This is what tells you
+                    # whether the ENTIRE roll chain is profitable, not just this leg.
+                    # Commission/fees on these three legs are estimated via the
+                    # journal's own fee schedule (see run_roll_for_position) so this
+                    # lines up with what the journal will show once the trades are
+                    # actually entered — not just the gross, fee-free math.
+                    _btc_p  = cached.get("btc_chain_price")
+                    _sto_p  = cached["sto_chain_price"]
+                    _btc_cost   = cached.get("roll_btc_cost")
+                    _sto_credit = cached.get("roll_sto_credit")
+                    _close_cost = cached.get("roll_close_price")
+                    _close_amt  = cached.get("roll_close_cost")
+                    if _btc_cost is None or _sto_credit is None or _close_amt is None:
+                        # Older cached analysis, predates fee estimation — fall back
+                        # to the gross (fee-free) figures rather than error out.
+                        _btc_cost   = round((_btc_p or 0.0) * 100 * pos_qty, 2)
+                        _sto_credit = round(_sto_p * 100 * pos_qty, 2)
+                        _close_cost = round(_sto_p * 0.40, 4)
+                        _close_amt  = round(_close_cost * 100 * pos_qty, 2)
+                    final_pnl = round(chain_cash - _btc_cost + _sto_credit - _close_amt, 2)
+                    _sto_lbl = html_mod.escape(cached.get("sto_chain_desc") or "new leg")
                     working = (
                         f"{base} "
-                        f"− ${buy_back_cost:,.2f} close at 40% "
-                        f"(${pos_avg_price:.2f} × 0.40 × 100 × {pos_qty} contracts) "
+                        f"− ${_btc_cost:,.2f} BTC current leg @ ${_btc_p:.2f} (incl. est. comm/fees) "
+                        f"+ ${_sto_credit:,.2f} STO {_sto_lbl} @ ${_sto_p:.2f} (incl. est. comm/fees) "
+                        f"− ${_close_amt:,.2f} close new leg @ ${_close_cost:.2f} (40%, incl. est. comm/fees) "
                         f"= {_fmt_pnl(final_pnl)}"
+                    )
+                    exp_note = ""
+
+                elif rec == "ROLL" and has_pos:
+                    # New leg's price couldn't be confirmed against the chain that
+                    # was fetched (e.g. its expiry fell outside the fetch window) —
+                    # show only the realized-to-date cash rather than guess.
+                    working = (
+                        f"{base} = {_fmt_pnl(round(chain_cash, 2))} "
+                        f"<span style='color:var(--muted);font-size:11px'>"
+                        f"[new leg price unconfirmed — enter test trades to project the roll]</span>"
                     )
                     exp_note = ""
 
@@ -5738,6 +6439,97 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
             else:
                 chain_html = ""
 
+            # Confirmed BTC/STO prices from the exact chain snapshot NotebookLM was
+            # given — shown next to the Execution Instructions so the Action 1/2
+            # prices can be checked against real data instead of the LLM's estimate.
+            btc_chain_price = cached.get("btc_chain_price")
+            sto_chain_price = cached.get("sto_chain_price")
+            sto_chain_desc  = cached.get("sto_chain_desc")
+            if rec == "ROLL" and (btc_chain_price is not None or sto_chain_price is not None):
+                _price_parts = []
+                if btc_chain_price is not None:
+                    _btc_desc = (
+                        f"{ticker_sym} {html_mod.escape(str(parts[2]))} "
+                        f"{html_mod.escape(parts[1].upper())} exp {html_mod.escape(parts[3])}"
+                    ) if len(parts) >= 4 else ticker_sym
+                    _price_parts.append(f"BTC leg ({_btc_desc}) @ ${btc_chain_price:.2f}")
+                if sto_chain_price is not None:
+                    _sto_desc = html_mod.escape(sto_chain_desc) if sto_chain_desc else "new leg"
+                    _price_parts.append(f"STO leg ({_sto_desc}) @ ${sto_chain_price:.2f}")
+                confirmed_html = (
+                    f'<div class="chain-pnl" style="margin-top:14px">'
+                    f'<span class="chain-label">Confirmed Prices &nbsp;'
+                    f'<span style="font-weight:normal;color:var(--muted)">(from the chain used for this analysis)</span></span>'
+                    f'<span class="chain-working">{" &nbsp;|&nbsp; ".join(_price_parts)}</span>'
+                    f'</div>'
+                )
+            else:
+                confirmed_html = ""
+
+            # Decay-quality block: replaces the flat 60%-profit rule of thumb with
+            # a Greeks-based decomposition of the price move since entry. Live
+            # (recomputed on every view, like the chain-PnL footer above), and
+            # gracefully "--" for any component that needs entry-snapshot data
+            # this position doesn't have.
+            def _dfmt(v, digits=3):
+                return "—" if v is None else f"{'+' if v >= 0 else ''}${v:.{digits}f}"
+
+            if decay_info is None:
+                decay_html = ""
+            else:
+                d = decay_info
+                if d.get("gamma_risk"):
+                    _dg_str  = f'${d["dollar_gamma"]:.0f}' if d.get("dollar_gamma") is not None else "unknown"
+                    _dte_str = _dte if _dte is not None else "?"
+                    _ad_str  = f'{abs(_delta_val):.3f}' if _delta_val is not None else "?"
+                    gamma_note = (
+                        f'<br><span style="color:var(--danger)">&#9650; High gamma this close to expiry.</span> '
+                        f'<span style="color:var(--muted);font-size:11px">'
+                        f'Gamma = how fast delta (directional exposure) changes as the stock moves — the '
+                        f'"convexity" of the position; high gamma means small stock moves cause outsized P&amp;L '
+                        f'swings. This position’s $Gamma: {html_mod.escape(_dg_str)} (a 1% move in {html_mod.escape(pk_sym)} '
+                        f'would shift delta exposure by roughly that many dollars). Flagged because DTE ≤ 14 '
+                        f'and |delta| ≥ 0.30 (here: {_dte_str} DTE, |delta| {_ad_str}) — gamma accelerates '
+                        f'sharply this close to expiry, especially near the money, so small moves swing this '
+                        f'position’s value disproportionately to the theta reward left on the table.'
+                        f'</span>'
+                    )
+                else:
+                    gamma_note = ""
+                if d.get("decay_quality") is None:
+                    dq_line = (
+                        f'<strong style="color:var(--muted)">—</strong> '
+                        f'<span style="color:var(--muted);font-size:11px">'
+                        f'({html_mod.escape(d.get("note") or "unavailable")})</span>'
+                    )
+                else:
+                    pct = d["decay_quality"] * 100
+                    color = "var(--ok)" if pct >= 70 else "var(--warn)" if pct >= 35 else "var(--danger)"
+                    dq_line = f'<strong style="color:{color}">{pct:.0f}%</strong> of the move since entry is time decay'
+
+                theta_day = d.get("theta_per_day")
+                cap_eff   = d.get("capital_efficiency")
+                dgamma    = d.get("dollar_gamma")
+                vanna     = d.get("vanna")
+                charm     = d.get("charm")
+                decay_html = (
+                    f'<div class="chain-pnl" style="margin-top:14px">'
+                    f'<span class="chain-label">Decay Quality Analysis</span>'
+                    f'<span class="chain-working">'
+                    f'{dq_line}{gamma_note}<br>'
+                    f'Spot: {_dfmt(d.get("spot_component"))}'
+                    f'&nbsp;&nbsp;Time: {_dfmt(d.get("time_component"))}'
+                    f'&nbsp;&nbsp;Vol: {_dfmt(d.get("vega_component"))}'
+                    f'&nbsp;&nbsp;Residual: {_dfmt(d.get("residual"))}<br>'
+                    f'Theta: {"—" if theta_day is None else f"${theta_day:.2f}/day"}'
+                    f'&nbsp;&nbsp;Capital efficiency: {"—" if cap_eff is None else f"{cap_eff*100:.3f}%/day"}'
+                    f'&nbsp;&nbsp;$Gamma: {"—" if dgamma is None else f"{dgamma:.0f}"}<br>'
+                    f'Vanna: {"—" if vanna is None else f"{vanna:.4f}"}'
+                    f'&nbsp;&nbsp;Charm: {"—" if charm is None else f"{charm:.4f}/day"}'
+                    f'</span>'
+                    f'</div>'
+                )
+
             run_at_html = (
                 f'<div style="font-size:11px;color:var(--muted);margin-bottom:12px">Updated {html_mod.escape(cached["_run_at"])}</div>'
                 if cached.get("_run_at") else ""
@@ -5748,7 +6540,9 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                 f'{run_at_html}'
                 f'</div>'
                 f'<div class="rec-body">{"".join(lines_out)}</div>'
+                f'{confirmed_html}'
                 f'{chain_html}'
+                f'{decay_html}'
             )
 
         page = f"""<!DOCTYPE html>
@@ -6495,7 +7289,6 @@ async def query_notebooklm(
                     f"REJECT any roll candidate with STO premium ≤ ${min_sto:.2f}. "
                     f"If no candidate clears this threshold, recommend 'Do Nothing'."
                 )
-                formula_base = f"{adj_sign}${abs(adj_net):,.2f}"
             else:
                 min_sto = 0.0
                 viability = (
@@ -6507,26 +7300,22 @@ async def query_notebooklm(
                     f"The chain net is {net_sign}${net:,.2f}. Any roll collecting "
                     f"additional premium improves it."
                 )
-                formula_base = f"{adj_sign}${abs(adj_net):,.2f}"
 
             pnl_instruction = (
                 f"CHAIN PNL ANALYSIS — complete this before finalising your recommendation. "
                 f"Net chain cash to date: {net_sign}${net:,.2f} "
                 f"(${coll:,.2f} collected − ${paid_:,.2f} paid across {n_pos} position(s)). "
                 f"{viability} "
-                f"For the roll you recommend, show the projected net chain PnL in the "
-                f"Execution Instructions using this formula: "
-                f"Projected Net Chain PnL = {formula_base} + "
-                f"(new STO premium × 0.60 × 100 × {total_contracts} contracts). "
-                f"Label it 'Projected Net Chain PnL (assuming 40% BTC on new roll leg)'."
+                f"Do NOT include a projected net chain PnL dollar figure in the Execution "
+                f"Instructions — the dashboard computes that deterministically from actual "
+                f"and test trades once entered. Use the CHAIN PNL ANALYSIS above only to "
+                f"decide whether the roll clears the breakeven threshold."
             )
         else:
             pnl_instruction = (
-                f"In the Execution Instructions section, add as the final bullet point "
-                f"the potential PnL if the recommended rolled-to option is bought back at "
-                f"40% of its sale price. Use this formula and show the working: "
-                f"PnL = Sale Price × 0.60 × 100 × {total_contracts} contract(s). "
-                f"Label it 'Expected PnL (buy-back at 40% of premium)'."
+                f"Do NOT include a projected PnL dollar figure in the Execution Instructions "
+                f"— the dashboard computes that deterministically from actual and test trades "
+                f"once entered."
             )
         vix_clause = f", the VIX ({vix_note})," if vix_note else ""
         import zoneinfo as _zi
