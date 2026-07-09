@@ -5281,17 +5281,25 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
-    _AUTH_USER = os.environ["OTJ_USER"]
-    _AUTH_PASS = os.environ["OTJ_PASS"]
+    # ── Cloudflare Access auth ──────────────────────────────────────────────
+    # No credential check here by design (matches dogpile/stocks/synopticon):
+    # this process binds to 127.0.0.1 only, so the only traffic that can ever
+    # reach it is (a) same-machine processes — the journal's entry-snapshot
+    # call, or a local curl, already trusted at the same boundary as
+    # filesystem access — or (b) cloudflared relaying traffic AFTER
+    # Cloudflare Access has already enforced its login policy at the edge; an
+    # unauthenticated external request never reaches the tunnel's local
+    # forward step at all. The header below is identity for logging, not a
+    # pass/fail gate.
+    def _cf_email() -> str:
+        return flask_request.headers.get("CF-Access-Authenticated-User-Email", "").lower().strip()
 
     def require_auth(f):
         @wraps(f)
         def decorated(*args, **kwargs):
-            auth = flask_request.authorization
-            if not auth or auth.username != _AUTH_USER or auth.password != _AUTH_PASS:
-                log.warning("AUTH FAIL  %s %s from %s", flask_request.method, flask_request.path, flask_request.remote_addr)
-                return Response("Login required", 401,
-                                {"WWW-Authenticate": 'Basic realm="Options"'})
+            email = _cf_email()
+            if email:
+                log.info("AUTH  %s %s  user=%s", flask_request.method, flask_request.path, email)
             return f(*args, **kwargs)
         return decorated
 
