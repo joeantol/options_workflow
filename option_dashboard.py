@@ -884,6 +884,63 @@ def get_option_greeks_batch(token: str, account_id: str, osi_symbols: list[str])
     return result
 
 
+def _decay_opinion(
+    gamma_risk: bool,
+    decay_quality: float | None,
+    pct_pnl: float | None,
+    capital_efficiency: float | None,
+    note: str | None = None,
+) -> tuple[str, str]:
+    """
+    Close/hold opinion combining decay quality, gamma risk, and PnL — a
+    genuinely different question from "is decay_quality high": a position can
+    have 100% decay quality and still be near breakeven (nothing captured yet
+    to attribute), or a fragile 10%-quality profit that's still fine to hold
+    if it's nowhere near a normal profit target.
+
+    Rule-of-thumb thresholds, not a formula — tune alongside gamma_risk's own
+    (dte<=14, |delta|>=0.30) if these stop matching how you actually trade:
+      - 50% profit captured is this trader's own established take-profit
+        convention (referenced throughout the PLAN/REVIEW-driven analyses).
+      - 5%/day capital efficiency is "very little value left to decay further"
+        (see the LULU example: 2 DTE produced ~16.5%/day).
+    """
+    profit_target_hit = pct_pnl is not None and pct_pnl >= 50.0
+    high_efficiency = capital_efficiency is not None and capital_efficiency >= 0.05
+
+    if gamma_risk:
+        if profit_target_hit:
+            return ("Close", "Past the 50% profit target and gamma risk is elevated "
+                              "this close to expiry — lock it in.")
+        return ("Close/Roll", "Gamma risk is elevated (short DTE, near-the-money) "
+                               "without a clear profit cushion to justify the convexity risk.")
+
+    if decay_quality is None:
+        why = f"decay quality unavailable — {note}" if note else "decay quality unavailable"
+        if profit_target_hit:
+            return ("Consider closing", f"Past the 50% profit target ({why}).")
+        return ("Hold", f"No acute risk signal ({why}).")
+
+    if decay_quality >= 0.70:
+        if profit_target_hit or high_efficiency:
+            return ("Close", "Profit is genuinely theta-driven and most of the available "
+                              "decay looks captured — diminishing reward from holding further.")
+        return ("Hold", "Profit is genuinely theta-driven and still building; no acute risk.")
+
+    if decay_quality < 0.35:
+        if profit_target_hit:
+            return ("Hold (fragile)", "Profit looks good on paper but is mostly a directional "
+                                       "move, not decay — it could reverse. Close now only if "
+                                       "you want the directional risk off the table.")
+        return ("Hold", "Early stage — not enough decay or profit captured yet "
+                         "to have a strong opinion.")
+
+    # mixed 0.35–0.70
+    if profit_target_hit:
+        return ("Consider closing", "Past the 50% profit target with mixed decay/directional quality.")
+    return ("Hold", "Mixed profit quality (part decay, part directional) — no acute signal yet.")
+
+
 def compute_decay_signals(
     pos: dict,
     dte: int | None,
@@ -894,6 +951,7 @@ def compute_decay_signals(
     opt_theta: float | None,
     opt_vega: float | None,
     current_iv: float | None,
+    pct_pnl: float | None = None,
 ) -> dict:
     """
     Greeks-based decay-quality analysis for a short option position — replaces
@@ -917,6 +975,7 @@ def compute_decay_signals(
         "residual": None, "decay_quality": None, "capital_efficiency": None,
         "dollar_gamma": None, "gamma_risk": False, "theta_per_day": None,
         "vanna": None, "charm": None, "note": None,
+        "opinion": None, "opinion_reason": None,
     }
 
     net_qty = pos.get("net_qty") or 0
@@ -935,81 +994,96 @@ def compute_decay_signals(
         if capital_at_risk > 0:
             out["capital_efficiency"] = round(abs(out["theta_per_day"]) / capital_at_risk, 5)
 
-    entry_iv = pos.get("entry_iv")
-    entry_S  = pos.get("entry_underlying_price")
-    if entry_iv is None or entry_S is None:
-        out["note"] = "no entry snapshot captured for this position"
-        return out
-
-    strike      = pos.get("strike")
-    expiry      = pos.get("expiry")
-    option_type = (pos.get("option_type") or "").lower()
-    avg_price   = pos.get("avg_price")
-    if not (strike and expiry and option_type in ("call", "put")):
-        out["note"] = "incomplete position data"
-        return out
-    if current_price is None or underlying is None or current_iv is None:
-        out["note"] = "missing live quote"
-        return out
-
+    # Everything below either sets out["note"] and returns early, or runs to
+    # completion and sets out["decay_quality"]. The opinion is computed exactly
+    # once, in `finally`, from whatever state `out` is in at that point — this
+    # way its message always matches the real reason decay_quality is None
+    # (or isn't), instead of a "preliminary" guess taken before note was known.
     try:
-        today = datetime.date.today()
-        expiry_d = datetime.date.fromisoformat(expiry)
-        T_now = max((expiry_d - today).days, 0) / 365.0
-    except (ValueError, TypeError):
-        out["note"] = "bad expiry"
+        entry_iv = pos.get("entry_iv")
+        entry_S  = pos.get("entry_underlying_price")
+        if entry_iv is None or entry_S is None:
+            out["note"] = "no entry snapshot captured for this position"
+            return out
+
+        strike      = pos.get("strike")
+        expiry      = pos.get("expiry")
+        option_type = (pos.get("option_type") or "").lower()
+        avg_price   = pos.get("avg_price")
+        if not (strike and expiry and option_type in ("call", "put")):
+            out["note"] = "incomplete position data"
+            return out
+        if current_price is None or underlying is None or current_iv is None:
+            out["note"] = "missing live quote"
+            return out
+
+        try:
+            today = datetime.date.today()
+            expiry_d = datetime.date.fromisoformat(expiry)
+            T_now = max((expiry_d - today).days, 0) / 365.0
+        except (ValueError, TypeError):
+            out["note"] = "bad expiry"
+            return out
+        if T_now <= 0:
+            out["note"] = "expired"
+            return out
+
+        entry_dt_str = (pos.get("entry_snapshot_at") or pos.get("entry_date") or "")[:10]
+        try:
+            entry_d = datetime.date.fromisoformat(entry_dt_str)
+            T_entry = max((expiry_d - entry_d).days, 1) / 365.0
+        except (ValueError, TypeError):
+            out["note"] = "bad entry date"
+            return out
+
+        is_call = option_type == "call"
+        q = greeks_pricing.dividend_yield_from_quarterly(pos.get("dividend_amount"), underlying)
+
+        try:
+            V0 = greeks_pricing.price(entry_S, strike, T_entry, entry_iv, is_call, q=q)     # entry, theoretical
+            V1 = greeks_pricing.price(underlying, strike, T_entry, entry_iv, is_call, q=q)  # + spot moves
+            V2 = greeks_pricing.price(underlying, strike, T_now, entry_iv, is_call, q=q)    # + time passes
+            V3 = greeks_pricing.price(underlying, strike, T_now, current_iv, is_call, q=q)  # + vol moves (== current theoretical)
+        except (ValueError, OverflowError, ZeroDivisionError):
+            out["note"] = "pricing error"
+            return out
+
+        spot_component = V1 - V0
+        time_component = V2 - V1
+        vega_component = V3 - V2
+        residual       = current_price - V3   # actual vs theoretical — bid/ask noise, model gap
+
+        out["spot_component"] = round(spot_component, 4)
+        out["time_component"] = round(time_component, 4)
+        out["vega_component"] = round(vega_component, 4)
+        out["residual"]       = round(residual, 4)
+
+        # Decay quality: what share of the position's total favorable move (price
+        # cheapening, good for a short seller) is attributable to time decay
+        # specifically, vs a spot/vol move that could reverse. 0 whenever there's
+        # no favorable move yet to attribute, OR the move exists but time_component
+        # isn't negative (e.g. a brand-new position with almost no elapsed time —
+        # nothing to credit to decay yet) — both are real "0" answers, not missing
+        # data, so this must not leave decay_quality as None.
+        total_move = (current_price - avg_price) if avg_price is not None else (V3 - V0) + residual
+        price_drop = -total_move
+        if price_drop > 0 and time_component < 0:
+            out["decay_quality"] = round(min(1.0, max(0.0, (-time_component) / price_drop)), 3)
+        else:
+            out["decay_quality"] = 0.0
+
+        try:
+            g = greeks_pricing.greeks(underlying, strike, T_now, current_iv, is_call, q=q)
+            out["vanna"] = round(g["vanna"], 5) if g.get("vanna") is not None else None
+            out["charm"] = round(g["charm"], 5) if g.get("charm") is not None else None
+        except Exception:
+            pass
+
         return out
-    if T_now <= 0:
-        out["note"] = "expired"
-        return out
-
-    entry_dt_str = (pos.get("entry_snapshot_at") or pos.get("entry_date") or "")[:10]
-    try:
-        entry_d = datetime.date.fromisoformat(entry_dt_str)
-        T_entry = max((expiry_d - entry_d).days, 1) / 365.0
-    except (ValueError, TypeError):
-        out["note"] = "bad entry date"
-        return out
-
-    is_call = option_type == "call"
-    q = greeks_pricing.dividend_yield_from_quarterly(pos.get("dividend_amount"), underlying)
-
-    try:
-        V0 = greeks_pricing.price(entry_S, strike, T_entry, entry_iv, is_call, q=q)     # entry, theoretical
-        V1 = greeks_pricing.price(underlying, strike, T_entry, entry_iv, is_call, q=q)  # + spot moves
-        V2 = greeks_pricing.price(underlying, strike, T_now, entry_iv, is_call, q=q)    # + time passes
-        V3 = greeks_pricing.price(underlying, strike, T_now, current_iv, is_call, q=q)  # + vol moves (== current theoretical)
-    except (ValueError, OverflowError, ZeroDivisionError):
-        out["note"] = "pricing error"
-        return out
-
-    spot_component = V1 - V0
-    time_component = V2 - V1
-    vega_component = V3 - V2
-    residual       = current_price - V3   # actual vs theoretical — bid/ask noise, model gap
-
-    out["spot_component"] = round(spot_component, 4)
-    out["time_component"] = round(time_component, 4)
-    out["vega_component"] = round(vega_component, 4)
-    out["residual"]       = round(residual, 4)
-
-    # Decay quality: what share of the position's total favorable move (price
-    # cheapening, good for a short seller) is attributable to time decay
-    # specifically, vs a spot/vol move that could reverse. 0 when there's no
-    # favorable move yet to attribute (a real answer, not a missing one).
-    total_move = (current_price - avg_price) if avg_price is not None else (V3 - V0) + residual
-    price_drop = -total_move
-    if price_drop > 0 and time_component < 0:
-        out["decay_quality"] = round(min(1.0, max(0.0, (-time_component) / price_drop)), 3)
-    elif price_drop <= 0:
-        out["decay_quality"] = 0.0
-
-    try:
-        g = greeks_pricing.greeks(underlying, strike, T_now, current_iv, is_call, q=q)
-        out["vanna"] = round(g["vanna"], 5) if g.get("vanna") is not None else None
-        out["charm"] = round(g["charm"], 5) if g.get("charm") is not None else None
-    except Exception:
-        pass
+    finally:
+        out["opinion"], out["opinion_reason"] = _decay_opinion(
+            out["gamma_risk"], out["decay_quality"], pct_pnl, out["capital_efficiency"], out["note"]
+        )
 
     return out
 
@@ -1269,7 +1343,7 @@ def get_eval_data(
         else:
             pos_hypo_cash = None
 
-        decay = compute_decay_signals(pos, dte, underlying, current_price, delta, gamma, opt_theta, opt_vega, current_iv)
+        decay = compute_decay_signals(pos, dte, underlying, current_price, delta, gamma, opt_theta, opt_vega, current_iv, pct_pnl)
 
         result_positions.append({
             **pos,
@@ -1366,7 +1440,10 @@ def eval_open_positions(token: str, account_id: str, ticker: str | None = None) 
         )
 
 
-def _parse_recommended_option(text: str, chain_rows: list[dict], prefer_type: str | None = None) -> dict | None:
+def _parse_recommended_option(
+    text: str, chain_rows: list[dict], prefer_type: str | None = None,
+    trust_any_date: bool = False,
+) -> dict | None:
     """
     Try to extract the recommended strike and expiry from NotebookLM response text
     and return the matching chain row, or None if not found.
@@ -1376,6 +1453,20 @@ def _parse_recommended_option(text: str, chain_rows: list[dict], prefer_type: st
     the OTHER type can win purely because it happens to appear earlier in
     chain_rows (calls are listed before puts), which is a real option contract
     but not the one that was actually recommended.
+
+    trust_any_date: only set True when `text` is already scoped to a single,
+    specific sentence (e.g. the STO line) where any date mentioned is almost
+    certainly the intended expiry. When False (the default, used for
+    whole-text scans prone to picking up prose dates like "as of July 9,
+    2026"), a date that isn't one of chain_rows' actual expiries is discarded
+    and target_expiry falls back to None — which then makes the matching loop
+    below treat EVERY row's expiry as an acceptable match. That's fine when no
+    expiry was stated at all, but if a specific expiry WAS stated and just
+    isn't in chain_rows (e.g. its chain fetch got rate-limited), discarding it
+    silently lets a same-strike row at a completely different, wrong expiry
+    win by strike alone (confirmed on a real MSFT roll: stated "Aug 21 2026"
+    wasn't in the fetched chain, so a 400-strike row expiring 2026-07-10 won
+    instead and got shown as a "confirmed" price for the wrong contract).
     """
     # Extract strike: $12.50, $12, 12.50 strike, strike of 12.50, etc.
     strike_match = re.search(
@@ -1403,6 +1494,7 @@ def _parse_recommended_option(text: str, chain_rows: list[dict], prefer_type: st
         r'\s+\d{1,2},?\s+\d{4})'
     )
     target_expiry = None
+    _first_parsed_date = None  # first date found, even if not a known chain expiry
     for _dm in re.finditer(_DATE_PAT, text, re.IGNORECASE):
         _raw = next((g for g in _dm.groups() if g), None)
         if not _raw:
@@ -1411,6 +1503,8 @@ def _parse_recommended_option(text: str, chain_rows: list[dict], prefer_type: st
             try:
                 _parsed = datetime.datetime.strptime(_raw.replace(",", ", ").strip(), _fmt).date()
                 _parsed_str = _parsed.strftime("%Y-%m-%d")
+                if _first_parsed_date is None:
+                    _first_parsed_date = _parsed_str
                 if _parsed_str in _valid_expiries:
                     target_expiry = _parsed_str
                     break
@@ -1418,6 +1512,8 @@ def _parse_recommended_option(text: str, chain_rows: list[dict], prefer_type: st
                 continue
         if target_expiry:
             break
+    if target_expiry is None and trust_any_date and _first_parsed_date is not None:
+        target_expiry = _first_parsed_date
 
     # Find best matching row: must match strike exactly; prefer exact expiry too;
     # a type mismatch (when prefer_type is given) is effectively disqualifying.
@@ -1575,7 +1671,136 @@ def _parse_ideal_entry(text: str) -> str | None:
     return None
 
 
+_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _detect_recommendation_llm(text: str) -> str | None:
+    """
+    Classify the CURRENT recommendation in a NotebookLM analysis via Claude
+    Haiku instead of the regex/word-count heuristic below. The regex approach
+    reliably misfires on this text shape: the "Execution Instructions" section
+    always discusses a *future*, contingent roll plan (e.g. "at 21 DTE,
+    evaluate a roll") even when today's verdict is DO NOTHING/WATCH, and a
+    naive roll-word count can't tell that apart from an active roll
+    instruction (confirmed on a real MSFT analysis: "DO NOTHING (WATCH)" today,
+    with a contingent roll plan for 21 DTE, misclassified as ROLL).
+
+    Returns None — not a guess — if the API key is missing or the call fails,
+    so the caller falls back to the regex heuristic instead of trusting a bad
+    read.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return None
+    import requests
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": _ANTHROPIC_MODEL,
+                "max_tokens": 8,
+                "system": (
+                    "You classify options-trading analysis text into exactly one "
+                    "of: ROLL, HOLD, ASSIGNMENT. Classify the CURRENT, immediate "
+                    "recommendation only — ignore any future/contingent plan "
+                    "described for a later date (e.g. \"at 21 DTE, evaluate a "
+                    "roll\" is NOT a current ROLL recommendation if today's verdict "
+                    "is to do nothing/watch/hold). ASSIGNMENT means the advice is "
+                    "to accept/allow assignment rather than act. Reply with "
+                    "exactly one word: ROLL, HOLD, or ASSIGNMENT. No other text."
+                ),
+                "messages": [{"role": "user", "content": text[:6000]}],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        content = resp.json().get("content", [])
+        reply = (content[0].get("text", "") if content else "").strip().upper()
+        if reply in ("ROLL", "HOLD", "ASSIGNMENT"):
+            return reply
+        log.warning("[llm-classify] unexpected reply %r, falling back to regex", reply)
+    except Exception as exc:
+        log.warning("[llm-classify] failed, falling back to regex: %s", exc)
+    return None
+
+
+def _detect_unborn_action_llm(text: str) -> str | None:
+    """
+    Classify whether an "unborn" (no existing position yet) covered-call/CSP
+    analysis recommends opening a new position or doing nothing this cycle.
+
+    Deliberately separate from _detect_recommendation_llm: that one's
+    ROLL/HOLD/ASSIGNMENT vocabulary is for managing an EXISTING position and
+    has no accurate bucket for "sell this new contract to open" — both it and
+    its regex fallback default to HOLD whenever the text doesn't mention
+    "roll" or "assignment", which describes essentially every unborn
+    recommendation regardless of whether it's actually telling you to sell
+    something (confirmed on real UAMY and USAR analyses that named a specific
+    strike/expiry/premium to sell and still got classified HOLD → badged
+    "DO NOTHING").
+
+    Returns None — not a guess — if the API key is missing or the call fails,
+    so the caller falls back to the existing regex "do nothing" heuristic.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return None
+    import requests
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": _ANTHROPIC_MODEL,
+                "max_tokens": 8,
+                "system": (
+                    "You classify options-trading analysis text about whether to "
+                    "open a NEW covered call or cash-secured put position — there "
+                    "is no existing position yet, so this is purely about entering "
+                    "one. Reply with exactly one word: SELL if the text recommends "
+                    "a specific contract (strike/expiry/premium) to sell/open right "
+                    "now, or WAIT if it recommends not opening a position this "
+                    "cycle (e.g. \"do nothing\", \"wait for a better setup\", no "
+                    "candidate met the criteria). No other text."
+                ),
+                "messages": [{"role": "user", "content": text[:6000]}],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        content = resp.json().get("content", [])
+        reply = (content[0].get("text", "") if content else "").strip().upper()
+        if reply in ("SELL", "WAIT"):
+            return reply
+        log.warning("[llm-classify-unborn] unexpected reply %r, falling back to regex", reply)
+    except Exception as exc:
+        log.warning("[llm-classify-unborn] failed, falling back to regex: %s", exc)
+    return None
+
+
 def _detect_recommendation(text: str) -> str:
+    """Classify a NotebookLM ROLL response as ROLL, HOLD, or ASSIGNMENT.
+
+    Tries the LLM classifier first (see _detect_recommendation_llm); falls
+    back to the regex/word-count heuristic below if the API key is missing or
+    the call fails, so this never blocks on the network being unavailable.
+    """
+    llm_result = _detect_recommendation_llm(text)
+    if llm_result is not None:
+        return llm_result
+    return _detect_recommendation_regex(text)
+
+
+def _detect_recommendation_regex(text: str) -> str:
     """Parse a NotebookLM ROLL response and return ROLL, HOLD, or ASSIGNMENT.
 
     Priority order:
@@ -1813,6 +2038,7 @@ async def run_roll_for_position(
         btc_chain_price = sto_chain_price = None
         sto_chain_desc  = None
         projected_roll_pnl = None
+        roll_btc_cost = roll_sto_credit = roll_close_cost = roll_close_price = None
         if rec == "ROLL" and pos_qty and matched_pos:
             _adapted_rows = [
                 {
@@ -1864,7 +2090,7 @@ async def run_roll_for_position(
             _rec_opt = None
             _sto_snippet = None
             for _sto_m in re.finditer(r'(?:sell\s+to\s+open|\bSTO\b)[^\n]{0,150}', text, re.IGNORECASE):
-                _candidate = _parse_recommended_option(_sto_m.group(0), _adapted_rows)
+                _candidate = _parse_recommended_option(_sto_m.group(0), _adapted_rows, trust_any_date=True)
                 if _candidate and _candidate.get("strike") is not None:
                     _rec_opt = _candidate
                     _sto_snippet = _sto_m.group(0)
@@ -1880,7 +2106,9 @@ async def run_roll_for_position(
                 # doesn't spell it out.
                 _type_m = re.search(r'\b(call|put)s?\b', _sto_snippet, re.IGNORECASE)
                 _prefer_type = _type_m.group(1).upper() if _type_m else _cur_type
-                _rec_opt = _parse_recommended_option(_sto_snippet, _adapted_rows, prefer_type=_prefer_type) or _rec_opt
+                _rec_opt = _parse_recommended_option(
+                    _sto_snippet, _adapted_rows, prefer_type=_prefer_type, trust_any_date=True
+                ) or _rec_opt
 
             if not _rec_opt:
                 _rec_opt = _parse_recommended_option(text, _adapted_rows, prefer_type=_cur_type)
@@ -1941,7 +2169,6 @@ async def run_roll_for_position(
             # the journal will actually record once the trades are entered for real
             # — chain["net_cash"] already has the real leg's fees baked in, so only
             # these three projected legs need it added here.
-            roll_btc_cost = roll_sto_credit = roll_close_cost = roll_close_price = None
             if sto_chain_price:
                 _btc_price = btc_chain_price if btc_chain_price is not None else current_leg_price
                 _btc_price = _btc_price or 0.0
@@ -2139,18 +2366,28 @@ async def run_unborn_for_ticker(
                     "text": "", "ticker": ticker, "strat": strat, "chain": display_rows}
 
         log.info("[unborn] display_rows count: %d, first: %s", len(display_rows), display_rows[0] if display_rows else None)
-        rec = _detect_recommendation(text)
-        # Detect DO NOTHING:
-        # 1. _detect_recommendation already returned HOLD (covers "Doing Nothing", bold variants, etc.)
-        # 2. Explicit "Recommendation: DO NOTHING" heading as a belt-and-suspenders check.
-        # 3. No chain options found AND text mentions "do nothing" anywhere (original guard).
+        # Detect DO NOTHING — deliberately NOT via _detect_recommendation: that
+        # classifier's ROLL/HOLD/ASSIGNMENT vocabulary is for an EXISTING
+        # position and defaults to HOLD whenever the text says neither "roll"
+        # nor "assignment", which is every unborn recommendation, correct or
+        # not. Use the unborn-specific SELL/WAIT classifier instead:
+        #   1. LLM says SELL/WAIT — trust it (still OR'd with the explicit
+        #      heading check below in case the LLM call is unavailable).
+        #   2. Explicit "Recommendation: DO NOTHING" heading as a fallback.
+        #   3. No chain options found AND text mentions "do nothing" anywhere
+        #      (original guard, only reached if the LLM call failed).
+        _action = _detect_unborn_action_llm(text)
         _explicit_do_nothing = bool(re.search(
             r'\brecommendation\b[:\s\*]+do\s+nothing\b',
             text, re.IGNORECASE
         ))
-        _do_nothing = (rec == "HOLD") or _explicit_do_nothing or (
-            (not display_rows) and bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", text, re.IGNORECASE))
-        )
+        if _action is not None:
+            _do_nothing = (_action == "WAIT") or _explicit_do_nothing
+        else:
+            _do_nothing = _explicit_do_nothing or (
+                (not display_rows) and bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", text, re.IGNORECASE))
+            )
+        rec = "HOLD" if _do_nothing else "SELL"
         if _do_nothing:
             # Return a placeholder row — option details are blank, ideal_entry = DO NOTHING
             chosen = {
@@ -2560,9 +2797,16 @@ function fmt(v, digits, prefix='') {
 // decay_quality: share of the price move since entry attributable to time decay
 // vs. a spot/vol move that could reverse. '—' whenever entry-snapshot data is
 // missing (older positions, or the capture call failed) — never a guess.
+function _opinionColor(opinion) {
+  if (opinion === 'Close') return 'var(--danger)';
+  if (opinion === 'Close/Roll' || opinion === 'Consider closing' || opinion === 'Hold (fragile)') return 'var(--warn)';
+  return 'var(--ok)';
+}
+
 function _decayCellHtml(d, dte, delta, symbol) {
   if (!d) return '—';
   const parts = [];
+  if (d.opinion) parts.push(`${d.opinion}${d.opinion_reason ? ' \\u2014 ' + d.opinion_reason : ''}`);
   if (d.spot_component != null) parts.push(`Spot: ${d.spot_component>=0?'+':''}$${d.spot_component.toFixed(3)}`);
   if (d.time_component != null) parts.push(`Time: ${d.time_component>=0?'+':''}$${d.time_component.toFixed(3)}`);
   if (d.vega_component != null) parts.push(`Vol: ${d.vega_component>=0?'+':''}$${d.vega_component.toFixed(3)}`);
@@ -2574,6 +2818,9 @@ function _decayCellHtml(d, dte, delta, symbol) {
   if (d.charm != null)          parts.push(`Charm: ${d.charm.toFixed(4)}/day`);
   if (d.note && d.decay_quality == null) parts.push(`(${d.note})`);
   const msg = esc(parts.join('\\n'));
+  const opinionBadge = d.opinion
+    ? `<span class="info-tip" data-tip="${msg}" style="color:${_opinionColor(d.opinion)};font-size:10px;margin-left:3px">${esc(d.opinion)}</span>`
+    : '';
 
   let gammaBadge = '';
   if (d.gamma_risk) {
@@ -2594,11 +2841,11 @@ function _decayCellHtml(d, dte, delta, symbol) {
   }
 
   if (d.decay_quality == null) {
-    return `<span class="info-tip" data-tip="${msg}" style="color:var(--muted)">—</span>${gammaBadge}`;
+    return `<span class="info-tip" data-tip="${msg}" style="color:var(--muted)">—</span>${gammaBadge}${opinionBadge}`;
   }
   const pct = d.decay_quality * 100;
   const color = pct >= 70 ? 'var(--ok)' : pct >= 35 ? 'var(--warn)' : 'var(--danger)';
-  return `<span class="info-tip" data-tip="${msg}" style="color:${color}">${pct.toFixed(0)}%</span>${gammaBadge}`;
+  return `<span class="info-tip" data-tip="${msg}" style="color:${color}">${pct.toFixed(0)}%</span>${gammaBadge}${opinionBadge}`;
 }
 
 // Shared, JS-positioned tooltip for .info-tip elements. Deliberately NOT a
@@ -3642,7 +3889,7 @@ function _renderFormerTableInner(el) {
   const sortFns = [
     p => p.symbol, p => p.strat, p => 0, p => '', p => '',
     p => p.qty, p => 999, p => -99, p => 0, p => 0,
-    p => p.ul_cost_basis ?? 0, p => '',
+    p => p.ul_cost_basis ?? 0, p => '', p => p.earnings_date || '',
   ];
   const fn = sortFns[_formerSortCol] || (p => 0);
   rows.sort((a, b) => {
@@ -3655,7 +3902,7 @@ function _renderFormerTableInner(el) {
 
   const hdrs = [th('Symbol',0),th('Type',1),th('Strike',2),th('Expiry',3),th('Side',4),
                 th('Qty',5),th('DTE',6),th('Delta',7),th('U/L Price',8),th('Opt Price',9),
-                th('Cost Basis',10),th('Ideal Entry',11),
+                th('Cost Basis',10),th('Ideal Entry',11),th('Earnings',12),
                 '<th>Actions</th>',
                 '<th style="text-align:center;cursor:pointer" onclick="unhideAllFormer()" title="Click to unhide all">Hide</th>'].join('');
 
@@ -3664,6 +3911,9 @@ function _renderFormerTableInner(el) {
     const rawKey = p.symbol + '|' + p.strat;
     const key = esc(rawKey);
     const hidden = _hiddenFormerRows.has(rawKey);
+    const earningsCell = (!p.earnings_date || p.earnings_date === 'Unknown')
+      ? '—'
+      : `${esc(p.earnings_date)}${p.earnings_source === 'estimated' ? ' <span style="color:var(--muted);font-size:10px" title="No confirmed date from the exchange yet — estimated from the last report + one quarter">(est.)</span>' : ''}`;
     return `<tr${hidden ? ' style="display:none"' : ''}>
       <td><b>${sym}</b></td>
       <td>${esc(p.strat)}</td>
@@ -3674,6 +3924,7 @@ function _renderFormerTableInner(el) {
       <td>—</td>
       <td>${fmtCb(p.ul_cost_basis)}</td>
       <td>—</td>
+      <td>${earningsCell}</td>
       <td><button data-key="${key}" onclick="analyzeFormerPosition(this.dataset.key,this)"
           style="font-size:11px;padding:3px 8px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">Analyze</button></td>
       <td style="text-align:center">
@@ -6160,12 +6411,20 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                     cb = float(r["ul_cost_basis"] or 0)
                 except (TypeError, ValueError):
                     cb = 0.0
+                try:
+                    kd = get_key_dates(sym)
+                    earnings_date = kd.get("earnings_date")
+                    earnings_source = kd.get("earnings_source")
+                except Exception:
+                    earnings_date, earnings_source = "Unknown", "unknown"
                 result.append({
                     "symbol": sym,
                     "strat": "CSP" if opt == "put" else "CC",
                     "ul_cost_basis": cb,
                     "qty": int(r["qty"] or 1),
                     "ul_price": get_underlying_price(sym),
+                    "earnings_date": earnings_date,
+                    "earnings_source": earnings_source,
                 })
             return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
         except Exception as exc:
@@ -6330,11 +6589,19 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                             except ValueError:
                                 _dte = None
                             _delta_val = _f2(_g.get("delta"))
+                            _pct_pnl = None
+                            _net_qty = _p.get("net_qty") or 0
+                            if _cur_price is not None and pos_avg_price is not None and pos_avg_price != 0:
+                                _abs_pnl = (
+                                    (pos_avg_price - _cur_price) if _net_qty > 0 else (_cur_price + pos_avg_price)
+                                ) * 100 * pos_qty
+                                _pct_pnl = _abs_pnl / (abs(pos_avg_price) * 100 * pos_qty) * 100
                             decay_info = compute_decay_signals(
                                 _p, _dte, _underlying, _cur_price,
                                 _delta_val, _f2(_g.get("gamma")),
                                 _f2(_g.get("theta")), _f2(_g.get("vega")),
                                 _f2(_g.get("impliedVolatility")),
+                                _pct_pnl,
                             )
                         except Exception as _decay_exc:
                             log.warning("[analyze decay] failed for %s: %s", pos_key, _decay_exc)
@@ -6512,11 +6779,23 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                 dgamma    = d.get("dollar_gamma")
                 vanna     = d.get("vanna")
                 charm     = d.get("charm")
+                opinion        = d.get("opinion")
+                opinion_reason = d.get("opinion_reason")
+                if opinion:
+                    _op_color = ("var(--danger)" if opinion == "Close"
+                                 else "var(--warn)" if opinion in ("Close/Roll", "Consider closing", "Hold (fragile)")
+                                 else "var(--ok)")
+                    opinion_line = (
+                        f'<br><strong style="color:{_op_color}">{html_mod.escape(opinion)}</strong>'
+                        f'{" — " + html_mod.escape(opinion_reason) if opinion_reason else ""}'
+                    )
+                else:
+                    opinion_line = ""
                 decay_html = (
                     f'<div class="chain-pnl" style="margin-top:14px">'
                     f'<span class="chain-label">Decay Quality Analysis</span>'
                     f'<span class="chain-working">'
-                    f'{dq_line}{gamma_note}<br>'
+                    f'{dq_line}{opinion_line}{gamma_note}<br>'
                     f'Spot: {_dfmt(d.get("spot_component"))}'
                     f'&nbsp;&nbsp;Time: {_dfmt(d.get("time_component"))}'
                     f'&nbsp;&nbsp;Vol: {_dfmt(d.get("vega_component"))}'
