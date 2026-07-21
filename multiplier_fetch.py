@@ -233,24 +233,34 @@ def _classify_post(title: str, pub: str) -> str | None:
 
 
 def get_latest_posts() -> list[dict]:
-    """Return the most recent Review AND Plan post from the archive (whichever exist)."""
-    url   = f"{SUBSTACK_BASE}/api/v1/archive?sort=new&limit=25"
-    posts = requests.get(url, timeout=30).json()
+    """Return the most recent Review AND Plan post from the RSS feed (whichever exist).
+
+    The RSS feed indexes new posts faster than /api/v1/archive, which can lag
+    by hours right after publish and cause the scheduler to miss same-day posts.
+    """
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+
+    resp = requests.get(f"{SUBSTACK_BASE}/feed", timeout=30)
+    root = ET.fromstring(resp.content)
     found: dict[str, dict] = {}
-    for post in posts:
-        title     = post.get("title", "")
-        canonical = post.get("canonical_url", "")
-        if not canonical:
-            slug = post.get("slug", "")
-            canonical = f"{SUBSTACK_BASE}/p/{slug}"
-        pub       = post.get("post_date") or post.get("published_at") or ""
+    for item in root.iter("item"):
+        title   = (item.findtext("title") or "").strip()
+        link    = (item.findtext("link") or "").strip()
+        pub_raw = (item.findtext("pubDate") or "").strip()
+        pub = ""
+        if pub_raw:
+            try:
+                pub = parsedate_to_datetime(pub_raw).isoformat()
+            except Exception:
+                pass
         post_type = _classify_post(title, pub)
         if post_type and post_type not in found:
-            found[post_type] = {"type": post_type, "url": canonical, "title": title, "post_date": pub}
+            found[post_type] = {"type": post_type, "url": link, "title": title, "post_date": pub}
         if len(found) == 2:
             break
     if not found:
-        raise RuntimeError("No recent Review or Plan post found in the archive.")
+        raise RuntimeError("No recent Review or Plan post found in the RSS feed.")
     return list(found.values())
 
 
