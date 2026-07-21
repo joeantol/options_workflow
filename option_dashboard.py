@@ -43,6 +43,9 @@ from functools import wraps
 from pathlib import Path
 
 import greeks_pricing
+import claude_advisor
+import openai_advisor
+import iv_history
 
 try:
     from dotenv import load_dotenv
@@ -884,6 +887,58 @@ def get_option_greeks_batch(token: str, account_id: str, osi_symbols: list[str])
     return result
 
 
+def _render_advisor_markdown(text: str) -> str:
+    """
+    Minimal markdown -> HTML for the Luna second-opinion text: **bold**,
+    *italic*, '- ' bullets (wrapped in a real <ul>), blank-line paragraph
+    breaks. Deliberately separate from the main analysis body's line-by-line
+    renderer (headers/tables/etc.) — Claude/Luna's output is plain prose per
+    their shared system prompt, doesn't need that much machinery.
+    """
+    import html as _html_mod
+
+    def _inline(s: str) -> str:
+        s = _html_mod.escape(s)
+        s = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', s)
+        s = re.sub(r'\*(.+?)\*', r'<em>\1</em>', s)
+        return s
+
+    blocks: list[str] = []
+    bullet_buf: list[str] = []
+
+    def _flush_bullets():
+        if bullet_buf:
+            blocks.append('<ul style="margin:4px 0 4px 20px">' + "".join(bullet_buf) + '</ul>')
+            bullet_buf.clear()
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            _flush_bullets()
+            continue
+        if re.fullmatch(r'-{3,}|\*{3,}', line):
+            _flush_bullets()
+            blocks.append('<hr style="border:none;border-top:1px solid var(--border);margin:10px 0">')
+            continue
+        _heading_m = re.match(r'(#{1,4})\s+(.*)', line)
+        if _heading_m:
+            _flush_bullets()
+            # Inline-styled — this card uses .chain-working, not .rec-body,
+            # so it doesn't inherit the analyze-body heading CSS.
+            blocks.append(
+                f'<p style="margin-top:10px;font-weight:600;color:var(--accent)">'
+                f'{_inline(_heading_m.group(2))}</p>'
+            )
+            continue
+        if line.startswith("- ") or line.startswith("• "):
+            bullet_buf.append(f"<li>{_inline(line[2:])}</li>")
+            continue
+        _flush_bullets()
+        blocks.append(f'<p style="margin-bottom:10px">{_inline(line)}</p>')
+    _flush_bullets()
+    return "".join(blocks)
+
+
 def _decay_opinion(
     gamma_risk: bool,
     decay_quality: float | None,
@@ -1227,6 +1282,7 @@ def get_eval_data(
         opt_theta: float | None = _to_f(greeks.get("theta"))
         opt_vega: float | None = _to_f(greeks.get("vega"))
         current_iv: float | None = _to_f(greeks.get("impliedVolatility"))
+        iv_history.record_iv_snapshot(sym, current_iv)
 
         # Current price: prefer mid=(bid+ask)/2, then last
         quote = quotes.get(osi, {})
@@ -1371,6 +1427,7 @@ def get_eval_data(
 
     flagged_count = sum(1 for p in result_positions if p["flagged"])
     vix = get_vix()
+    iv_history.record_iv_snapshot(iv_history.VIX_TICKER, vix)
     return {
         "positions": result_positions,
         "skipped": skipped,
@@ -1948,22 +2005,17 @@ async def run_roll_for_position(
                 "ticker": ticker,
             }
 
-        output_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
-        )
-        with open(output_file, "w", newline="") as tmp:
-            writer = csv.DictWriter(tmp, fieldnames=CSV_COLUMNS)
-            writer.writeheader()
-            writer.writerows(all_rows)
-
-        source_id = None
-        try:
-            source_id = await upload_to_notebooklm(output_file, notebook_id)
-        finally:
-            try:
-                os.unlink(output_file)
-            except OSError:
-                pass
+        # Compact candidate-strike summary from this SAME chain fetch, for
+        # Claude's comparison opinion (claude_advisor.py) — reuses all_rows
+        # rather than a second Public.com hit. Current leg's own type, parsed
+        # straight from pos_key (cheap, no need to wait for matched_pos below).
+        chain_candidates_text = None
+        if pos_key:
+            _pk_parts = pos_key.split("|")
+            if len(_pk_parts) == 4:
+                chain_candidates_text = claude_advisor.build_chain_candidates_text(
+                    all_rows, _pk_parts[1].upper(), current_expiry=_pk_parts[3]
+                )
 
         key_dates = get_key_dates(ticker)
         vix = get_vix()
@@ -2008,27 +2060,37 @@ async def run_roll_for_position(
         chain = get_chain_net_cash(spread_id, fallback_pos_id=matched_pos.get("id") if matched_pos else None)
         current_leg_price = float(matched_pos["current_price"]) if matched_pos and matched_pos.get("current_price") is not None else None
 
-        # Give the source time to finish processing before querying (wait=False upload)
-        if source_id:
-            await asyncio.sleep(15)
-        try:
-            text = await query_notebooklm(
-                notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
-                silent=True,
-                ul_cost_basis=ul_cost_basis,
-                chain_data=chain,
-                current_leg_price=current_leg_price,
-            )
-        finally:
-            await delete_notebooklm_source(notebook_id, source_id)
-        if not text:
-            return {"error": "Empty response from NotebookLM", "recommendation": "HOLD", "text": "", "ticker": ticker}
+        # Claude is the primary advisor (see claude_advisor.py) — build the
+        # same rich position context /api/openai-compare uses for the second
+        # opinion (live Greeks, decay signals, ATR/IV, dte, reasons), rather
+        # than the bare DB row in matched_pos, so the primary analysis has
+        # full data to reason over.
+        eval_data = get_eval_data(token, account_id, ticker=ticker, verbose=False)
+        claude_pos = None
+        for _p in eval_data.get("positions", []):
+            try:
+                if (str(_p.get("option_type", "")).upper() == pk_type
+                        and float(_p.get("strike") or -1) == pk_strike
+                        and str(_p.get("expiry")) == pk_expiry):
+                    claude_pos = _p
+                    break
+            except (TypeError, ValueError):
+                continue
+        if claude_pos is None:
+            return {"error": f"Position not found in live eval data for {ticker}", "recommendation": "HOLD", "text": "", "ticker": ticker}
+
+        claude_context = claude_advisor.build_position_context(claude_pos, eval_data.get("vix"), key_dates)
+        claude_result = claude_advisor.query_claude_advisor(claude_context, chain_candidates_text)
+        if claude_result.get("error"):
+            return {"error": claude_result["error"], "recommendation": "HOLD", "text": "", "ticker": ticker}
+        text = claude_result["text"]
+        tail_text = claude_result.get("tail_text")
 
         # Expected PnL: close current position at 40% of sale price (keep 60%)
         pos_avg_price = float(matched_pos["avg_price"]) if matched_pos and matched_pos.get("avg_price") is not None else None
         pos_qty       = abs(int(matched_pos["net_qty"])) if matched_pos and matched_pos.get("net_qty") is not None else None
 
-        rec = _detect_recommendation(text)
+        rec = claude_result.get("recommendation") or "HOLD"
 
         # Confirmed BTC/STO prices from the exact option chain snapshot uploaded to
         # NotebookLM — used below for the hard PnL guard, and returned so the
@@ -2205,6 +2267,7 @@ async def run_roll_for_position(
         return {
             "recommendation": rec,
             "text": text,
+            "tail_text": tail_text,  # so /api/ask can replay this turn for follow-ups
             "ticker": ticker,
             "chain_cash":      chain["net_cash"],       # for dashboard badge
             "chain_collected": chain["collected"],
@@ -2223,6 +2286,7 @@ async def run_roll_for_position(
             "roll_sto_credit":  roll_sto_credit,   # incl. estimated commission/fees
             "roll_close_cost":  roll_close_cost,   # incl. estimated commission/fees
             "roll_close_price": roll_close_price,  # 40% of sto_chain_price
+            "chain_candidates_text": chain_candidates_text,  # for claude_advisor's reuse — same chain, no 2nd fetch
             "error": None,
         }
 
@@ -2326,67 +2390,32 @@ async def run_unborn_for_ticker(
                 "opt_price":   row.get("mid_price") or row.get("last"),
             })
 
-        output_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
-        )
-        with open(output_file, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-            writer.writeheader()
-            writer.writerows(all_rows)
-
-        source_id = None
-        try:
-            source_id = await upload_to_notebooklm(output_file, notebook_id)
-        finally:
-            try:
-                os.unlink(output_file)
-            except OSError:
-                pass
+        # Same chain fetch as above, reused for Claude's opinion (claude_advisor.py)
+        # — no separate Public.com hit.
+        chain_candidates_text = claude_advisor.build_chain_candidates_text(all_rows, opt_type_filter)
 
         key_dates = get_key_dates(ticker)
         vix = get_vix()
+        atr = get_atr(ticker)
 
-        # Synthetic position representing the intended trade size
-        synthetic_positions = [{"symbol": ticker, "option_type": strat, "net_qty": -qty,
-                                 "avg_price": None, "strike": None, "expiry": None}]
-
-        # Give the source time to finish processing before querying (wait=False upload)
-        if source_id:
-            await asyncio.sleep(15)
-        try:
-            text = await query_notebooklm(
-                notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
-                silent=True,
-                ul_cost_basis=ul_cost_basis,
-            )
-        finally:
-            await delete_notebooklm_source(notebook_id, source_id)
-        if not text:
-            return {"error": "Empty response from NotebookLM", "recommendation": "HOLD",
+        # Claude is the primary advisor (see claude_advisor.py) — no chain CSV
+        # upload/source needed since Claude reads the candidate list directly
+        # from chain_candidates_text, not a full uploaded chain document.
+        claude_context = claude_advisor.build_unborn_context(ticker, strat, ul_price, ul_cost_basis, vix, atr, key_dates)
+        claude_result = claude_advisor.query_claude_unborn_advisor(claude_context, chain_candidates_text)
+        if claude_result.get("error"):
+            return {"error": claude_result["error"], "recommendation": "HOLD",
                     "text": "", "ticker": ticker, "strat": strat, "chain": display_rows}
+        text = claude_result["text"]
+        tail_text = claude_result.get("tail_text")
 
         log.info("[unborn] display_rows count: %d, first: %s", len(display_rows), display_rows[0] if display_rows else None)
-        # Detect DO NOTHING — deliberately NOT via _detect_recommendation: that
-        # classifier's ROLL/HOLD/ASSIGNMENT vocabulary is for an EXISTING
-        # position and defaults to HOLD whenever the text says neither "roll"
-        # nor "assignment", which is every unborn recommendation, correct or
-        # not. Use the unborn-specific SELL/WAIT classifier instead:
-        #   1. LLM says SELL/WAIT — trust it (still OR'd with the explicit
-        #      heading check below in case the LLM call is unavailable).
-        #   2. Explicit "Recommendation: DO NOTHING" heading as a fallback.
-        #   3. No chain options found AND text mentions "do nothing" anywhere
-        #      (original guard, only reached if the LLM call failed).
-        _action = _detect_unborn_action_llm(text)
-        _explicit_do_nothing = bool(re.search(
-            r'\brecommendation\b[:\s\*]+do\s+nothing\b',
-            text, re.IGNORECASE
-        ))
-        if _action is not None:
-            _do_nothing = (_action == "WAIT") or _explicit_do_nothing
-        else:
-            _do_nothing = _explicit_do_nothing or (
-                (not display_rows) and bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", text, re.IGNORECASE))
-            )
+        # Claude already returns a clean SELL/WAIT recommendation (parsed by
+        # claude_advisor._call_claude) — no text-classification heuristics
+        # needed. "HOLD" is this dict's established vocabulary for the
+        # don't-act case (matching the existing-position return shape), even
+        # though claude_advisor's own SELL/WAIT terminology differs.
+        _do_nothing = (claude_result.get("recommendation") != "SELL")
         rec = "HOLD" if _do_nothing else "SELL"
         if _do_nothing:
             # Return a placeholder row — option details are blank, ideal_entry = DO NOTHING
@@ -2427,11 +2456,14 @@ async def run_unborn_for_ticker(
         return {
             "recommendation": rec,
             "text": text,
+            "tail_text": tail_text,  # so /api/ask-unborn can replay this turn for follow-ups
             "ticker": ticker,
             "strat": strat,
             "chain": [chosen] if chosen else [],
             "ul_cost_basis": ul_cost_basis,
+            "ul_price": ul_price,
             "_do_nothing": _do_nothing,
+            "chain_candidates_text": chain_candidates_text,  # for claude_advisor's reuse — same chain, no 2nd fetch
             "error": None,
         }
 
@@ -2446,6 +2478,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Option Dashboard</title>
+<script>(function(){try{if(localStorage.getItem('theme')==='light')document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23052e16' stroke='%2322c55e' stroke-width='3'/%3E%3Cpath d='M14 40 A20 20 0 1 1 50 40' fill='none' stroke='%23164b2a' stroke-width='6' stroke-linecap='round'/%3E%3Cpath d='M14 40 A20 20 0 0 1 44 18' fill='none' stroke='%2322c55e' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='32' cy='32' r='3' fill='%2322c55e'/%3E%3Cline x1='32' y1='32' x2='44' y2='20' stroke='%2386efac' stroke-width='2.5' stroke-linecap='round'/%3E%3Ctext x='32' y='50' text-anchor='middle' font-size='8' fill='%2322c55e' font-family='monospace'%3EOPTS%3C/text%3E%3C/svg%3E">
 <style>
   :root {
@@ -2453,9 +2486,25 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
     --text: #e2e8f0; --muted: #8892a4; --accent: #4f8ef7;
     --ok: #22c55e; --warn: #facc15; --danger: #ef4444;
     --ok-bg: #052e16; --warn-bg: #3a2e00; --danger-bg: #450a0a;
+    --warn-row-bg: #1f1a0a; --danger-row-bg: #1f0a0a; --hold-bg: #0c1a2e;
+    --tooltip-bg: #1e1e2e; --tooltip-fg: #f87171;
+  }
+  :root[data-theme="light"] {
+    --bg: #f7f8fa; --surface: #ffffff; --border: #dde1e8;
+    --text: #1a1d27; --muted: #667085; --accent: #2563eb;
+    --ok: #16a34a; --warn: #b45309; --danger: #dc2626;
+    --ok-bg: #dcfce7; --warn-bg: #fef3c7; --danger-bg: #fee2e2;
+    --warn-row-bg: #fefaf0; --danger-row-bg: #fef5f5; --hold-bg: #dbeafe;
+    --tooltip-bg: #1a1d27; --tooltip-fg: #fca5a5;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
+  .theme-switch { position: relative; display: inline-block; width: 32px; height: 17px; flex-shrink: 0; }
+  .theme-switch input { opacity: 0; width: 0; height: 0; }
+  .theme-switch .slider { position: absolute; inset: 0; background: var(--border); border-radius: 17px; cursor: pointer; transition: background .15s; }
+  .theme-switch .slider::before { content: ""; position: absolute; width: 13px; height: 13px; left: 2px; top: 2px; background: var(--surface); border-radius: 50%; transition: transform .15s; }
+  .theme-switch input:checked + .slider { background: var(--accent); }
+  .theme-switch input:checked + .slider::before { transform: translateX(15px); }
   header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 14px 24px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
   header h1 { font-size: 16px; font-weight: 600; color: var(--accent); letter-spacing: 0.05em; }
   .stat { display: flex; flex-direction: column; gap: 2px; }
@@ -2482,20 +2531,20 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   th.sorted-desc::after { content: " ▼"; }
   td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; white-space: nowrap; transition: font-size 80ms ease, padding-top 80ms ease, padding-bottom 80ms ease; }
   tr.ok-row   td { background: transparent; }
-  tr.warn-row td { background: #1f1a0a; }
-  tr.danger-row td { background: #1f0a0a; }
+  tr.warn-row td { background: var(--warn-row-bg); }
+  tr.danger-row td { background: var(--danger-row-bg); }
   tr:hover td { filter: brightness(1.15); font-size: 15px; padding-top: 12px; padding-bottom: 12px; }
   #unborn-chain tbody tr:hover td, #former-chain tbody tr:hover td { padding-top: 9px; padding-bottom: 9px; }
   .badge { display: inline-block; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 600; letter-spacing: 0.05em; }
   .badge-ok     { background: var(--ok-bg);   color: var(--ok);   }
-  .badge-hold   { background: #0c1a2e; color: var(--accent); border: 1px solid var(--accent); }
+  .badge-hold   { background: var(--hold-bg); color: var(--accent); border: 1px solid var(--accent); }
   .badge-warn   { background: var(--warn-bg); color: var(--warn); }
   .badge-danger { background: var(--danger-bg); color: var(--danger); }
   .reasons { font-size: 11px; color: var(--muted); white-space: normal; max-width: 360px; }
   .err-tip { position: relative; display: inline-block; cursor: default; }
   .err-tip .err-msg {
     display: none; position: absolute; z-index: 100; bottom: calc(100% + 6px); left: 50%;
-    transform: translateX(-50%); background: #1e1e2e; color: #f87171; border: 1px solid #f87171;
+    transform: translateX(-50%); background: var(--tooltip-bg); color: var(--tooltip-fg); border: 1px solid var(--tooltip-fg);
     border-radius: 6px; padding: 7px 10px; font-size: 11px; white-space: pre-wrap;
     max-width: 340px; min-width: 140px; word-break: break-word; box-shadow: 0 4px 16px #0008;
     pointer-events: none;
@@ -2541,6 +2590,13 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="stat"><span class="stat-label">As of</span><span class="stat-value muted" id="h-time" style="font-size:12px">—</span></div>
   <div id="multiplier-files" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><!--MULTIPLIER_FILES--></div>
   <div class="actions">
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted)">
+      <span class="theme-switch">
+        <input type="checkbox" id="theme-toggle" onchange="toggleTheme()" checked>
+        <span class="slider"></span>
+      </span>
+      Dark mode
+    </label>
     <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--muted)">
       <input type="checkbox" id="collapse-ok" onchange="applyCollapseOk()" style="cursor:pointer;accent-color:var(--accent)">
       Collapse OK
@@ -2606,6 +2662,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
         <th data-col="opt_price" onclick="sortTable(11)">Opt Price</th>
         <th data-col="pnl" onclick="sortTable(12)">PnL</th>
         <th data-col="status">Status / Flags</th>
+        <th data-col="dont_analyze" style="text-align:center" title="If checked, scheduled auto-analysis skips this position. Flags still light up, and pressing Analyze still works.">DON'T ANALYZE</th>
         <th data-col="action">Action<br><button onclick="resetRecommendations()" style="font-size:10px;padding:2px 7px;margin-top:4px;font-weight:normal">Reset</button></th>
         <th data-col="alert" style="text-align:center">Alert</th>
         <th data-col="hide" style="text-align:center;cursor:pointer" onclick="unhideAll()" title="Click to unhide all">Hide</th>
@@ -2670,6 +2727,7 @@ _WEB_DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 <script>
+const _SERVER_VERSION = "<!--SERVER_VERSION-->";
 let _data = [];
 const _LS_SORT_KEY = 'optionsSortState';
 let _sortCol = (() => { try { return JSON.parse(localStorage.getItem(_LS_SORT_KEY) || '[0,1]')[0]; } catch { return 0; } })();
@@ -2736,6 +2794,14 @@ async function fetchData() {
 }
 
 function applyData(d) {
+  // Server restarted (code deploy) since this tab loaded — a stale tab keeps
+  // polling data-only endpoints forever on old JS otherwise, silently missing
+  // any fix. Force a real reload so the tab always picks up current code.
+  if (d.server_version && _SERVER_VERSION && d.server_version !== _SERVER_VERSION) {
+    console.warn('[version] server restarted (', _SERVER_VERSION, '→', d.server_version, ') — reloading');
+    location.reload();
+    return;
+  }
   _data = d.positions || [];
   // Seed _prevUlPrices from server data so the first price poll can show ticks
   for (const p of _data) {
@@ -2864,7 +2930,7 @@ function _showInfoTip(target) {
   if (!_tipEl) {
     _tipEl = document.createElement('div');
     _tipEl.id = '_infoTooltip';
-    _tipEl.style.cssText = 'display:none;position:fixed;z-index:99999;background:#1e1e2e;' +
+    _tipEl.style.cssText = 'display:none;position:fixed;z-index:99999;background:var(--surface);' +
       'color:var(--text);border:1px solid var(--border);border-radius:6px;padding:9px 12px;' +
       'font-size:11px;line-height:1.5;white-space:pre-wrap;max-width:380px;min-width:200px;' +
       'word-break:break-word;box-shadow:0 4px 16px #0008;pointer-events:none;text-align:left';
@@ -3225,6 +3291,9 @@ function renderTable() {
         const ulTitle = flagChanged ? 'title="Flags changed since last refresh"' : '';
         return `<ul class="reasons" style="${ulStyle}" ${ulTitle}>${allItems}</ul>`;
       })()}</td>
+      <td style="text-align:center"><input type="checkbox" ${p.dont_analyze ? 'checked' : ''}
+        onchange="_toggleDontAnalyze('${posKey.replace(/'/g,"\\'")}', this.checked)"
+        style="cursor:pointer;accent-color:var(--accent);width:14px;height:14px"></td>
       <td${actionTdAttr}>${actionCell}</td>
       <td style="text-align:center">${(() => {
         const hasAlert = !!_alerts[posKey];
@@ -3252,6 +3321,7 @@ function renderTable() {
   // Auto-analyze flagged positions that don't have a cached recommendation yet
   for (const p of rows) {
     if (!p.flagged) continue;
+    if (p.dont_analyze) continue;
     const posKey = [p.symbol, p.option_type, String(p.strike||''), p.expiry||''].join('|');
     if (_recommendations[posKey]) continue;
     if (_autoQueued.has(posKey)) continue;
@@ -3265,6 +3335,7 @@ function renderTable() {
 
   // Auto-rerun analysis when flag tier, delta (±0.05), or underlying (±$0.50) changes
   for (const p of rows) {
+    if (p.dont_analyze) continue;
     const posKey = [p.symbol, p.option_type, String(p.strike||''), p.expiry||''].join('|');
     const newFP  = _analysisFP(p);
     const oldFP  = _prevAnalysisFP[posKey];
@@ -3275,13 +3346,11 @@ function renderTable() {
     if (_autoRerunAt[posKey] && now - _autoRerunAt[posKey] < _AUTO_RERUN_COOLDOWN_MS) continue;
     _autoRerunAt[posKey] = now;
     console.log('[auto-rerun]', posKey, ':', oldFP, '→', newFP);
-    delete _recommendations[posKey];
-    _saveRecs(_recommendations);
-    fetch('/api/reset-cache-entry', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({position_key: posKey})
-    }).catch(() => {});
-    analyzePosition(posKey, null);
+    // Force a fresh server-side recompute without clearing the existing cache
+    // entry first — the old (still-correct-enough) analysis stays visible on
+    // the page until the new one is ready, instead of a blank "not found" gap
+    // if this fetch never completes (backgrounded/closed tab, network drop).
+    analyzePosition(posKey, null, true);
   }
 }
 
@@ -3304,6 +3373,14 @@ function applyCollapseOk() {
     tr.style.display = hide ? 'none' : '';
   });
 }
+
+function toggleTheme() {
+  const dark = document.getElementById('theme-toggle').checked;
+  const theme = dark ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', theme);
+  try { localStorage.setItem('theme', theme); } catch {}
+}
+document.getElementById('theme-toggle').checked = document.documentElement.getAttribute('data-theme') !== 'light';
 
 // Persist recommendations across browser refreshes via localStorage
 const _LS_KEY = 'optionsRecs';
@@ -3388,6 +3465,21 @@ function _toggleHide(posKey, checked, snapshot, trEl) {
     if (trEl) trEl.style.display = '';
   }
   _saveHidden();
+}
+// ────────────────────────────────────────────────────────────────────────────
+
+// ── Don't-analyze toggle (server-persisted — skips scheduled auto-analysis
+// for this position; flags still light up, manual Analyze still works) ──────
+async function _toggleDontAnalyze(posKey, checked) {
+  const p = _data.find(row => [row.symbol, row.option_type, String(row.strike||''), row.expiry||''].join('|') === posKey);
+  if (p) p.dont_analyze = checked;
+  try {
+    await fetch('/api/dont-analyze', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({position_key: posKey, checked})
+    });
+  } catch (e) { console.error('dont-analyze toggle failed', e); }
 }
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -3955,18 +4047,22 @@ async function analyzeFormerPosition(key, btn) {
   btn.disabled = true;
   btn.innerHTML = '<span style="display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle"></span>';
 
-  await fetch('/api/unborn-cache-delete', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({row_key: key})
-  });
-
   try {
     let d;
+    let forceNow = true;
     while (true) {
       const r = await fetch('/api/unborn', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ticker, qty, strat, cost_basis: cb})
+        body: JSON.stringify({ticker, qty, strat, cost_basis: cb, force: forceNow})
       });
+      // Only force the very first request in this sequence — re-sending
+      // force:true on every retry bypasses the server's cache/in-flight
+      // check every time, so a fast-completing analysis (e.g. "no option
+      // support") never gets a chance to be returned: each poll finds
+      // nothing in-flight (the prior one already finished) and force
+      // skips the cache hit too, so it just restarts forever. Confirmed
+      // live on PPIH — polled every ~5s in a genuine infinite loop.
+      forceNow = false;
       let raw;
       try { raw = await r.text(); d = JSON.parse(raw); }
       catch { throw new Error('Non-JSON: ' + (raw||'').slice(0,200)); }
@@ -4025,21 +4121,16 @@ async function recalcUnbornRow(key, btn) {
   // Columns: 0=Symbol,1=Type,2=Strike,3=Expiry,4=Side,5=Qty,6=DTE,7=Delta,8=UL,9=OptPrice,10=Basis,11=Ideal,12=Actions
   if (tr) [2, 3, 6, 7, 9].forEach(i => { if (tr.cells[i]) tr.cells[i].textContent = '—'; });
 
-  // Purge server-side cache so a fresh analysis runs
-  await fetch('/api/unborn-cache-delete', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({row_key: key})
-  });
-
   try {
     let d;
+    let forceNow = true;
     while (true) {
       const r = await fetch('/api/unborn', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ticker, qty, strat})
+        body: JSON.stringify({ticker, qty, strat, force: forceNow})
       });
+      forceNow = false;  // see analyzeFormerPosition's comment on the PPIH infinite-loop bug
       let raw;
       try { raw = await r.text(); d = JSON.parse(raw); }
       catch { throw new Error('Non-JSON: ' + (raw||'').slice(0,200)); }
@@ -4109,7 +4200,7 @@ function _actionCell(key) {
     [...document.querySelectorAll('[data-poskey]')].find(el => el.dataset.poskey === key);
 }
 
-async function analyzePosition(key, btn) {
+async function analyzePosition(key, btn, force) {
   if (btn) {
     btn.disabled = true;
     btn.style.background = 'orange';
@@ -4126,13 +4217,15 @@ async function analyzePosition(key, btn) {
   console.log('[analyze] starting:', key);
   try {
     let d;
+    let forceNow = !!force;
     // Poll until the server finishes (handles concurrent in-progress queries)
     while (true) {
       const r = await fetch('/api/analyze', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({position_key: key})
+        body: JSON.stringify({position_key: key, force: forceNow})
       });
+      forceNow = false;  // see analyzeFormerPosition's comment on the PPIH infinite-loop bug
       let raw;
       try {
         raw = await r.text();
@@ -4191,19 +4284,16 @@ async function findUnborn() {
 
   resultEl.innerHTML = '<span style="display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px"><span style="width:13px;height:13px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Analyzing…</span>';
   try {
-    // Always run fresh — clear any stale cached result for this ticker+strat
-    await fetch('/api/unborn-cache-delete', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({row_key: ticker + '|' + strat})
-    });
+    // Always run fresh
     let d;
+    let forceNow = true;
     while (true) {
       const r = await fetch('/api/unborn', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ticker, qty, strat})
+        body: JSON.stringify({ticker, qty, strat, force: forceNow})
       });
+      forceNow = false;  // see analyzeFormerPosition's comment on the PPIH infinite-loop bug
       let raw;
       try { raw = await r.text(); d = JSON.parse(raw); }
       catch { throw new Error('Server returned non-JSON: ' + (raw||'').slice(0,200)); }
@@ -4499,13 +4589,17 @@ async function _pollAnalysisUpdates() {
       }
       if (anyNew || (data.inflight || []).length > 0 || (data.unborn_inflight || []).length > 0) nextDelay = _AU_FAST_MS;
     }
-    // Unborn rows — merge in any rows whose _run_at changed
+    // Unborn rows — merge in any rows whose _run_at changed, AND pick up rows
+    // the server persisted directly (e.g. a background analysis that finished
+    // after this tab stopped polling it) that this tab never had locally.
     const ru = await fetch('/api/unborn-rows');
     if (ru.ok) {
       const serverRows = await ru.json();
       let unbornUpdated = false;
       for (const [key, row] of Object.entries(serverRows)) {
-        if (_unbornRows[key] && row._run_at && _unbornRows[key]._run_at !== row._run_at) {
+        if (_deletedUnbornKeys.has(key)) continue;
+        const existing = _unbornRows[key];
+        if (!existing || (row._run_at && existing._run_at !== row._run_at)) {
           _unbornRows[key] = row;
           unbornUpdated = true;
         }
@@ -5281,6 +5375,13 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
+    # Process-start timestamp, embedded in every served page and every /api/eval
+    # response — client-side JS compares its own baked-in copy against the live
+    # value on every poll and force-reloads on mismatch. Without this, a tab left
+    # open across a server restart/deploy just keeps polling data-only endpoints
+    # forever on stale JS, silently ignoring fixes (bit us three times running).
+    _SERVER_VERSION = str(int(datetime.datetime.now().timestamp()))
+
     # ── Cloudflare Access auth ──────────────────────────────────────────────
     # No credential check here by design (matches dogpile/stocks/synopticon):
     # this process binds to 127.0.0.1 only, so the only traffic that can ever
@@ -5331,6 +5432,52 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             log.warning("Could not save analysis cache: %s", exc)
 
     _analysis_cache: dict[str, dict] = _load_cache()
+
+    # Persistent "don't analyze" set: posKey -> excluded from scheduled_refresh's
+    # flagged-position auto-analysis pass. Manual Analyze-button clicks and the
+    # flagging/badge logic itself are untouched by this — it only gates the cron.
+    _DONT_ANALYZE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dont_analyze.json")
+
+    def _load_dont_analyze() -> set[str]:
+        try:
+            with open(_DONT_ANALYZE_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return set()
+
+    def _save_dont_analyze(keys: set[str]) -> None:
+        try:
+            with open(_DONT_ANALYZE_FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(keys), f)
+        except Exception as exc:
+            log.warning("Could not save dont-analyze set: %s", exc)
+
+    _dont_analyze: set[str] = _load_dont_analyze()
+
+    def _pos_key_str(p: dict) -> str:
+        strike = p.get("strike")
+        try:
+            f = float(strike)
+            strike_str = str(int(f)) if f == int(f) else str(f)
+        except (TypeError, ValueError):
+            strike_str = str(strike or "")
+        return "|".join([str(p.get("symbol", "")), str(p.get("option_type", "")), strike_str, str(p.get("expiry") or "")])
+
+    iv_history.ensure_vix_backfilled()
+
+    def _startup_ensure_fed_source():
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            return
+        try:
+            from notebooklm import NotebookLMClient
+            async def _run():
+                async with NotebookLMClient.from_storage() as client:
+                    await _ensure_fed_calendar_source(client, notebook_id)
+            asyncio.run(_run())
+        except Exception as exc:
+            log.warning("[fed-calendar] startup ensure-source failed: %s", exc)
+    threading.Thread(target=_startup_ensure_fed_source, daemon=True).start()
 
     # Re-evaluate recommendations on load so any previously mis-classified
     # entries (e.g. ROLL when primary was HOLD) get corrected immediately
@@ -5442,8 +5589,11 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             log.exception("[multiplier] build failed — skipping header status")
             mf_html = ""
         return Response(
-            _WEB_DASHBOARD_HTML.replace("<!--MULTIPLIER_FILES-->", mf_html),
+            _WEB_DASHBOARD_HTML
+            .replace("<!--MULTIPLIER_FILES-->", mf_html)
+            .replace("<!--SERVER_VERSION-->", _SERVER_VERSION),
             mimetype="text/html",
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.route("/api/multiplier-status-html")
@@ -5656,9 +5806,12 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         log.info("[DASHBOARD-REFRESH] eval requested at %s", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         _price_cache.clear()  # force fresh underlying prices on every manual refresh
         data = get_eval_data(_get_valid_token(), account_id, ticker=None, verbose=False)
+        data["server_version"] = _SERVER_VERSION
         # Include server-side analysis cache so the client can restore
         # recommendation badges after a manual refresh
         with _cache_lock:
+            for _p in data.get("positions", []):
+                _p["dont_analyze"] = _pos_key_str(_p) in _dont_analyze
             data["cached_recommendations"] = {
                 k: {
                     "recommendation": v.get("recommendation"),
@@ -5675,17 +5828,34 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             })
         return Response(json.dumps(_sanitize(data), default=_serial), mimetype="application/json")
 
+    @app.route("/api/dont-analyze", methods=["POST"])
+    @require_auth
+    def api_dont_analyze():
+        body = flask_request.get_json(force=True, silent=True) or {}
+        pos_key = body.get("position_key", "")
+        checked = bool(body.get("checked"))
+        if not pos_key:
+            return Response(json.dumps({"error": "Missing position_key"}), status=400, mimetype="application/json")
+        with _cache_lock:
+            if checked:
+                _dont_analyze.add(pos_key)
+            else:
+                _dont_analyze.discard(pos_key)
+            _save_dont_analyze(_dont_analyze)
+        return Response(json.dumps({"ok": True}), mimetype="application/json")
+
     @app.route("/api/analyze", methods=["POST"])
     @require_auth
     def api_analyze():
         body = flask_request.get_json(force=True, silent=True) or {}
         pos_key = body.get("position_key", "")
+        force = bool(body.get("force"))
         if not pos_key:
             return Response(json.dumps({"error": "Missing position_key"}), status=400, mimetype="application/json")
 
         with _cache_lock:
             _cached = _analysis_cache.get(pos_key)
-            if _cached and not _cached.get("error"):
+            if _cached and not _cached.get("error") and not force:
                 return Response(json.dumps(_cached), mimetype="application/json")
             # Re-run errors only after a 5-minute cooldown
             if _cached and _cached.get("error"):
@@ -5772,6 +5942,20 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
         with _cache_lock:
             import time as _time
+            # Preserve any claude_*/openai_* second-opinion fields already
+            # merged into this entry by api_claude_compare()/api_openai_compare()
+            # — a plain overwrite here would silently wipe them if a slow
+            # primary analysis lands after a comparison already ran, since the
+            # comparison endpoints' own writes only ever merge, never replace.
+            # Only when NOT forced: a forced re-analyze means the position's
+            # state changed enough to warrant a fresh look (auto-rerun on
+            # flag/delta/underlying change) — the old second opinions were
+            # made against the prior state and are no longer valid, so they
+            # should be dropped rather than carried forward against new data.
+            if not force:
+                _existing = _analysis_cache.get(pos_key) or {}
+                _claude_fields = {k: v for k, v in _existing.items() if k.startswith(("claude_", "openai_"))}
+                result.update(_claude_fields)
             if not result.get("error"):
                 result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
                 _analysis_cache[pos_key] = result
@@ -5779,6 +5963,106 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             else:
                 result["_error_at"] = _time.time()
                 _analysis_cache[pos_key] = result
+        return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
+
+    @app.route("/api/openai-compare", methods=["POST"])
+    @require_auth
+    def api_openai_compare():
+        """
+        Second opinion via OpenAI's GPT-5.6 Luna, stored alongside Claude's
+        primary recommendation for the same pos_key — comparison only,
+        doesn't touch the main `recommendation`/`text` fields. See
+        openai_advisor.py for the caching design (same CORE/weekly/Fed
+        prefix as Claude's, automatic OpenAI prompt caching instead of
+        explicit cache_control breakpoints).
+        """
+        body = flask_request.get_json(force=True, silent=True) or {}
+        pos_key = body.get("position_key", "")
+        if not pos_key:
+            return Response(json.dumps({"error": "Missing position_key"}), status=400, mimetype="application/json")
+
+        parts = pos_key.split("|")
+        if len(parts) != 4:
+            return Response(json.dumps({"error": f"Bad position_key: {pos_key}"}), status=400, mimetype="application/json")
+        sym, opt_type, strike_str, expiry = parts
+        ticker = sym.upper()
+
+        try:
+            fresh_token = _get_valid_token()
+            eval_data = get_eval_data(fresh_token, account_id, ticker=ticker, verbose=False)
+            pos = None
+            for p in eval_data.get("positions", []):
+                try:
+                    if (str(p.get("option_type", "")).lower() == opt_type.lower()
+                            and float(p.get("strike") or -1) == float(strike_str)
+                            and str(p.get("expiry")) == expiry):
+                        pos = p
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if pos is None:
+                return Response(json.dumps({"error": f"Position not found: {pos_key}"}), status=404, mimetype="application/json")
+
+            key_dates = get_key_dates(ticker)
+            context = openai_advisor.build_position_context(pos, eval_data.get("vix"), key_dates)
+            with _cache_lock:
+                chain_candidates_text = _analysis_cache.get(pos_key, {}).get("chain_candidates_text")
+            result = openai_advisor.query_openai_advisor(context, chain_candidates_text)
+        except Exception as exc:
+            log.exception("[openai-compare] failed for %s", pos_key)
+            result = {"error": str(exc), "recommendation": None, "text": ""}
+
+        import time as _time
+        result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
+
+        with _cache_lock:
+            entry = _analysis_cache.setdefault(pos_key, {})
+            entry["openai_recommendation"] = result.get("recommendation")
+            entry["openai_text"] = result.get("text")
+            entry["openai_tail_text"] = result.get("tail_text")
+            entry["openai_error"] = result.get("error")
+            entry["openai_run_at"] = result["_run_at"]
+            entry["openai_qa_thread"] = []  # fresh compare invalidates any prior follow-up thread
+            _save_cache(_analysis_cache)
+
+        return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
+
+    @app.route("/api/openai-ask", methods=["POST"])
+    @require_auth
+    def api_openai_ask():
+        """Follow-up question in the same conversation as an existing Luna
+        comparison (api_openai_compare)."""
+        body = flask_request.get_json(force=True, silent=True) or {}
+        pos_key = body.get("position_key", "")
+        question = (body.get("question") or "").strip()
+        if not pos_key or not question:
+            return Response(json.dumps({"error": "Missing position_key or question"}), status=400, mimetype="application/json")
+
+        with _cache_lock:
+            cached = _analysis_cache.get(pos_key)
+        if not cached or not cached.get("openai_text"):
+            return Response(json.dumps({"error": "No Luna analysis yet for this position — click Compare with Luna first."}), status=404, mimetype="application/json")
+
+        qa_thread = cached.get("openai_qa_thread") or []
+        try:
+            result = openai_advisor.ask_position_followup(
+                cached.get("openai_tail_text") or "",
+                cached["openai_text"],
+                qa_thread,
+                question,
+            )
+        except Exception as exc:
+            log.exception("[openai-ask] failed for %s", pos_key)
+            result = {"error": str(exc), "answer": ""}
+
+        if not result.get("error"):
+            with _cache_lock:
+                entry = _analysis_cache.setdefault(pos_key, {})
+                thread = entry.get("openai_qa_thread") or []
+                thread.append({"q": question, "a": result["answer"]})
+                entry["openai_qa_thread"] = thread
+                _save_cache(_analysis_cache)
+
         return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
 
     # ── Unborn routes ──────────────────────────────────────────────────────────
@@ -5819,6 +6103,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         ticker        = body.get("ticker", "").upper().strip()
         qty           = int(body.get("qty") or 1)
         strat         = body.get("strat", "CC").upper()
+        force         = bool(body.get("force"))
         if not ticker:
             return Response(json.dumps({"error": "Missing ticker"}), status=400, mimetype="application/json")
         if strat not in ("CC", "CSP"):
@@ -5843,7 +6128,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
         with _cache_lock:
             cached = _unborn_cache.get(ub_key)
-            if cached and not cached.get("error"):
+            if cached and not cached.get("error") and not force:
                 return Response(json.dumps(cached), mimetype="application/json")
             # Re-run errors only after a 5-minute cooldown
             if cached and cached.get("error"):
@@ -5900,6 +6185,16 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     _unborn_inflight.discard(ub_key)
             with _cache_lock:
                 import time as _time
+                # Preserve claude_*/openai_* fields already merged in by
+                # api_claude_compare_unborn()/api_openai_compare_unborn() — see
+                # the matching comment in /api/analyze's write for why a plain
+                # overwrite is unsafe, and why this is skipped entirely when
+                # force=True (state changed enough to warrant a fresh look —
+                # the old second opinions no longer apply).
+                if not force:
+                    _existing = _unborn_cache.get(ub_key) or {}
+                    _claude_fields = {k: v for k, v in _existing.items() if k.startswith(("claude_", "openai_"))}
+                    result.update(_claude_fields)
                 if not result.get("error"):
                     result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
                     _unborn_cache[ub_key] = result
@@ -5907,13 +6202,161 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 else:
                     result["_error_at"] = _time.time()
                     _unborn_cache[ub_key] = result
+            if not result.get("error"):
+                try:
+                    _persist_unborn_display_row(ticker, strat, qty, result)
+                except Exception:
+                    log.exception("[unborn-rows] failed to server-persist row for %s", ub_key)
 
         t = threading.Thread(target=_run_analysis, daemon=True)
         t.start()
         return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
                         status=202, mimetype="application/json")
 
+    @app.route("/api/openai-compare-unborn", methods=["POST"])
+    @require_auth
+    def api_openai_compare_unborn():
+        """
+        Second opinion via Luna on whether to open a NEW position — covers
+        both the unborn table and the Former Positions "Analyze" button.
+        See openai_advisor.py.
+        """
+        body = flask_request.get_json(force=True, silent=True) or {}
+        ub_key = body.get("ub_key", "")
+        if not ub_key:
+            return Response(json.dumps({"error": "Missing ub_key"}), status=400, mimetype="application/json")
+
+        with _cache_lock:
+            cached = _unborn_cache.get(ub_key)
+            if cached is None:
+                prefix = ub_key + "|"
+                for k, v in _unborn_cache.items():
+                    if k.startswith(prefix):
+                        ub_key, cached = k, v
+                        break
+        if not cached or cached.get("error"):
+            return Response(json.dumps({"error": f"No unborn analysis cached for {ub_key} — click Find/Analyze first."}), status=404, mimetype="application/json")
+
+        try:
+            ticker = cached.get("ticker", "")
+            strat = cached.get("strat", "CC")
+            ul_price = cached.get("ul_price")
+            ul_cost_basis = cached.get("ul_cost_basis")
+            vix = get_vix()
+            atr = get_atr(ticker)
+            key_dates = get_key_dates(ticker)
+            context = openai_advisor.build_unborn_context(ticker, strat, ul_price, ul_cost_basis, vix, atr, key_dates)
+            chain_candidates_text = cached.get("chain_candidates_text")
+            result = openai_advisor.query_openai_unborn_advisor(context, chain_candidates_text)
+        except Exception as exc:
+            log.exception("[openai-compare-unborn] failed for %s", ub_key)
+            result = {"error": str(exc), "recommendation": None, "text": ""}
+
+        import time as _time
+        result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
+
+        with _cache_lock:
+            entry = _unborn_cache.setdefault(ub_key, dict(cached))
+            entry["openai_recommendation"] = result.get("recommendation")
+            entry["openai_text"] = result.get("text")
+            entry["openai_tail_text"] = result.get("tail_text")
+            entry["openai_error"] = result.get("error")
+            entry["openai_run_at"] = result["_run_at"]
+            entry["openai_qa_thread"] = []  # fresh compare invalidates any prior follow-up thread
+            _save_unborn_cache(_unborn_cache)
+
+        return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
+
+    @app.route("/api/openai-ask-unborn", methods=["POST"])
+    @require_auth
+    def api_openai_ask_unborn():
+        """Follow-up question in the same conversation as an existing unborn
+        Luna comparison (api_openai_compare_unborn)."""
+        body = flask_request.get_json(force=True, silent=True) or {}
+        ub_key = body.get("ub_key", "")
+        question = (body.get("question") or "").strip()
+        if not ub_key or not question:
+            return Response(json.dumps({"error": "Missing ub_key or question"}), status=400, mimetype="application/json")
+
+        with _cache_lock:
+            cached = _unborn_cache.get(ub_key)
+            if cached is None:
+                prefix = ub_key + "|"
+                for k, v in _unborn_cache.items():
+                    if k.startswith(prefix):
+                        ub_key, cached = k, v
+                        break
+        if not cached or not cached.get("openai_text"):
+            return Response(json.dumps({"error": "No Luna analysis yet for this ticker — click Compare with Luna first."}), status=404, mimetype="application/json")
+
+        qa_thread = cached.get("openai_qa_thread") or []
+        try:
+            result = openai_advisor.ask_unborn_followup(
+                cached.get("openai_tail_text") or "",
+                cached["openai_text"],
+                qa_thread,
+                question,
+            )
+        except Exception as exc:
+            log.exception("[openai-ask-unborn] failed for %s", ub_key)
+            result = {"error": str(exc), "answer": ""}
+
+        if not result.get("error"):
+            with _cache_lock:
+                entry = _unborn_cache.setdefault(ub_key, dict(cached))
+                thread = entry.get("openai_qa_thread") or []
+                thread.append({"q": question, "a": result["answer"]})
+                entry["openai_qa_thread"] = thread
+                _save_unborn_cache(_unborn_cache)
+
+        return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
+
     _UNBORN_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unborn_rows.json")
+
+    def _persist_unborn_display_row(ticker: str, strat: str, qty: int, result: dict) -> None:
+        """
+        Mirror what the browser's findUnborn()/analyzeFormerPosition() success
+        path writes into unborn_rows.json — but from the server, right when a
+        background analysis actually finishes. Without this, a completed
+        result only ever reaches the dashboard's persisted display state if
+        the SAME browser tab that triggered it is still alive and polling
+        when it finishes — if that tab was backgrounded, navigated away, or
+        hit a network hiccup during a long (multi-minute, retry-heavy)
+        analysis, the server has a perfectly good cached answer that the
+        Unborn/Former-Positions table silently never shows.
+        """
+        chain = result.get("chain") or []
+        if chain:
+            row = dict(chain[0])
+        else:
+            row = {
+                "symbol": ticker, "option_type": strat,
+                "_do_nothing": bool(result.get("_do_nothing")),
+                "ideal_entry": "DO NOTHING" if result.get("_do_nothing") else None,
+            }
+        row.update({
+            "_qty": qty,
+            "_ubKey": urllib.parse.quote(f"{ticker}|{strat}|{qty}", safe=""),
+            "_ul_cost_basis": result.get("ul_cost_basis"),
+            "_run_at": result.get("_run_at"),
+        })
+        display_key = f"{ticker}|{strat}"
+        with _cache_lock:
+            try:
+                if os.path.exists(_UNBORN_ROWS_FILE):
+                    with open(_UNBORN_ROWS_FILE, "r", encoding="utf-8") as f:
+                        rows = json.load(f)
+                else:
+                    rows = {}
+            except (json.JSONDecodeError, OSError):
+                rows = {}
+            rows[display_key] = row
+            try:
+                with open(_UNBORN_ROWS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(rows, f)
+                log.info("[unborn-rows] server-persisted row for %s", display_key)
+            except OSError as exc:
+                log.warning("[unborn-rows] server-side write failed: %s", exc)
 
     @app.route("/api/unborn-rows", methods=["GET"])
     @require_auth
@@ -6133,13 +6576,90 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 f'<div style="font-size:11px;color:var(--muted);margin-bottom:12px">Updated {html_mod.escape(cached["_run_at"])}</div>'
                 if cached.get("_run_at") else ""
             )
+
+            # Luna (GPT-5.6) second opinion on whether to open this position —
+            # SELL/WAIT vocabulary, not ROLL/HOLD/ASSIGNMENT (no existing
+            # position to manage). Comparison only. See openai_advisor.py.
+            _main_action = "HOLD" if (cached.get("_do_nothing") or cached.get("recommendation") == "HOLD") else "SELL"
+            openai_rec    = cached.get("openai_recommendation")
+            openai_text   = cached.get("openai_text")
+            openai_error  = cached.get("openai_error")
+            openai_run_at = cached.get("openai_run_at")
+            if openai_rec:
+                _ai2_cls = "ok" if openai_rec == "SELL" else "warn"
+                _ai2_matches = (openai_rec == "SELL") == (_main_action == "SELL")
+                if _ai2_matches:
+                    _agree_tag = '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
+                else:
+                    _agree_tag = '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>'
+                openai_badge_html = (
+                    f'<span class="badge badge-{_ai2_cls}" style="font-size:11px;padding:3px 10px;margin-left:8px" '
+                    f'title="Luna (GPT-5.6) second opinion">Luna: {html_mod.escape(openai_rec)}</span>{_agree_tag}'
+                )
+            else:
+                openai_badge_html = (
+                    '<button onclick="openaiCompareUnborn(this)" '
+                    'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#10a37f;color:#fff;'
+                    'border:none;border-radius:4px;cursor:pointer">Compare with Luna</button>'
+                )
+            if openai_text:
+                _ai2_body = _render_advisor_markdown(openai_text)
+                _ai2_updated = (
+                    f'&nbsp;&nbsp;<span style="font-weight:normal;color:var(--muted);font-size:11px">'
+                    f'Updated {html_mod.escape(openai_run_at)}</span>' if openai_run_at else ""
+                )
+                openai_card_html = (
+                    f'<div id="openai-card" class="chain-pnl" style="margin-top:14px;border-color:#10a37f">'
+                    f'<span class="chain-label" style="color:#10a37f">Luna’s Take (GPT-5.6, second opinion){_ai2_updated}</span>'
+                    f'<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">{_ai2_body}</span>'
+                    f'</div>'
+                )
+            elif openai_error:
+                openai_card_html = (
+                    f'<div id="openai-card" class="chain-pnl" style="margin-top:14px;border-color:#10a37f">'
+                    f'<span class="chain-label" style="color:#10a37f">Luna’s Take</span>'
+                    f'<span class="chain-working" style="color:var(--danger);display:block;margin-top:6px">Error: {html_mod.escape(openai_error)}</span>'
+                    f'</div>'
+                )
+            else:
+                openai_card_html = '<div id="openai-card"></div>'
+
+            primary_ask_html = (
+                '<div class="ask-section">'
+                '<div class="ask-thread" id="ask-thread"></div>'
+                '<div class="ask-input">'
+                '<textarea id="ask-q" rows="3" placeholder="Ask Claude a follow-up question…"></textarea>'
+                '<div class="ask-input-row">'
+                '<button onclick="submitAsk()">Ask</button>'
+                '<div id="ask-spinner"></div>'
+                '</div></div></div>'
+            )
+            openai_ask_html = (
+                '<div class="ask-section" style="margin-top:20px">'
+                '<div class="ask-thread" id="openai-ask-thread"></div>'
+                '<div class="ask-input">'
+                '<textarea id="openai-ask-q" rows="3" placeholder="Ask Luna a follow-up question…"></textarea>'
+                '<div class="ask-input-row">'
+                '<button onclick="submitOpenaiAskUnborn()" style="background:#10a37f;border-color:#10a37f">Ask Luna</button>'
+                '<div id="openai-ask-spinner"></div>'
+                '</div></div></div>'
+            )
+
             body_html = (
                 f'<div style="margin-bottom:16px">'
                 f'<span class="badge badge-{rec_cls}" style="font-size:15px;padding:6px 16px">{html_mod.escape(rec)}</span>'
+                f'<span id="openai-badge-slot">{openai_badge_html}</span>'
                 f'{run_at_html}'
                 f'</div>'
                 f'<div class="rec-body">{"".join(lines_out)}</div>'
+                f'{primary_ask_html}'
+                f'{openai_card_html}'
+                f'{openai_ask_html}'
             )
+
+        _main_action_js = None
+        if cached and not cached.get("error"):
+            _main_action_js = "HOLD" if (cached.get("_do_nothing") or cached.get("recommendation") == "HOLD") else "SELL"
 
         page = f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -6181,12 +6701,16 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   .rec-body li{{margin:2px 0 2px 20px;max-width:860px}}
   .rec-body strong{{color:var(--text)}}
   .rec-body br{{display:block;margin:6px 0;content:""}}
+  .chain-pnl{{margin-top:28px;padding:14px 18px;background:var(--surface);border:1px solid var(--border);border-radius:8px;max-width:860px}}
+  .chain-label{{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px}}
+  .chain-working{{font-size:13px;color:var(--text)}}
   .ask-section{{margin-top:36px;max-width:860px}}
   .ask-thread{{margin-bottom:12px;display:flex;flex-direction:column;gap:12px}}
   .ask-q{{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--muted)}}
   .ask-q::before{{content:'You: ';color:var(--accent);font-weight:600}}
   .ask-a{{background:#12151f;border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);white-space:pre-wrap;line-height:1.6}}
-  .ask-a::before{{content:'NotebookLM: ';color:var(--ok);font-weight:600}}
+  .ask-a::before{{content:'Claude: ';color:var(--ok);font-weight:600}}
+  .ask-a.openai-ask-a::before{{content:'Luna: ';color:#10a37f}}
   .ask-a.err{{color:var(--danger)}}
   .ask-input{{display:flex;flex-direction:column;gap:8px}}
   .ask-input textarea{{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;font-family:inherit;resize:vertical;min-height:64px;outline:none}}
@@ -6202,24 +6726,97 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   <span class="pos-label">{title_str}</span>
 </header>
 {body_html}
-<div class="ask-section">
-  <div class="ask-thread" id="ask-thread"></div>
-  <div class="ask-input">
-    <textarea id="ask-q" rows="3" placeholder="Ask a follow-up question…"></textarea>
-    <div class="ask-input-row">
-      <button onclick="submitAsk()">Ask</button>
-      <div id="ask-spinner"></div>
-    </div>
-  </div>
-</div>
 <script>
 const _POS_KEY = {json.dumps(ub_key)};
+const _MAIN_ACTION = {json.dumps(_main_action_js)};
+const _OPENAI_SAVED_QA = {json.dumps(cached.get("openai_qa_thread", []) if cached else [])};
+function esc(s) {{
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}}
+function _advisorInline(s) {{
+  s = esc(s);
+  s = s.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+  s = s.replace(/\\*(.+?)\\*/g, '<em>$1</em>');
+  return s;
+}}
+function renderAdvisorMarkdown(text) {{
+  const blocks = [];
+  let bulletBuf = [];
+  const flushBullets = () => {{
+    if (bulletBuf.length) {{ blocks.push('<ul style="margin:4px 0 4px 20px">' + bulletBuf.join('') + '</ul>'); bulletBuf = []; }}
+  }};
+  for (const raw of text.split('\\n')) {{
+    const line = raw.trim();
+    if (!line) {{ flushBullets(); continue; }}
+    if (/^-{{3,}}$|^\\*{{3,}}$/.test(line)) {{
+      flushBullets();
+      blocks.push('<hr style="border:none;border-top:1px solid var(--border);margin:10px 0">');
+      continue;
+    }}
+    const headingM = line.match(/^(#{{1,4}})\\s+(.*)/);
+    if (headingM) {{
+      flushBullets();
+      blocks.push(`<p style="margin-top:10px;font-weight:600;color:var(--accent)">${{_advisorInline(headingM[2])}}</p>`);
+      continue;
+    }}
+    if (line.startsWith('- ') || line.startsWith('• ')) {{
+      bulletBuf.push(`<li>${{_advisorInline(line.slice(2))}}</li>`);
+      continue;
+    }}
+    flushBullets();
+    blocks.push(`<p style="margin-bottom:10px">${{_advisorInline(line)}}</p>`);
+  }}
+  flushBullets();
+  return blocks.join('');
+}}
+async function openaiCompareUnborn(btn) {{
+  if (btn) {{ btn.disabled = true; btn.textContent = 'Comparing…'; }}
+  try {{
+    const r = await fetch('/api/openai-compare-unborn', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ub_key: _POS_KEY}})
+    }});
+    const d = await r.json();
+    const slot = document.getElementById('openai-badge-slot');
+    const card = document.getElementById('openai-card');
+    if (d.error) {{
+      if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">Luna error: ${{esc(d.error)}}</span>`;
+      return;
+    }}
+    if (slot) {{
+      const cls = d.recommendation === 'SELL' ? 'ok' : 'warn';
+      const matches = _MAIN_ACTION && ((d.recommendation === 'SELL') === (_MAIN_ACTION === 'SELL'));
+      const agreeTag = !_MAIN_ACTION ? '' : matches
+        ? '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
+        : '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>';
+      slot.innerHTML = `<span class="badge badge-${{cls}}" style="font-size:11px;padding:3px 10px;margin-left:8px" title="Luna (GPT-5.6) second opinion">Luna: ${{esc(d.recommendation||'?')}}</span>${{agreeTag}}`;
+    }}
+    if (card) {{
+      const body = renderAdvisorMarkdown(d.text || '');
+      card.outerHTML = `<div id="openai-card" class="chain-pnl" style="margin-top:14px;border-color:#10a37f">`
+        + `<span class="chain-label" style="color:#10a37f">Luna’s Take (GPT-5.6, second opinion)</span>`
+        + `<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">${{body}}</span>`
+        + `</div>`;
+    }}
+  }} catch(e) {{
+    const slot = document.getElementById('openai-badge-slot');
+    if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">Luna error: ${{esc(e.message)}}</span>`;
+  }} finally {{
+    if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with Luna'; }}
+  }}
+}}
 const _SAVED_QA = {json.dumps(cached.get("qa_thread", []) if cached else [])};
 (function() {{
   const thread = document.getElementById('ask-thread');
   for (const item of _SAVED_QA) {{
     const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; thread.appendChild(qEl);
-    const aEl = document.createElement('div'); aEl.className='ask-a'; aEl.textContent=item.a; thread.appendChild(aEl);
+    const aEl = document.createElement('div'); aEl.className='ask-a'; aEl.innerHTML=renderAdvisorMarkdown(item.a); thread.appendChild(aEl);
+  }}
+  const openaiThread = document.getElementById('openai-ask-thread');
+  for (const item of _OPENAI_SAVED_QA) {{
+    const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; openaiThread.appendChild(qEl);
+    const aEl = document.createElement('div'); aEl.className='ask-a openai-ask-a'; aEl.innerHTML=renderAdvisorMarkdown(item.a); openaiThread.appendChild(aEl);
   }}
 }})();
 async function submitAsk() {{
@@ -6239,7 +6836,7 @@ async function submitAsk() {{
     }});
     const d = await r.json();
     if (d.error) {{ aEl.className='ask-a err'; aEl.textContent=d.error; }}
-    else {{ aEl.textContent=d.answer; }}
+    else {{ aEl.innerHTML=renderAdvisorMarkdown(d.answer || ''); }}
   }} catch(e) {{ aEl.className='ask-a err'; aEl.textContent=e.message; }}
   finally {{
     document.getElementById('ask-spinner').style.display='none';
@@ -6249,9 +6846,36 @@ async function submitAsk() {{
 document.getElementById('ask-q').addEventListener('keydown', e => {{
   if (e.key==='Enter' && !e.shiftKey) {{ e.preventDefault(); submitAsk(); }}
 }});
+async function submitOpenaiAskUnborn() {{
+  const ta = document.getElementById('openai-ask-q');
+  const q = ta.value.trim();
+  if (!q) return;
+  const thread = document.getElementById('openai-ask-thread');
+  const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=q; thread.appendChild(qEl);
+  ta.value = '';
+  document.getElementById('openai-ask-spinner').style.display = 'block';
+  const aEl = document.createElement('div'); aEl.className='ask-a openai-ask-a'; aEl.textContent='…'; thread.appendChild(aEl);
+  aEl.scrollIntoView({{behavior:'smooth'}});
+  try {{
+    const r = await fetch('/api/openai-ask-unborn', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{ub_key: _POS_KEY, question: q}})
+    }});
+    const d = await r.json();
+    if (d.error) {{ aEl.className='ask-a openai-ask-a err'; aEl.textContent=d.error; }}
+    else {{ aEl.innerHTML=renderAdvisorMarkdown(d.answer || ''); }}
+  }} catch(e) {{ aEl.className='ask-a openai-ask-a err'; aEl.textContent=e.message; }}
+  finally {{
+    document.getElementById('openai-ask-spinner').style.display='none';
+    aEl.scrollIntoView({{behavior:'smooth'}});
+  }}
+}}
+document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
+  if (e.key==='Enter' && !e.shiftKey) {{ e.preventDefault(); submitOpenaiAskUnborn(); }}
+}});
 </script>
 </body></html>"""
-        return Response(page, mimetype="text/html")
+        return Response(page, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
     @app.route("/favicon/<ticker>.svg")
     @require_auth
@@ -6271,64 +6895,41 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
     @app.route("/api/ask", methods=["POST"])
     @require_auth
     def api_ask():
+        """
+        Follow-up question against the primary Claude analysis (existing
+        position or unborn/new-position decision) — replays the original
+        cached context + Claude's own first answer + prior follow-ups via
+        claude_advisor, so it has real conversational continuity and reuses
+        the same cached CORE/weekly/Fed prefix as the original call. Checks
+        both caches since this endpoint is shared by both page types.
+        """
         body     = flask_request.get_json(force=True, silent=True) or {}
         pos_key  = body.get("position_key", "")
         question = (body.get("question") or "").strip()
         if not pos_key or not question:
             return Response(json.dumps({"error": "Missing position_key or question"}),
                             status=400, mimetype="application/json")
-        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID", "")
-        if not notebook_id:
-            return Response(json.dumps({"error": "NOTEBOOKLM_NOTEBOOK_ID not set"}),
-                            status=500, mimetype="application/json")
+
+        with _cache_lock:
+            cached = _analysis_cache.get(pos_key)
+            _in_unborn = False
+            if cached is None:
+                cached = _unborn_cache.get(pos_key)
+                _in_unborn = cached is not None
+        if not cached or not cached.get("text"):
+            return Response(json.dumps({"error": "No analysis yet for this position — click Analyze first."}),
+                            status=404, mimetype="application/json")
+
+        qa_thread = cached.get("qa_thread") or []
+        ask_fn = claude_advisor.ask_unborn_followup if _in_unborn else claude_advisor.ask_position_followup
         try:
-            from notebooklm import NotebookLMClient
-            # Build full context: original recommendation + prior Q&A + new question
-            # Check both caches (analysis for open positions, unborn for new trades)
-            with _cache_lock:
-                cached_entry = _analysis_cache.get(pos_key) or _unborn_cache.get(pos_key) or {}
-                _in_unborn = pos_key in _unborn_cache and pos_key not in _analysis_cache
-            prior_qa = cached_entry.get("qa_thread", [])
-            rec_text = cached_entry.get("text", "")
-            context_parts = []
-            if rec_text:
-                snippet = rec_text[:1500] + ("…" if len(rec_text) > 1500 else "")
-                context_parts.append(f"=== Original Analysis ===\n{snippet}")
-            if prior_qa:
-                context_parts.append("=== Prior Q&A (recent) ===")
-                for item in prior_qa[-4:]:   # last 4 exchanges only
-                    context_parts.append(f"Q: {item['q']}\nA: {item['a'][:600]}")
-            context_parts.append(f"=== New Question ===\n{question}")
-            full_prompt = "\n\n".join(context_parts)
-            _ASK_TRANSPORT_KW = ("timeout", "transport", "network", "connection", "reset", "eof", "read")
-            _ASK_TRANSPORT_BACKOFF = [15, 30, 60]
-            async def _ask():
-                last_exc = None
-                async with NotebookLMClient.from_storage() as client:
-                    for attempt in range(4):
-                        try:
-                            return await client.chat.ask(notebook_id, full_prompt)
-                        except Exception as _exc:
-                            last_exc = _exc
-                            msg = str(_exc).lower()
-                            if "rate" in msg or "limit" in msg or "429" in msg or "reject" in msg:
-                                wait = 30 * (2 ** attempt)  # 30s, 60s, 120s
-                                log.warning("[ask] rate limited, waiting %ds (attempt %d/4)", wait, attempt+1)
-                                await asyncio.sleep(wait)
-                            elif any(kw in msg for kw in _ASK_TRANSPORT_KW):
-                                if attempt < 3:
-                                    wait = _ASK_TRANSPORT_BACKOFF[min(attempt, len(_ASK_TRANSPORT_BACKOFF) - 1)]
-                                    log.warning("[ask] transport/timeout error (attempt %d/4), retrying in %ds — %s", attempt+1, wait, _exc)
-                                    await asyncio.sleep(wait)
-                                else:
-                                    raise RuntimeError(
-                                        "NotebookLM timed out after 4 attempts. Try again in a few minutes."
-                                    ) from _exc
-                            else:
-                                raise
-                raise last_exc
-            result = asyncio.run(_ask())
-            answer = getattr(result, "answer", None) or str(result)
+            result = ask_fn(cached.get("tail_text") or "", cached["text"], qa_thread, question)
+        except Exception as exc:
+            log.exception("[ask] failed for %s", pos_key)
+            result = {"error": str(exc), "answer": ""}
+
+        if not result.get("error"):
+            answer = result["answer"]
             log.info("[ask] pos_key=%s q=%s… answer_len=%d", pos_key, question[:40], len(answer))
             # Persist Q&A in the analysis cache so it survives page reloads
             with _cache_lock:
@@ -6342,10 +6943,8 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                     qa = entry.setdefault("qa_thread", [])
                     qa.append({"q": question, "a": answer})
                     _save_cache(_analysis_cache)
-            return Response(json.dumps({"answer": answer}), mimetype="application/json")
-        except Exception as exc:
-            log.error("[ask] error: %s", exc)
-            return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
+
+        return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
 
     @app.route("/api/reset-cache-entry", methods=["POST"])
     @require_auth
@@ -6380,6 +6979,27 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
             _analysis_cache.clear()
             _save_cache(_analysis_cache)
         log.info("[reset] analysis cache cleared")
+        return Response(json.dumps({"status": "ok"}), mimetype="application/json")
+
+    @app.route("/api/ensure-fed-source", methods=["POST"])
+    @require_auth
+    def api_ensure_fed_source():
+        """Self-heals the NB notebook's next-month Fed calendar source on
+        month rollover. Cheap no-op most days — meant to be hit periodically
+        (scheduled_refresh.py) so it doesn't depend on the dashboard process
+        staying up across a month boundary."""
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            return Response(json.dumps({"error": "NOTEBOOKLM_NOTEBOOK_ID not set"}), status=500, mimetype="application/json")
+        try:
+            from notebooklm import NotebookLMClient
+            async def _run():
+                async with NotebookLMClient.from_storage() as client:
+                    await _ensure_fed_calendar_source(client, notebook_id)
+            asyncio.run(_run())
+        except Exception as exc:
+            log.warning("[fed-calendar] ensure-source failed: %s", exc)
+            return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
         return Response(json.dumps({"status": "ok"}), mimetype="application/json")
 
     @app.route("/api/former-positions", methods=["GET"])
@@ -6821,15 +7441,88 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
                 f'<div style="font-size:11px;color:var(--muted);margin-bottom:12px">Updated {html_mod.escape(cached["_run_at"])}</div>'
                 if cached.get("_run_at") else ""
             )
+
+            # Luna (GPT-5.6) second opinion — compact badge next to the main
+            # recommendation, plus a full card further down. Comparison only;
+            # never overwrites Claude's own primary rec/text. See openai_advisor.py.
+            openai_rec   = cached.get("openai_recommendation")
+            openai_text  = cached.get("openai_text")
+            openai_error = cached.get("openai_error")
+            openai_run_at = cached.get("openai_run_at")
+            if openai_rec:
+                _ai2_cls = {"ROLL": "warn", "ASSIGNMENT": "danger", "HOLD": "hold"}.get(openai_rec, "ok")
+                if not rec:
+                    _agree_tag = ""  # no primary rec yet to compare against
+                elif openai_rec == rec:
+                    _agree_tag = '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
+                else:
+                    _agree_tag = '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>'
+                openai_badge_html = (
+                    f'<span class="badge badge-{_ai2_cls}" style="font-size:11px;padding:3px 10px;margin-left:8px" '
+                    f'title="Luna (GPT-5.6) second opinion">Luna: {html_mod.escape(openai_rec)}</span>{_agree_tag}'
+                )
+            else:
+                openai_badge_html = (
+                    '<button onclick="openaiCompare(this)" '
+                    'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#10a37f;color:#fff;'
+                    'border:none;border-radius:4px;cursor:pointer">Compare with Luna</button>'
+                )
+            if openai_text:
+                _ai2_body = _render_advisor_markdown(openai_text)
+                _ai2_updated = (
+                    f'&nbsp;&nbsp;<span style="font-weight:normal;color:var(--muted);font-size:11px">'
+                    f'Updated {html_mod.escape(openai_run_at)}</span>' if openai_run_at else ""
+                )
+                openai_card_html = (
+                    f'<div id="openai-card" class="chain-pnl" style="margin-top:14px;border-color:#10a37f">'
+                    f'<span class="chain-label" style="color:#10a37f">Luna’s Take (GPT-5.6, second opinion){_ai2_updated}</span>'
+                    f'<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">{_ai2_body}</span>'
+                    f'</div>'
+                )
+            elif openai_error:
+                openai_card_html = (
+                    f'<div id="openai-card" class="chain-pnl" style="margin-top:14px;border-color:#10a37f">'
+                    f'<span class="chain-label" style="color:#10a37f">Luna’s Take</span>'
+                    f'<span class="chain-working" style="color:var(--danger);display:block;margin-top:6px">Error: {html_mod.escape(openai_error)}</span>'
+                    f'</div>'
+                )
+            else:
+                openai_card_html = '<div id="openai-card"></div>'
+
+            primary_ask_html = (
+                '<div class="ask-section">'
+                '<div class="ask-thread" id="ask-thread"></div>'
+                '<div class="ask-input">'
+                '<textarea id="ask-q" rows="3" placeholder="Ask Claude a follow-up question…"></textarea>'
+                '<div class="ask-input-row">'
+                '<button onclick="submitAsk()">Ask</button>'
+                '<div id="ask-spinner"></div>'
+                '</div></div></div>'
+            )
+            openai_ask_html = (
+                '<div class="ask-section" style="margin-top:20px">'
+                '<div class="ask-thread" id="openai-ask-thread"></div>'
+                '<div class="ask-input">'
+                '<textarea id="openai-ask-q" rows="3" placeholder="Ask Luna a follow-up question…"></textarea>'
+                '<div class="ask-input-row">'
+                '<button onclick="submitOpenaiAsk()" style="background:#10a37f;border-color:#10a37f">Ask Luna</button>'
+                '<div id="openai-ask-spinner"></div>'
+                '</div></div></div>'
+            )
+
             body_html = (
                 f'<div style="margin-bottom:16px">'
                 f'<span class="badge badge-{rec_cls}" style="font-size:15px;padding:6px 16px">{html_mod.escape(rec)}</span>'
+                f'<span id="openai-badge-slot">{openai_badge_html}</span>'
                 f'{run_at_html}'
                 f'</div>'
                 f'<div class="rec-body">{"".join(lines_out)}</div>'
                 f'{confirmed_html}'
                 f'{chain_html}'
                 f'{decay_html}'
+                f'{primary_ask_html}'
+                f'{openai_card_html}'
+                f'{openai_ask_html}'
             )
 
         page = f"""<!DOCTYPE html>
@@ -6893,7 +7586,8 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
   .ask-q{{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--muted)}}
   .ask-q::before{{content:'You: ';color:var(--accent);font-weight:600}}
   .ask-a{{background:#12151f;border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);white-space:pre-wrap;line-height:1.6}}
-  .ask-a::before{{content:'NotebookLM: ';color:var(--ok);font-weight:600}}
+  .ask-a::before{{content:'Claude: ';color:var(--ok);font-weight:600}}
+  .ask-a.openai-ask-a::before{{content:'Luna: ';color:#10a37f}}
   .ask-a.err{{color:var(--danger)}}
   .ask-input{{display:flex;flex-direction:column;gap:8px}}
   .ask-input textarea{{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;font-family:inherit;resize:vertical;min-height:64px;outline:none}}
@@ -6911,26 +7605,138 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
   <span class="pos-label">{html_mod.escape(title_str)}</span>
 </header>
 {body_html}
-<div class="ask-section">
-  <div class="ask-thread" id="ask-thread"></div>
-  <div class="ask-input">
-    <textarea id="ask-q" rows="3" placeholder="Ask a follow-up question…"></textarea>
-    <div class="ask-input-row">
-      <button onclick="submitAsk()">Ask</button>
-      <div id="ask-spinner"></div>
-    </div>
-  </div>
-</div>
 <script>
 const _POS_KEY = {json.dumps(pos_key)};
+const _MAIN_REC = {json.dumps(rec)};
 const _SAVED_QA = {json.dumps(cached.get("qa_thread", []) if cached else [])};
+const _OPENAI_SAVED_QA = {json.dumps(cached.get("openai_qa_thread", []) if cached else [])};
+function esc(s) {{
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}}
+function _openaiBadgeCls(rec) {{
+  return rec === 'ROLL' ? 'warn' : rec === 'ASSIGNMENT' ? 'danger' : rec === 'HOLD' ? 'hold' : 'ok';
+}}
+function _advisorInline(s) {{
+  s = esc(s);
+  s = s.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+  s = s.replace(/\\*(.+?)\\*/g, '<em>$1</em>');
+  return s;
+}}
+function renderAdvisorMarkdown(text) {{
+  const blocks = [];
+  let bulletBuf = [];
+  const flushBullets = () => {{
+    if (bulletBuf.length) {{ blocks.push('<ul style="margin:4px 0 4px 20px">' + bulletBuf.join('') + '</ul>'); bulletBuf = []; }}
+  }};
+  for (const raw of text.split('\\n')) {{
+    const line = raw.trim();
+    if (!line) {{ flushBullets(); continue; }}
+    if (/^-{{3,}}$|^\\*{{3,}}$/.test(line)) {{
+      flushBullets();
+      blocks.push('<hr style="border:none;border-top:1px solid var(--border);margin:10px 0">');
+      continue;
+    }}
+    const headingM = line.match(/^(#{{1,4}})\\s+(.*)/);
+    if (headingM) {{
+      flushBullets();
+      blocks.push(`<p style="margin-top:10px;font-weight:600;color:var(--accent)">${{_advisorInline(headingM[2])}}</p>`);
+      continue;
+    }}
+    if (line.startsWith('- ') || line.startsWith('\\u2022 ')) {{
+      bulletBuf.push(`<li>${{_advisorInline(line.slice(2))}}</li>`);
+      continue;
+    }}
+    flushBullets();
+    blocks.push(`<p style="margin-bottom:10px">${{_advisorInline(line)}}</p>`);
+  }}
+  flushBullets();
+  return blocks.join('');
+}}
+async function openaiCompare(btn) {{
+  if (btn) {{ btn.disabled = true; btn.textContent = 'Comparing…'; }}
+  try {{
+    const r = await fetch('/api/openai-compare', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{position_key: _POS_KEY}})
+    }});
+    const d = await r.json();
+    const slot = document.getElementById('openai-badge-slot');
+    const card = document.getElementById('openai-card');
+    if (d.error) {{
+      if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">Luna error: ${{esc(d.error)}}</span>`;
+      return;
+    }}
+    if (slot) {{
+      const cls = _openaiBadgeCls(d.recommendation);
+      const agreeTag = !_MAIN_REC
+        ? ''
+        : d.recommendation === _MAIN_REC
+        ? '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
+        : '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>';
+      slot.innerHTML = `<span class="badge badge-${{cls}}" style="font-size:11px;padding:3px 10px;margin-left:8px" title="Luna (GPT-5.6) second opinion">Luna: ${{esc(d.recommendation||'?')}}</span>${{agreeTag}}`;
+    }}
+    if (card) {{
+      const body = renderAdvisorMarkdown(d.text || '');
+      card.outerHTML = `<div id="openai-card" class="chain-pnl" style="margin-top:14px;border-color:#10a37f">`
+        + `<span class="chain-label" style="color:#10a37f">Luna’s Take (GPT-5.6, second opinion)</span>`
+        + `<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">${{body}}</span>`
+        + `</div>`;
+    }}
+  }} catch(e) {{
+    const slot = document.getElementById('openai-badge-slot');
+    if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">Luna error: ${{esc(e.message)}}</span>`;
+  }} finally {{
+    if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with Luna'; }}
+  }}
+}}
 (function() {{
   const thread = document.getElementById('ask-thread');
   for (const item of _SAVED_QA) {{
     const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; thread.appendChild(qEl);
-    const aEl = document.createElement('div'); aEl.className='ask-a'; aEl.textContent=item.a; thread.appendChild(aEl);
+    const aEl = document.createElement('div'); aEl.className='ask-a'; aEl.innerHTML=renderAdvisorMarkdown(item.a); thread.appendChild(aEl);
+  }}
+  const openaiThread = document.getElementById('openai-ask-thread');
+  for (const item of _OPENAI_SAVED_QA) {{
+    const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; openaiThread.appendChild(qEl);
+    const aEl = document.createElement('div'); aEl.className='ask-a openai-ask-a'; aEl.innerHTML=renderAdvisorMarkdown(item.a); openaiThread.appendChild(aEl);
   }}
 }})();
+async function submitOpenaiAsk() {{
+  const ta = document.getElementById('openai-ask-q');
+  const q = ta.value.trim();
+  if (!q) return;
+  const thread = document.getElementById('openai-ask-thread');
+  const qEl = document.createElement('div');
+  qEl.className = 'ask-q';
+  qEl.textContent = q;
+  thread.appendChild(qEl);
+  ta.value = '';
+  document.getElementById('openai-ask-spinner').style.display = 'block';
+  const aEl = document.createElement('div');
+  aEl.className = 'ask-a openai-ask-a';
+  aEl.textContent = '…';
+  thread.appendChild(aEl);
+  aEl.scrollIntoView({{behavior:'smooth'}});
+  try {{
+    const r = await fetch('/api/openai-ask', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{position_key: _POS_KEY, question: q}})
+    }});
+    const d = await r.json();
+    if (d.error) {{ aEl.className = 'ask-a openai-ask-a err'; aEl.textContent = d.error; }}
+    else {{ aEl.innerHTML = renderAdvisorMarkdown(d.answer || ''); }}
+  }} catch(e) {{
+    aEl.className = 'ask-a openai-ask-a err'; aEl.textContent = e.message;
+  }} finally {{
+    document.getElementById('openai-ask-spinner').style.display = 'none';
+    aEl.scrollIntoView({{behavior:'smooth'}});
+  }}
+}}
+document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
+  if (e.key === 'Enter' && !e.shiftKey) {{ e.preventDefault(); submitOpenaiAsk(); }}
+}});
 async function submitAsk() {{
   const ta = document.getElementById('ask-q');
   const q = ta.value.trim();
@@ -6955,7 +7761,7 @@ async function submitAsk() {{
     }});
     const d = await r.json();
     if (d.error) {{ aEl.className = 'ask-a err'; aEl.textContent = d.error; }}
-    else {{ aEl.textContent = d.answer; }}
+    else {{ aEl.innerHTML = renderAdvisorMarkdown(d.answer || ''); }}
   }} catch(e) {{
     aEl.className = 'ask-a err'; aEl.textContent = e.message;
   }} finally {{
@@ -6969,7 +7775,7 @@ document.getElementById('ask-q').addEventListener('keydown', e => {{
 </script>
 </body>
 </html>"""
-        return Response(page, mimetype="text/html")
+        return Response(page, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
     port = 5051
     url  = f"http://127.0.0.1:{port}"
@@ -7170,6 +7976,55 @@ def print_key_dates(ticker: str, dates: dict) -> None:
         f"  Dividend Amount : {dates['dividend_amount']} per share",
     ]
     print_box(lines, title=f"  {ticker} — Key Dates  ")
+
+
+async def _ensure_fed_calendar_source(client, notebook_id: str) -> None:
+    """
+    Keep a NEXT-month NY Fed Economic Indicators Calendar source in the
+    notebook, alongside the pre-existing current-month source (that one's
+    the base https://.../nationalecon_cal URL, added manually — untouched
+    here). The base source only ever shows "this month"; late in the month,
+    a 1-week-ahead view needs next month's page too, which only exists at
+    its own dated URL (i-{mon}{yy}.html). Self-heals on month rollover: any
+    stale i-*.html source we previously added gets replaced with the
+    current correct one. Best-effort — failures here must never break the
+    caller (dashboard startup / scheduled refresh).
+    """
+    import datetime
+    today = datetime.date.today()
+    next_month = (today.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+    correct_url = claude_advisor.fed_month_url(next_month)
+
+    try:
+        sources = await client.sources.list(notebook_id)
+    except Exception as exc:
+        log.warning("[fed-calendar] Could not list sources: %s", exc)
+        return
+
+    stale_ids = []
+    already_present = False
+    for source in sources:
+        url = getattr(source, "url", None) or ""
+        if "/research/calendars/i-" not in url:
+            continue
+        if url == correct_url:
+            already_present = True
+        else:
+            stale_ids.append(source.id)
+
+    for sid in stale_ids:
+        try:
+            await client.sources.delete(notebook_id, sid)
+            log.info("[fed-calendar] Removed stale month source: %s", sid)
+        except Exception as exc:
+            log.warning("[fed-calendar] Failed to delete stale source %s: %s", sid, exc)
+
+    if not already_present:
+        try:
+            await client.sources.add_url(notebook_id, correct_url)
+            log.info("[fed-calendar] Added next-month source: %s", correct_url)
+        except Exception as exc:
+            log.warning("[fed-calendar] Failed to add %s: %s", correct_url, exc)
 
 
 def _is_ticker_csv_source(title: str) -> bool:
@@ -7453,6 +8308,37 @@ def print_box(lines: list[str], title: str = "") -> None:
     print(border)
 
 
+async def _reset_notebooklm_conversation(client, notebook_id: str) -> None:
+    """
+    Delete the notebook's current server-side conversation (if any) before
+    asking a fresh, independent question.
+
+    Every call site in this file already builds a fully self-contained
+    prompt — original analysis + recent Q&A embedded as plain text — so
+    nothing here actually depends on NotebookLM's own server-side
+    conversation memory. Left alone, `chat.ask(notebook_id, question)` with
+    no `conversation_id` just keeps extending the SAME one conversation
+    forever (confirmed via the notebooklm-py client's own docstring), and
+    since this notebook is shared across every ticker, every scheduled
+    refresh, and every follow-up question, that conversation had — after
+    ~3 weeks of continuous automated use — grown long enough that NotebookLM
+    started returning responses over the client's 50MB RPC size cap
+    (`RPC response exceeded 52428800 bytes`) or stalling mid-stream, on an
+    increasing fraction of calls, across multiple unrelated tickers (LULU,
+    BIRK, MSFT, DG all hit it the same morning). Deleting the prior
+    conversation before each independent ask keeps every request small and
+    fast, matching what it should have been the whole time. Best-effort:
+    failures here (e.g. no conversation exists yet) must never block the
+    actual question.
+    """
+    try:
+        conv_id = await client.chat.get_conversation_id(notebook_id)
+        if conv_id:
+            await client.chat.delete_conversation(notebook_id, conv_id)
+    except Exception as exc:
+        log.warning("[notebooklm] could not reset conversation before asking: %s", exc)
+
+
 async def query_notebooklm(
     notebook_id: str,
     ticker: str,
@@ -7607,7 +8493,16 @@ async def query_notebooklm(
         vix_clause = f", the VIX ({vix_note})," if vix_note else ""
         import zoneinfo as _zi
         _now_et = datetime.datetime.now(_zi.ZoneInfo("America/New_York"))
-        _today_preamble = _now_et.strftime("Today is %A, %B %-d, %Y at %-I:%M %p ET. ")
+        _today_preamble = _now_et.strftime(
+            "Today is %A, %B %-d, %Y at %-I:%M %p ET. Start your response with a line "
+            "reading exactly 'It is %A, %-m/%-d @ %-H:%M.' using this exact date/time, "
+            "before anything else, so I can confirm you have the correct current date/time. "
+            "Do not compute or invent the weekday or date of any other day yourself, and "
+            "never pair a weekday range with a calendar-date range (e.g. 'Mon-Fri (Jul "
+            "13-19)') unless every date in it is verified against its correct weekday — "
+            "prefer relative phrasing like 'the rest of this week' or 'within 1-2 trading "
+            "days' instead. "
+        )
         question = (
             f"{_today_preamble}"
             f"Based on the updated {ticker} source, the latest economic release calendar, "
@@ -7623,7 +8518,16 @@ async def query_notebooklm(
         vix_clause = f", the VIX ({vix_note})," if vix_note else ""
         import zoneinfo as _zi
         _now_et = datetime.datetime.now(_zi.ZoneInfo("America/New_York"))
-        _today_preamble = _now_et.strftime("Today is %A, %B %-d, %Y at %-I:%M %p ET. ")
+        _today_preamble = _now_et.strftime(
+            "Today is %A, %B %-d, %Y at %-I:%M %p ET. Start your response with a line "
+            "reading exactly 'It is %A, %-m/%-d @ %-H:%M.' using this exact date/time, "
+            "before anything else, so I can confirm you have the correct current date/time. "
+            "Do not compute or invent the weekday or date of any other day yourself, and "
+            "never pair a weekday range with a calendar-date range (e.g. 'Mon-Fri (Jul "
+            "13-19)') unless every date in it is verified against its correct weekday — "
+            "prefer relative phrasing like 'the rest of this week' or 'within 1-2 trading "
+            "days' instead. "
+        )
         question = (
             f"{_today_preamble}"
             f"Given the {ticker} source, what is the best {strat_label} choice, "
@@ -7650,16 +8554,72 @@ async def query_notebooklm(
     if not silent:
         print(f"\nQuerying NotebookLM...")
 
-    _TRANSPORT_KEYWORDS = ("timeout", "timed out", "transport", "network", "connection", "reset", "eof", "read", "rpc")
+    _TRANSPORT_KEYWORDS = ("timeout", "timed out", "transport", "network", "connection", "reset", "eof", "read", "rpc", "malformed")
     _MAX_ATTEMPTS = 4
     _TRANSPORT_BACKOFF = [15, 30, 60]  # seconds between transport-error retries
+    # Per-attempt cap on chat.ask() itself, independent of the various outer
+    # 300s budgets (api_unborn's _run_analysis, scheduled_refresh's POLL_MAX).
+    # Without this, a stalled streaming response (HTTP 200 received, then the
+    # body just stops arriving mid-stream with no further bytes — observed
+    # directly in the logs via httpcore's receive_response_body.started with
+    # no .complete for 4+ minutes) blocks silently inside this single await
+    # with no exception to trigger the retry loop below, so the entire outer
+    # budget gets burned on one hung attempt with zero retries actually
+    # happening — exactly what produced the "Analysis timed out" the user saw
+    # for LULU with no warnings/retries logged in between. Bounding it here
+    # converts a silent full-budget hang into a normal retryable failure.
+    _PER_ATTEMPT_TIMEOUT = 90
 
     last_exc = None
     async with NotebookLMClient.from_storage() as client:
+        await _reset_notebooklm_conversation(client, notebook_id)
         for attempt in range(_MAX_ATTEMPTS):
             try:
-                result = await client.chat.ask(notebook_id, question)
+                result = await asyncio.wait_for(
+                    client.chat.ask(notebook_id, question), timeout=_PER_ATTEMPT_TIMEOUT
+                )
+                # The notebooklm client sometimes can't find NotebookLM's actual
+                # "marked answer" in the raw API response (logs "No marked answer
+                # found; falling back to longest unmarked text") and falls back to
+                # whatever text looks longest — which can be NotebookLM's own
+                # internal reasoning/tool-call trace instead of a real answer.
+                # Every valid response is required (by our own system prompt) to
+                # open with "It is [weekday]..." — use that as a cheap, reliable
+                # sanity check rather than silently caching garbage as a real
+                # recommendation.
+                _candidate = getattr(result, "answer", None) or str(result)
+                if not _candidate.strip().lower().startswith("it is "):
+                    raise RuntimeError(
+                        "NotebookLM returned a malformed response (missing the "
+                        "expected 'It is [weekday]...' opening line — likely its "
+                        "own internal reasoning leaking through after an API "
+                        f"hiccup, not a real answer). Got: {_candidate[:150]!r}"
+                    )
                 break
+            except asyncio.TimeoutError as exc:
+                # asyncio.TimeoutError carries no message (str(exc) == ""), so
+                # it would never match _TRANSPORT_KEYWORDS below — give it an
+                # explicit message so it's treated as the retryable transport
+                # error it is, not silently mis-bucketed.
+                exc = asyncio.TimeoutError(
+                    f"chat.ask stalled past the {_PER_ATTEMPT_TIMEOUT}s per-attempt timeout"
+                )
+                last_exc = exc
+                msg = str(exc).lower()
+                log.warning(
+                    "[query_notebooklm] chat.ask stalled past %ds (attempt %d/%d)",
+                    _PER_ATTEMPT_TIMEOUT, attempt + 1, _MAX_ATTEMPTS,
+                )
+                if attempt < _MAX_ATTEMPTS - 1:
+                    wait = _TRANSPORT_BACKOFF[min(attempt, len(_TRANSPORT_BACKOFF) - 1)]
+                    log.warning("[query_notebooklm] retrying in %ds", wait)
+                    await asyncio.sleep(wait)
+                else:
+                    log.warning("[query_notebooklm] stalled on final attempt — giving up")
+                    raise RuntimeError(
+                        f"NotebookLM stalled mid-response after {_MAX_ATTEMPTS} attempts "
+                        "(connection opens, then no data arrives) — try again in a few minutes."
+                    ) from exc
             except Exception as exc:
                 last_exc = exc
                 msg = str(exc).lower()

@@ -122,6 +122,13 @@ def main():
     log.info("=" * 60)
     log.info("Scheduled refresh starting")
 
+    # ── 0. Self-heal the NB next-month Fed calendar source on month rollover ──
+    try:
+        r = requests.post(f"{BASE_URL}/api/ensure-fed-source", timeout=30)
+        log.info("POST /api/ensure-fed-source -> HTTP %d", r.status_code)
+    except Exception as exc:
+        log.warning("ensure-fed-source failed: %s", exc)
+
     # ── 1. Fetch all current positions ───────────────────────────────────────
     log.info("GET %s/api/eval ...", BASE_URL)
     try:
@@ -165,10 +172,9 @@ def main():
             qty = int(row.get("_qty") or 1)
             cb  = float(row.get("_ul_cost_basis") or 0)
             log.info("  %s  strat=%s qty=%d cb=%.2f", ticker, strat, qty, cb)
-            _post(f"{BASE_URL}/api/unborn-cache-delete", {"row_key": row_key})
             result, status = _post_and_poll_result(
                 f"{BASE_URL}/api/unborn",
-                {"ticker": ticker, "qty": qty, "strat": strat, "cost_basis": cb},
+                {"ticker": ticker, "qty": qty, "strat": strat, "cost_basis": cb, "force": True},
             )
             log.info("    → /api/unborn HTTP %d", status)
             chain = result.get("chain") or []
@@ -196,7 +202,19 @@ def main():
             log.error("Failed to save unborn rows: %s", exc)
 
     # ── Pass 2: Re-analyze flagged (warning) positions ────────────────────────
-    flagged = [p for p in positions if p.get("flagged")]
+    # Claude drives /api/analyze itself now (primary advisor); the Luna
+    # second-opinion call is back-to-back with it here, not on its own
+    # schedule — that keeps OpenAI's automatic prompt cache (CORE manuals +
+    # weekly plan/review + Fed calendar) warm across every position in this
+    # pass, instead of paying a full-price cache rewrite per position.
+    flagged = [p for p in positions if p.get("flagged") and not p.get("dont_analyze")]
+    skipped_dont_analyze = [p for p in positions if p.get("flagged") and p.get("dont_analyze")]
+    if skipped_dont_analyze:
+        log.info(
+            "  Skipping %d flagged position(s) marked don't-analyze: %s",
+            len(skipped_dont_analyze),
+            ", ".join(build_pos_key(p) for p in skipped_dont_analyze),
+        )
     log.info("--- Pass 2: flagged positions (%d) ---", len(flagged))
     for pos in flagged:
         pk = build_pos_key(pos)
@@ -205,6 +223,8 @@ def main():
         _post(f"{BASE_URL}/api/reset-cache-entry", {"position_key": pk})
         status = _post_and_poll(f"{BASE_URL}/api/analyze", {"position_key": pk})
         log.info("    → /api/analyze HTTP %d", status)
+        openai_status = _post(f"{BASE_URL}/api/openai-compare", {"position_key": pk})
+        log.info("    → /api/openai-compare HTTP %d", openai_status)
 
     # ── Pass 3: Run unborn for remaining open positions ──────────────────────
     seen: set[str] = set()
@@ -224,11 +244,9 @@ def main():
         qty      = abs(int(pos.get("net_qty") or 1))
         cb       = float(pos.get("ul_cost_basis") or 0)
         log.info("  %s  strat=%s qty=%d cb=%.2f", ticker, strat, qty, cb)
-        rk = f"{ticker}|{strat}"
-        _post(f"{BASE_URL}/api/unborn-cache-delete", {"row_key": rk})
         status = _post(
             f"{BASE_URL}/api/unborn",
-            {"ticker": ticker, "qty": qty, "strat": strat, "cost_basis": cb},
+            {"ticker": ticker, "qty": qty, "strat": strat, "cost_basis": cb, "force": True},
         )
         log.info("    → /api/unborn HTTP %d", status)
 

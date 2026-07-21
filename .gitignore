@@ -7,3 +7,8 @@ logs/
 *.log
 .analysis_cache.json
 .unborn_cache.json
+.core_docs_cache.json
+.weekly_docs_cache.json
+.iv_history.json
+.dont_analyze.json
+.fed_calendar_cache.json
