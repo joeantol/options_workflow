@@ -714,6 +714,24 @@ def get_vix() -> float | None:
         return None
 
 
+def get_tbill_rate() -> float | None:
+    """
+    13-week T-Bill yield (^IRX) via yfinance, as a percentage (e.g. 4.85
+    means 4.85%). Both advisors' system prompts instruct them to check a
+    candidate's yield against "the T-Bill hurdle" — confirmed live (ASML,
+    2026-07-21) that this was an instruction with no supporting number ever
+    actually given, so Claude/Luna could only say the check "cannot be
+    confirmed" rather than do it.
+    """
+    try:
+        import yfinance as yf
+        fi = yf.Ticker("^IRX").fast_info
+        val = getattr(fi, "last_price", None)
+        return float(val) if val else None
+    except Exception:
+        return None
+
+
 def get_atr(ticker: str, period: int = 14) -> float | None:
     """
     Calculate the Average True Range for *ticker* over *period* trading days.
@@ -2079,7 +2097,7 @@ async def run_roll_for_position(
         if claude_pos is None:
             return {"error": f"Position not found in live eval data for {ticker}", "recommendation": "HOLD", "text": "", "ticker": ticker}
 
-        claude_context = claude_advisor.build_position_context(claude_pos, eval_data.get("vix"), key_dates)
+        claude_context = claude_advisor.build_position_context(claude_pos, eval_data.get("vix"), key_dates, get_tbill_rate())
         claude_result = claude_advisor.query_claude_advisor(claude_context, chain_candidates_text)
         if claude_result.get("error"):
             return {"error": claude_result["error"], "recommendation": "HOLD", "text": "", "ticker": ticker}
@@ -2401,7 +2419,7 @@ async def run_unborn_for_ticker(
         # Claude is the primary advisor (see claude_advisor.py) — no chain CSV
         # upload/source needed since Claude reads the candidate list directly
         # from chain_candidates_text, not a full uploaded chain document.
-        claude_context = claude_advisor.build_unborn_context(ticker, strat, ul_price, ul_cost_basis, vix, atr, key_dates)
+        claude_context = claude_advisor.build_unborn_context(ticker, strat, ul_price, ul_cost_basis, vix, atr, key_dates, get_tbill_rate())
         claude_result = claude_advisor.query_claude_unborn_advisor(claude_context, chain_candidates_text)
         if claude_result.get("error"):
             return {"error": claude_result["error"], "recommendation": "HOLD",
@@ -6004,7 +6022,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 return Response(json.dumps({"error": f"Position not found: {pos_key}"}), status=404, mimetype="application/json")
 
             key_dates = get_key_dates(ticker)
-            context = openai_advisor.build_position_context(pos, eval_data.get("vix"), key_dates)
+            context = openai_advisor.build_position_context(pos, eval_data.get("vix"), key_dates, get_tbill_rate())
             with _cache_lock:
                 chain_candidates_text = _analysis_cache.get(pos_key, {}).get("chain_candidates_text")
             result = openai_advisor.query_openai_advisor(context, chain_candidates_text)
@@ -6245,7 +6263,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             vix = get_vix()
             atr = get_atr(ticker)
             key_dates = get_key_dates(ticker)
-            context = openai_advisor.build_unborn_context(ticker, strat, ul_price, ul_cost_basis, vix, atr, key_dates)
+            context = openai_advisor.build_unborn_context(ticker, strat, ul_price, ul_cost_basis, vix, atr, key_dates, get_tbill_rate())
             chain_candidates_text = cached.get("chain_candidates_text")
             result = openai_advisor.query_openai_unborn_advisor(context, chain_candidates_text)
         except Exception as exc:

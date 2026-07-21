@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 OPTIONS_DIR = Path("/Users/joeandbabs/work/retirement/options")
@@ -344,20 +345,38 @@ def build_chain_candidates_text(
                 direction = "IN(less time)"
             else:
                 direction = "SAME"
+        # Bid-ask spread as a % of mid — a genuine liquidity signal (how much
+        # you'd give up crossing the spread), sourced from Public.com's own
+        # quote (already fetched for every chain row, just wasn't passed
+        # through here before). "unknown" rather than 0 when bid/ask are
+        # missing — a missing quote is a liquidity concern in itself, not a
+        # tight-spread signal.
+        bid_ask_pct = "unknown"
+        try:
+            bid = float(r.get("bid") or 0)
+            ask = float(r.get("ask") or 0)
+            if bid > 0 and ask > 0 and mid > 0:
+                bid_ask_pct = round((ask - bid) / mid * 100, 1)
+        except (TypeError, ValueError):
+            pass
+        open_interest = r.get("open_interest")
         candidates.append({
             "strike": r.get("strike_price"), "expiry": r.get("expiration_date"),
-            "dte": dte, "delta": round(delta, 3), "mid": mid, "direction": direction,
+            "dte": dte, "delta": round(delta, 3), "mid": mid,
+            "bid_ask_pct": bid_ask_pct,
+            "open_interest": open_interest if open_interest not in (None, "") else "unknown",
+            "direction": direction,
         })
     if not candidates:
         return None
 
     candidates.sort(key=lambda c: (c["dte"], abs(c["delta"] - 0.30)))
-    header = "strike,expiry,dte,delta,mid_price"
+    header = "strike,expiry,dte,delta,mid_price,bid_ask_pct,open_interest"
     if current_expiry_d:
         header += ",roll_direction_vs_current"
     lines = [f"{header} ({cur_type} candidates from the live chain)"]
     for c in candidates[:_CANDIDATE_MAX_ROWS]:
-        row = f"{c['strike']},{c['expiry']},{c['dte']},{c['delta']},{c['mid']}"
+        row = f"{c['strike']},{c['expiry']},{c['dte']},{c['delta']},{c['mid']},{c['bid_ask_pct']},{c['open_interest']}"
         if current_expiry_d:
             row += f",{c['direction']}"
         lines.append(row)
@@ -403,6 +422,51 @@ def _build_cached_content_block(tail_text: str) -> list[dict]:
     ]
 
 
+_RETRY_BACKOFF = [2, 5]  # seconds between attempts — Claude's API is reliable
+                          # enough that a short retry is plenty, unlike NB's
+                          # much longer/more elaborate backoff.
+
+
+def _post_to_claude(api_key: str, system_prompt: str, messages: list) -> "requests.Response":
+    """POST to the Messages API with a short retry on transient failures only
+    (5xx, timeouts, connection errors) — confirmed live: a bare single-shot
+    call failed outright on a one-off Anthropic-side 500 with no recovery,
+    even though the exact same request succeeded on the very next attempt.
+    Does NOT retry 4xx — a bad request (e.g. the empty-tail_text 400 from
+    earlier) won't fix itself by resending it unchanged."""
+    import requests
+    last_exc = None
+    for attempt in range(len(_RETRY_BACKOFF) + 1):
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": _ANTHROPIC_MODEL,
+                    "max_tokens": 1500,
+                    "system": system_prompt,
+                    "messages": messages,
+                },
+                timeout=60,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_exc = exc
+            if attempt < len(_RETRY_BACKOFF):
+                time.sleep(_RETRY_BACKOFF[attempt])
+                continue
+            raise
+        if resp.status_code >= 500 and attempt < len(_RETRY_BACKOFF):
+            time.sleep(_RETRY_BACKOFF[attempt])
+            continue
+        resp.raise_for_status()
+        return resp
+    raise last_exc
+
+
 def _call_claude(system_prompt: str, tail_text: str, valid_recs: tuple[str, ...]) -> dict:
     """Shared Claude call: three cached layers (CORE manuals, weekly plan/
     review, Fed economic calendar) plus an uncached tail. Used by both the
@@ -413,7 +477,6 @@ def _call_claude(system_prompt: str, tail_text: str, valid_recs: tuple[str, ...]
     if not api_key:
         return {"error": "ANTHROPIC_API_KEY not set", "recommendation": None, "text": ""}
 
-    import requests
     try:
         content_block = _build_cached_content_block(tail_text)
     except Exception as exc:
@@ -422,22 +485,7 @@ def _call_claude(system_prompt: str, tail_text: str, valid_recs: tuple[str, ...]
     messages = [{"role": "user", "content": content_block}]
 
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": _ANTHROPIC_MODEL,
-                "max_tokens": 1500,
-                "system": system_prompt,
-                "messages": messages,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
+        resp = _post_to_claude(api_key, system_prompt, messages)
         data = resp.json()
         content = data.get("content", [])
         text = "".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
@@ -484,7 +532,6 @@ def _ask_followup(
     if not api_key:
         return {"error": "ANTHROPIC_API_KEY not set", "answer": ""}
 
-    import requests
     try:
         content_block = _build_cached_content_block(original_tail_text)
     except Exception as exc:
@@ -500,22 +547,7 @@ def _ask_followup(
     messages.append({"role": "user", "content": question})
 
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": _ANTHROPIC_MODEL,
-                "max_tokens": 1500,
-                "system": system_prompt,
-                "messages": messages,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
+        resp = _post_to_claude(api_key, system_prompt, messages)
         data = resp.json()
         content = data.get("content", [])
         text = "".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
@@ -577,6 +609,15 @@ _UNBORN_SYSTEM_PROMPT = (
     "well enough to act now — and clears the event calendar (no major "
     "economic release inside the DTE window, same as the earnings-blackout "
     "rule); WAIT if nothing qualifies yet or conditions call for patience.\n\n"
+    "The T-Bill hurdle and liquidity checks ARE answerable from the data "
+    "you were given, not just abstract criteria — the position data includes "
+    "the actual current 13-week T-Bill yield to compare premium yield "
+    "against, and each candidate row (when provided) includes a "
+    "bid_ask_pct column (bid-ask spread as a % of mid-price — lower is more "
+    "liquid; treat anything above roughly 10-15% as a real liquidity "
+    "concern worth naming) and open_interest. Use these actual numbers in "
+    "your reasoning; do not say a check 'cannot be confirmed' when the "
+    "number needed for it is sitting in the data you were given.\n\n"
     "Assignment mechanics — do not get this backwards: a short PUT is "
     "assigned if the underlying closes BELOW the strike at expiry; a short "
     "CALL is assigned if the underlying closes ABOVE the strike.\n\n"
@@ -704,7 +745,8 @@ def _cost_basis_line(is_call: bool, ul_cost_basis: float | None) -> str:
 
 def build_unborn_context(ticker: str, strat: str, ul_price: float | None,
                           ul_cost_basis: float | None, vix: float | None,
-                          atr: float | None = None, key_dates: dict | None = None) -> str:
+                          atr: float | None = None, key_dates: dict | None = None,
+                          tbill_rate: float | None = None) -> str:
     """Compact plain-text summary for the unborn (no existing position) case —
     the uncached tail of the prompt."""
     import datetime
@@ -717,6 +759,7 @@ def build_unborn_context(ticker: str, strat: str, ul_price: float | None,
         f"Today's date: {datetime.date.today().isoformat()} ({datetime.date.today().strftime('%A')})",
         f"Current time: {datetime.datetime.now().strftime('%-I:%M %p ET')}",
         f"VIX: {_fmt(vix)}",
+        f"13-week T-Bill yield (risk-free hurdle rate): {_fmt(tbill_rate)}%",
         "",
         f"Ticker: {ticker}",
         f"Intended strategy: {strategy}",
@@ -730,7 +773,8 @@ def build_unborn_context(ticker: str, strat: str, ul_price: float | None,
     return "\n".join(lines)
 
 
-def build_position_context(pos: dict, vix: float | None, key_dates: dict | None = None) -> str:
+def build_position_context(pos: dict, vix: float | None, key_dates: dict | None = None,
+                            tbill_rate: float | None = None) -> str:
     """Compact plain-text summary of one position's live data/Greeks — the
     uncached tail of the prompt. Mirrors the fields already computed by
     get_eval_data() so this needs no separate market-data fetch (ATR/buffer
@@ -747,6 +791,7 @@ def build_position_context(pos: dict, vix: float | None, key_dates: dict | None 
         f"Today's date: {datetime.date.today().isoformat()} ({datetime.date.today().strftime('%A')})",
         f"Current time: {datetime.datetime.now().strftime('%-I:%M %p ET')}",
         f"VIX: {_fmt(vix, 2)}",
+        f"13-week T-Bill yield (risk-free hurdle rate): {_fmt(tbill_rate, 2)}%",
         "",
         f"Position: {abs(int(pos.get('net_qty') or 0))}x "
         f"{pos.get('symbol')} {pos.get('strike')} {str(pos.get('option_type','')).upper()} "
