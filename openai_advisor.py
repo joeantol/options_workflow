@@ -94,7 +94,7 @@ def _call_openai(system_prompt: str, tail_text: str, valid_recs: tuple[str, ...]
     try:
         resp = client.chat.completions.create(
             model=_OPENAI_MODEL,
-            max_completion_tokens=1500,
+            max_completion_tokens=3000,
             prompt_cache_key=_PROMPT_CACHE_KEY,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -158,7 +158,7 @@ def _ask_followup(
     try:
         resp = client.chat.completions.create(
             model=_OPENAI_MODEL,
-            max_completion_tokens=1500,
+            max_completion_tokens=3000,
             prompt_cache_key=_PROMPT_CACHE_KEY,
             messages=messages,
         )

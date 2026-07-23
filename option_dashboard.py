@@ -1259,6 +1259,7 @@ def get_eval_data(
     price_cache_local: dict[str, float | None] = {}
     atr_cache: dict[str, tuple[float | None, float | None]] = {}
     div_cache: dict[str, float | None] = {}  # ticker -> dividend amount as float
+    chain_cache: dict[tuple[str, str], dict] = {}  # (ticker, expiry) -> full chain, fetched lazily
 
     result_positions: list[dict] = []
 
@@ -1312,6 +1313,29 @@ def get_eval_data(
             current_price = (bid + ask) / 2
         elif last is not None and last > 0:
             current_price = last
+
+        # Fallback: the batch quotes endpoint returns outcome=UNKNOWN (bid/ask/
+        # last all null) for contracts with zero open interest even when real
+        # market-maker quotes exist — confirmed for a freshly-rolled-into DG
+        # put with no trading history yet. The option-chain endpoint pulls
+        # from a different feed and has real data for the same contract.
+        if current_price is None:
+            chain_key = (sym, expiry)
+            if chain_key not in chain_cache:
+                chain_cache[chain_key] = get_option_chain(token, account_id, sym, expiry)
+            chain = chain_cache[chain_key] or {}
+            side = "puts" if opt_type == "PUT" else "calls"
+            for entry in chain.get(side, []):
+                od = entry.get("optionDetails") or {}
+                if _to_f(od.get("strikePrice")) == strike:
+                    c_bid = _to_f(entry.get("bid"))
+                    c_ask = _to_f(entry.get("ask"))
+                    c_last = _to_f(entry.get("last"))
+                    if c_bid is not None and c_ask is not None:
+                        current_price = (c_bid + c_ask) / 2
+                    elif c_last is not None and c_last > 0:
+                        current_price = c_last
+                    break
 
         # ── PnL ───────────────────────────────────────────────────────────────
         # net_qty > 0  →  net short  (collected premium; profit when price ↓)
@@ -2149,31 +2173,37 @@ async def run_roll_for_position(
                         btc_chain_price = None
                     break
 
-            # New (STO) leg's price — whatever NotebookLM recommended, matched
+            # New (STO) leg's price — whatever the advisor recommended, matched
             # against the same chain snapshot.
             #
-            # Execution Instructions consistently list "1. BTC ... 2. STO ..."
-            # in that order, and the BTC line always restates the CURRENT leg's
-            # exact strike/expiry verbatim (e.g. "BTC 4x LULU 115.00 Put exp
-            # 2026-07-10") before the STO line ever states the actual new one.
-            # A naive first-match search over the whole text reliably grabs the
-            # BTC line's strike instead — not just when it happens to produce an
-            # exact current-leg match (the old guard below only caught that
-            # narrow case), but whenever chain-matching then resolves to some
-            # OTHER type/expiry at that same wrong strike, which looks distinct
-            # from the current leg without actually being the recommendation.
-            # Scope the search to the STO/"sell to open" sentence first so this
-            # can't happen. There can be more than one "STO" mention (e.g. a
-            # summary line like "(simultaneous BTC/STO)" before the actual
-            # detailed one) — try each candidate in turn and keep the first
-            # that actually yields a strike, rather than just the first mention.
+            # The system prompt (claude_advisor._SYSTEM_PROMPT, shared by both
+            # advisors) now asks for an exact, standalone "STO leg: <strike> "
+            # "<PUT/CALL>, <expiry>, <price> mid-price." anchor line specifically
+            # so this doesn't have to guess — try that first. Fall back to any
+            # "sell to open"/"STO" mention for older cached responses or a model
+            # that ignores the formatting instruction, and finally to the whole
+            # text. A naive whole-text-only search is dangerous: the prose
+            # elsewhere (e.g. describing the assignment-loss scenario at the
+            # CURRENT strike) restates the current leg's own strike/expiry, and
+            # a first-match scan over the whole text can grab that instead — or
+            # worse, stitch together a strike from one sentence and an expiry
+            # from a completely unrelated one (confirmed live: "strike $124" in
+            # the Hold-scenario paragraph combined with the correct "2026-08-21"
+            # roll-target expiry into a nonexistent "124 PUT exp 2026-08-21").
+            # There can be more than one anchor/STO mention (e.g. a summary line
+            # like "(simultaneous BTC/STO)" before the actual detailed one) —
+            # try each candidate in turn and keep the first that actually yields
+            # a strike, rather than just the first mention.
             _rec_opt = None
             _sto_snippet = None
-            for _sto_m in re.finditer(r'(?:sell\s+to\s+open|\bSTO\b)[^\n]{0,150}', text, re.IGNORECASE):
-                _candidate = _parse_recommended_option(_sto_m.group(0), _adapted_rows, trust_any_date=True)
-                if _candidate and _candidate.get("strike") is not None:
-                    _rec_opt = _candidate
-                    _sto_snippet = _sto_m.group(0)
+            for _pattern in (r'STO\s+leg\s*:[^\n]{0,150}', r'(?:sell\s+to\s+open|\bSTO\b)[^\n]{0,150}'):
+                for _sto_m in re.finditer(_pattern, text, re.IGNORECASE):
+                    _candidate = _parse_recommended_option(_sto_m.group(0), _adapted_rows, trust_any_date=True)
+                    if _candidate and _candidate.get("strike") is not None:
+                        _rec_opt = _candidate
+                        _sto_snippet = _sto_m.group(0)
+                        break
+                if _rec_opt:
                     break
 
             if _rec_opt and _sto_snippet:
@@ -2281,6 +2311,24 @@ async def run_roll_for_position(
                         "%.2f < 0 (recommended premium ~$%.2f)",
                         ticker, projected_roll_pnl, sto_chain_price
                     )
+                    # Without this, the badge silently disagrees with the
+                    # displayed reasoning below it (which still says "ROLL"
+                    # throughout, since only the top-level rec field changed)
+                    # — confirmed live: a real HAL analysis showed a HOLD
+                    # badge over a full page of "Recommendation: ROLL IN"
+                    # reasoning with no indication anything had been
+                    # overridden, reading as a genuine bug rather than the
+                    # safety check it actually was.
+                    text = (
+                        f"**Overridden: HOLD, not ROLL.** The reasoning below recommends "
+                        f"rolling this position, but the actual chain-cash math on that "
+                        f"specific roll comes out to a **${projected_roll_pnl:,.2f} loss** "
+                        f"(not the ~${sto_chain_price:.2f}/share premium the reasoning cites) "
+                        f"once the real cost to close the current leg and the cost to "
+                        f"eventually close the new leg are included — so this roll doesn't "
+                        f"pay for itself, and the recommendation has been changed to HOLD "
+                        f"pending a candidate that actually nets a credit.\n\n---\n\n"
+                    ) + text
 
         return {
             "recommendation": rec,
@@ -4071,7 +4119,7 @@ async function analyzeFormerPosition(key, btn) {
     while (true) {
       const r = await fetch('/api/unborn', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ticker, qty, strat, cost_basis: cb, force: forceNow})
+        body: JSON.stringify({ticker, qty, strat, cost_basis: cb, force: forceNow, track: true})
       });
       // Only force the very first request in this sequence — re-sending
       // force:true on every retry bypasses the server's cache/in-flight
@@ -4146,7 +4194,7 @@ async function recalcUnbornRow(key, btn) {
       const r = await fetch('/api/unborn', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ticker, qty, strat, force: forceNow})
+        body: JSON.stringify({ticker, qty, strat, force: forceNow, track: true})
       });
       forceNow = false;  // see analyzeFormerPosition's comment on the PPIH infinite-loop bug
       let raw;
@@ -4309,7 +4357,7 @@ async function findUnborn() {
       const r = await fetch('/api/unborn', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ticker, qty, strat, force: forceNow})
+        body: JSON.stringify({ticker, qty, strat, force: forceNow, track: true})
       });
       forceNow = false;  // see analyzeFormerPosition's comment on the PPIH infinite-loop bug
       let raw;
@@ -6100,6 +6148,28 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         except Exception as exc:
             log.warning("Could not save unborn cache: %s", exc)
 
+    def _resolve_unborn_prefix_match(ub_key: str, unborn_cache: dict) -> tuple[str | None, dict | None]:
+        """
+        Find a cache entry for a ticker|strat|qty-only key (the _ubKey stored
+        on display rows deliberately omits cost basis) by prefix-matching
+        against the full ticker|strat|qty|cost_basis keys. When multiple
+        entries share the prefix — a ticker's cost basis can change over
+        time, leaving an OLD entry under a stale cost-basis suffix sitting
+        alongside a newer, correct one — prefer any error-free match, most
+        recently created; only fall back to an error entry if none
+        succeeded. Confirmed live: LULU's genuinely 2-day-old rate-limit
+        error (cost_basis=0, from before the DB lookup worked) kept winning
+        over that same day's real successful analysis (cost_basis=119) on
+        every page view, since a plain first-match-by-insertion-order scan
+        always found the older entry first.
+        """
+        prefix = ub_key + "|"
+        matches = [(k, v) for k, v in unborn_cache.items() if k.startswith(prefix)]
+        if not matches:
+            return None, None
+        successes = [(k, v) for k, v in matches if not v.get("error")]
+        return (successes[-1] if successes else matches[-1])
+
     _unborn_cache_raw: dict[str, dict] = _load_unborn_cache()
     import datetime as _dt_uc
     _today_uc = _dt_uc.date.today().isoformat()
@@ -6122,6 +6192,16 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         qty           = int(body.get("qty") or 1)
         strat         = body.get("strat", "CC").upper()
         force         = bool(body.get("force"))
+        # Explicit "add/keep this as a visible Unborn-table row" signal — set
+        # by findUnborn()/analyzeFormerPosition()/recalcUnbornRow() (a real
+        # user action asking to track this ticker), but deliberately NOT by
+        # scheduled_refresh.py's Pass 3, which opportunistically pre-computes
+        # "what would a fresh entry look like" for tickers you already hold a
+        # position in — that's a background cache-warm, not a request to
+        # start showing this ticker in the Unborn section. Confirmed live:
+        # 5 currently-held positions (WU/ALM/BKR/MO/LULU) all appeared as
+        # visible Unborn rows purely because Pass 3 happened to run them.
+        track         = bool(body.get("track"))
         if not ticker:
             return Response(json.dumps({"error": "Missing ticker"}), status=400, mimetype="application/json")
         if strat not in ("CC", "CSP"):
@@ -6222,7 +6302,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     _unborn_cache[ub_key] = result
             if not result.get("error"):
                 try:
-                    _persist_unborn_display_row(ticker, strat, qty, result)
+                    _persist_unborn_display_row(ticker, strat, qty, result, track=track)
                 except Exception:
                     log.exception("[unborn-rows] failed to server-persist row for %s", ub_key)
 
@@ -6247,11 +6327,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         with _cache_lock:
             cached = _unborn_cache.get(ub_key)
             if cached is None:
-                prefix = ub_key + "|"
-                for k, v in _unborn_cache.items():
-                    if k.startswith(prefix):
-                        ub_key, cached = k, v
-                        break
+                resolved_key, cached = _resolve_unborn_prefix_match(ub_key, _unborn_cache)
+                if resolved_key is not None:
+                    ub_key = resolved_key
         if not cached or cached.get("error"):
             return Response(json.dumps({"error": f"No unborn analysis cached for {ub_key} — click Find/Analyze first."}), status=404, mimetype="application/json")
 
@@ -6299,11 +6377,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         with _cache_lock:
             cached = _unborn_cache.get(ub_key)
             if cached is None:
-                prefix = ub_key + "|"
-                for k, v in _unborn_cache.items():
-                    if k.startswith(prefix):
-                        ub_key, cached = k, v
-                        break
+                resolved_key, cached = _resolve_unborn_prefix_match(ub_key, _unborn_cache)
+                if resolved_key is not None:
+                    ub_key = resolved_key
         if not cached or not cached.get("openai_text"):
             return Response(json.dumps({"error": "No Luna analysis yet for this ticker — click Compare with Luna first."}), status=404, mimetype="application/json")
 
@@ -6331,7 +6407,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
     _UNBORN_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unborn_rows.json")
 
-    def _persist_unborn_display_row(ticker: str, strat: str, qty: int, result: dict) -> None:
+    def _persist_unborn_display_row(ticker: str, strat: str, qty: int, result: dict, track: bool = False) -> None:
         """
         Mirror what the browser's findUnborn()/analyzeFormerPosition() success
         path writes into unborn_rows.json — but from the server, right when a
@@ -6342,6 +6418,16 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         hit a network hiccup during a long (multi-minute, retry-heavy)
         analysis, the server has a perfectly good cached answer that the
         Unborn/Former-Positions table silently never shows.
+
+        track=True (an explicit user action) allowed CREATING a brand-new
+        row. Without it, only an ALREADY-tracked row (one the user already
+        added) gets updated in place — never created — so scheduled_refresh's
+        Pass 3 opportunistic "what would a fresh entry look like" checks for
+        tickers you already hold a position in (not a request to track them)
+        can't silently populate the Unborn table. Confirmed live: 5 held
+        positions (WU/ALM/BKR/MO/LULU) all appeared as visible Unborn rows
+        purely because Pass 3 happened to run them, not because anyone asked
+        to track them.
         """
         chain = result.get("chain") or []
         if chain:
@@ -6368,6 +6454,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     rows = {}
             except (json.JSONDecodeError, OSError):
                 rows = {}
+            if not track and display_key not in rows:
+                log.info("[unborn-rows] skipped untracked row for %s (no track flag, not already displayed)", display_key)
+                return
             rows[display_key] = row
             try:
                 with open(_UNBORN_ROWS_FILE, "w", encoding="utf-8") as f:
@@ -6509,14 +6598,12 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     @require_auth
     def unborn_detail(ub_key: str):
         ub_key = urllib.parse.unquote(ub_key)
-        # Exact match first; fall back to prefix match (handles cost-basis suffix added server-side)
+        # Exact match first; fall back to prefix match (handles cost-basis
+        # suffix added server-side — the _ubKey stored on the display row is
+        # deliberately ticker|strat|qty only, no cost basis).
         cached = _unborn_cache.get(ub_key)
         if cached is None:
-            prefix = ub_key + "|"
-            for k, v in _unborn_cache.items():
-                if k.startswith(prefix):
-                    cached = v
-                    break
+            _, cached = _resolve_unborn_prefix_match(ub_key, _unborn_cache)
         parts  = ub_key.split("|")   # TICKER|STRAT|QTY
         title_str = html_mod.escape(" · ".join(parts))
         ticker_sym = html_mod.escape(parts[0].upper())

@@ -247,7 +247,13 @@ _SYSTEM_PROMPT = (
     "Assignment mechanics — do not get this backwards: a short PUT is "
     "assigned if the underlying closes BELOW the strike at expiry; a short "
     "CALL is assigned if the underlying closes ABOVE the strike. Always check "
-    "the position's option type before describing what triggers assignment.\n\n"
+    "the position's option type before describing what triggers assignment. "
+    "When you state WHEN assignment happens, use the position's actual given "
+    "expiry date — never a relative phrase like 'this Friday' or 'this "
+    "week' as a template borrowed from general assignment-mechanics "
+    "language. A real analysis said assignment would happen 'this Friday' "
+    "for a position that didn't expire for another 58 days; that kind of "
+    "answer is actively dangerous, not just imprecise.\n\n"
     "Do not compute your own PnL, premium, or yield figures — treat every "
     "number given in the position data as authoritative; if you reference a "
     "number, use one that was given to you. If you recommend ROLL and a "
@@ -255,7 +261,16 @@ _SYSTEM_PROMPT = (
     "that list (with its real mid-price) as your suggested STO leg — this is "
     "real chain data, not a guess. If no candidate list was provided, "
     "describe the target in terms of the rules (delta range, DTE window) "
-    "instead of inventing a specific live price you were not given.\n\n"
+    "instead of inventing a specific live price you were not given. When you "
+    "do name a specific STO leg, include it as its own standalone line, "
+    "verbatim in exactly this format so it can be parsed automatically: "
+    "'STO leg: <strike> <PUT or CALL>, <expiry YYYY-MM-DD>, <mid-price> "
+    "mid-price.' (e.g. 'STO leg: 105 PUT, 2026-08-21, $1.34 mid-price.') — "
+    "on its own line, not buried mid-paragraph, since the prose elsewhere "
+    "in your answer will also mention the CURRENT position's own strike/"
+    "expiry (e.g. describing the assignment-loss scenario at the current "
+    "strike) and a parser matching the first strike+date mentioned anywhere "
+    "in the text will otherwise grab the wrong one.\n\n"
     "Roll direction — if a candidate list was provided, each row's LAST "
     "column (roll_direction_vs_current) already tells you whether that "
     "specific candidate is OUT (more time), IN (less time), or SAME versus "
@@ -447,7 +462,13 @@ def _post_to_claude(api_key: str, system_prompt: str, messages: list) -> "reques
                 },
                 json={
                     "model": _ANTHROPIC_MODEL,
-                    "max_tokens": 1500,
+                    # Confirmed live: a real ROLL analysis got cut off
+                    # mid-sentence ("New delta: -0.") at the old 1500-token
+                    # cap — the multi-"Pass" structured reasoning this system
+                    # prompt now asks for genuinely runs long. Extra
+                    # headroom costs ~$0.0075/call at Haiku's $5/MTok output
+                    # rate, trivial next to truncating a real recommendation.
+                    "max_tokens": 3000,
                     "system": system_prompt,
                     "messages": messages,
                 },
@@ -796,9 +817,28 @@ def build_position_context(pos: dict, vix: float | None, key_dates: dict | None 
         f"Position: {abs(int(pos.get('net_qty') or 0))}x "
         f"{pos.get('symbol')} {pos.get('strike')} {str(pos.get('option_type','')).upper()} "
         f"exp {pos.get('expiry')} ({'short' if (pos.get('net_qty') or 0) > 0 else 'long'})",
+        # Given explicitly rather than left for the model to compute — a real
+        # analysis stated "13,000 shares" for a 13-contract position (should
+        # be 1,300; 1 contract = 100 shares, always). Same reasoning as never
+        # trusting LLM PnL/premium arithmetic.
+        f"Share count if assigned/exercised: {abs(int(pos.get('net_qty') or 0)) * 100} shares "
+        f"({abs(int(pos.get('net_qty') or 0))} contracts x 100 shares/contract).",
+        # Explicitly anchors assignment timing to the position's REAL given
+        # expiry date — a real analysis said assignment would happen "this
+        # Friday (July 25)" for a position that doesn't expire until
+        # 2026-09-18, apparently pattern-matching a generic "assignment
+        # settles Friday" phrase from the manuals without substituting the
+        # actual date. Assignment CAN happen early (any day, American-style)
+        # if deep ITM, but the position's stated expiry is the only date that
+        # should ever be named as "when this will be assigned" absent a
+        # specific stated reason to expect early assignment.
         f"Assignment for this leg happens if the underlying closes "
         f"{'BELOW' if str(pos.get('option_type','')).lower() == 'put' else 'ABOVE'} "
-        f"the {pos.get('strike')} strike at expiry.",
+        f"the {pos.get('strike')} strike at expiry ({pos.get('expiry')}) — that exact date "
+        f"is the one to name for 'when this gets assigned,' never a relative "
+        f"phrase like 'this Friday' or 'this week,' and never a date other "
+        f"than {pos.get('expiry')} unless you have a specific, stated reason "
+        f"to expect early assignment before then.",
         f"Days to expiration: {pos.get('dte')}",
         f"Underlying price: {_fmt(pos.get('underlying'), 2)}",
         _cost_basis_line(str(pos.get('option_type', '')).lower() == 'call', pos.get('ul_cost_basis')),
