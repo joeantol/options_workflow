@@ -241,9 +241,35 @@ _SYSTEM_PROMPT = (
     "the same source the other advisor uses), (4) live data for one specific "
     "position, and (5) sometimes a list of real candidate strikes/expiries "
     "from the current option chain. Using ONLY these sources and the rules "
-    "they establish, decide ROLL, HOLD, or ASSIGNMENT for this position — "
-    "factor in whether a major economic release falls within the position's "
-    "remaining DTE the same way you'd factor in an earnings date.\n\n"
+    "they establish, decide ROLL, HOLD, or ASSIGNMENT for this position.\n\n"
+    "Earnings vs. economic-calendar events — these are NOT equally weighted, "
+    "per the manuals' own distinction: a stock's OWN earnings is a hard, "
+    "non-negotiable blackout ('never sell through an earnings announcement — "
+    "this is not a guideline, this is a hard rule'). A major economic "
+    "release (CPI, jobs report, FOMC, etc.) is explicitly softer guidance — "
+    "'be AWARE of' it, not an automatic veto ('not every release matters... "
+    "if one lands during your contract and you're in rate-sensitive or "
+    "high-beta names, know it's there'). Because routine releases (CPI, "
+    "jobs, PPI, retail sales) occur roughly monthly, almost any multi-week "
+    "DTE window will contain at least one — treating that presence alone as "
+    "disqualifying, the same way you'd treat earnings, would rule out "
+    "practically every position and isn't what the manuals ask for. Weigh "
+    "it as one factor: is this ticker actually rate-sensitive or high-beta, "
+    "and are there STACKED events (e.g. CPI + Fed week, Fed + earnings) "
+    "that compound the risk — that combination is the manuals' real "
+    "concern, not a single routine print in isolation.\n\n"
+    "Important — whose positions are whose: the core strategy manuals and "
+    "the weekly plan/review may describe example or illustrative positions "
+    "(tickers, strikes, quantities) used to teach a rule — these belong to "
+    "the manuals' author or are hypothetical training material, NOT the "
+    "trader's actual holdings. The ONLY position that is real and belongs "
+    "to the trader you are advising is the one described in the 'live data "
+    "for one specific position' section below (starting 'Position: ...'). "
+    "Never state or imply that a ticker/position mentioned only in the "
+    "manuals or plan/review is something the trader currently owns, and "
+    "never pull strike/expiry/quantity specifics for the CURRENT position "
+    "from the manuals or plan/review — use only what the live position data "
+    "actually gives you.\n\n"
     "Assignment mechanics — do not get this backwards: a short PUT is "
     "assigned if the underlying closes BELOW the strike at expiry; a short "
     "CALL is assigned if the underlying closes ABOVE the strike. Always check "
@@ -271,8 +297,8 @@ _SYSTEM_PROMPT = (
     "expiry (e.g. describing the assignment-loss scenario at the current "
     "strike) and a parser matching the first strike+date mentioned anywhere "
     "in the text will otherwise grab the wrong one.\n\n"
-    "Roll direction — if a candidate list was provided, each row's LAST "
-    "column (roll_direction_vs_current) already tells you whether that "
+    "Roll direction — if a candidate list was provided, each row's "
+    "roll_direction_vs_current column already tells you whether that "
     "specific candidate is OUT (more time), IN (less time), or SAME versus "
     "the current position — this was computed for you from the actual "
     "dates precisely because 'roll out' is easy to reuse as a stock phrase "
@@ -282,6 +308,16 @@ _SYSTEM_PROMPT = (
     "do not independently judge or override it, and do not say 'roll out' "
     "for the overall recommendation if the candidate you actually chose is "
     "marked IN.\n\n"
+    "Earnings blackout per candidate — if a candidate list was provided and "
+    "an earnings_clear column is present, it already tells you whether that "
+    "specific candidate's expiry falls before the next earnings date "
+    "(CLEAR) or on/after it (THROUGH_EARNINGS) — this was computed for you "
+    "from the actual dates. Use that column directly; do not compute your "
+    "own 'days until earnings' figure per candidate, and do not describe a "
+    "candidate marked CLEAR as being inside an earnings blackout window (or "
+    "vice versa) — a real analysis miscalculated the days-until-earnings gap "
+    "for longer-dated candidates and flagged ones that were actually clear "
+    "as being inside the blackout zone.\n\n"
     "Dates and time — you are given the current date, weekday, and time; do "
     "not compute or assume a weekday for any other date yourself, and do "
     "not invent a specific calendar deadline (e.g. 'by EOD Friday, [date]') "
@@ -315,6 +351,7 @@ _CANDIDATE_MAX_ROWS = 60
 
 def build_chain_candidates_text(
     all_rows: list[dict], cur_type: str, current_expiry: str | None = None,
+    next_earnings_date: str | None = None, ul_price: float | None = None,
 ) -> str | None:
     """
     Compact candidate-strike text from chain rows ALREADY fetched for the
@@ -329,6 +366,27 @@ def build_chain_candidates_text(
     case where a candidate expiring EARLIER than the current position got
     called "roll out" anyway (the manuals' stock phrase "roll out and down"
     pattern-matched regardless of the actual date comparison).
+
+    next_earnings_date, when given, adds a deterministic earnings_clear
+    column (each candidate's expiry vs. that date) — computed here rather
+    than left for Claude to compute "days until earnings" itself. Confirmed
+    live: given the correct earnings date and each candidate's correct DTE,
+    an unborn SLB analysis still miscalculated the days-until-earnings gap
+    for the longer-dated candidates and flagged them as "inside the blackout
+    zone" — when in fact every single candidate on the list expired weeks
+    before earnings. The actual check ("does this expiry land before or
+    after that one fixed date") is a trivial comparison; there's no reason
+    to trust free-text arithmetic with it.
+
+    ul_price, when given, adds a deterministic annualized_yield_pct column
+    (premium / basis * 365/dte * 100) — basis is the strike for a PUT
+    (cash-secured basis) or the underlying price for a CALL (covered-call
+    yield on the stock's current value). Confirmed live: without a real
+    number to cite, Luna's SLB analysis said "the chain rows do not provide
+    an authoritative yield figure" and skipped the yield-vs-T-bill-hurdle
+    check the system prompt asks for entirely, leaning on whatever data it
+    did have (the event calendar) instead — same failure mode as the
+    T-bill rate and liquidity gaps fixed earlier, just one layer further in.
     """
     import datetime
     today = datetime.date.today()
@@ -338,6 +396,10 @@ def build_chain_candidates_text(
         current_expiry_d = datetime.date.fromisoformat(current_expiry) if current_expiry else None
     except (TypeError, ValueError):
         current_expiry_d = None
+    try:
+        earnings_d = datetime.date.fromisoformat(next_earnings_date) if next_earnings_date else None
+    except (TypeError, ValueError):
+        earnings_d = None
 
     candidates = []
     for r in all_rows:
@@ -375,23 +437,45 @@ def build_chain_candidates_text(
         except (TypeError, ValueError):
             pass
         open_interest = r.get("open_interest")
+        earnings_clear = ""
+        if earnings_d:
+            earnings_clear = "CLEAR" if exp < earnings_d else "THROUGH_EARNINGS"
+        yield_pct = "unknown"
+        if ul_price:
+            try:
+                strike_f = float(r.get("strike_price") or 0)
+                basis = strike_f if cur_type.upper() == "PUT" else float(ul_price)
+                if basis > 0 and dte > 0:
+                    yield_pct = round(mid / basis * (365 / dte) * 100, 2)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
         candidates.append({
             "strike": r.get("strike_price"), "expiry": r.get("expiration_date"),
             "dte": dte, "delta": round(delta, 3), "mid": mid,
             "bid_ask_pct": bid_ask_pct,
             "open_interest": open_interest if open_interest not in (None, "") else "unknown",
             "direction": direction,
+            "earnings_clear": earnings_clear,
+            "yield_pct": yield_pct,
         })
     if not candidates:
         return None
 
     candidates.sort(key=lambda c: (c["dte"], abs(c["delta"] - 0.30)))
     header = "strike,expiry,dte,delta,mid_price,bid_ask_pct,open_interest"
+    if earnings_d:
+        header += ",earnings_clear"
+    if ul_price:
+        header += ",annualized_yield_pct"
     if current_expiry_d:
         header += ",roll_direction_vs_current"
     lines = [f"{header} ({cur_type} candidates from the live chain)"]
     for c in candidates[:_CANDIDATE_MAX_ROWS]:
         row = f"{c['strike']},{c['expiry']},{c['dte']},{c['delta']},{c['mid']},{c['bid_ask_pct']},{c['open_interest']}"
+        if earnings_d:
+            row += f",{c['earnings_clear']}"
+        if ul_price:
+            row += f",{c['yield_pct']}"
         if current_expiry_d:
             row += f",{c['direction']}"
         lines.append(row)
@@ -627,18 +711,62 @@ _UNBORN_SYSTEM_PROMPT = (
     "option chain. Using ONLY these sources and the rules they establish, "
     "decide SELL or WAIT: SELL if a specific candidate meets the manuals' "
     "criteria (delta range, DTE window, yield vs. T-bill hurdle, liquidity) "
-    "well enough to act now — and clears the event calendar (no major "
-    "economic release inside the DTE window, same as the earnings-blackout "
-    "rule); WAIT if nothing qualifies yet or conditions call for patience.\n\n"
+    "well enough to act now and the earnings/event picture doesn't disqualify "
+    "it; WAIT if nothing qualifies yet or conditions call for patience.\n\n"
+    "Earnings vs. economic-calendar events — these are NOT equally weighted, "
+    "per the manuals' own distinction: the ticker's OWN earnings is a hard, "
+    "non-negotiable blackout ('never sell a put/call through an earnings "
+    "announcement — this is not a guideline, this is a hard rule'). A major "
+    "economic release (CPI, jobs report, FOMC, etc.) is explicitly softer "
+    "guidance — 'be AWARE of' it, not an automatic veto ('not every release "
+    "matters... if one lands during your contract and you're in "
+    "rate-sensitive or high-beta names, know it's there'). Because routine "
+    "releases (CPI, jobs, PPI, retail sales) occur roughly monthly, almost "
+    "any multi-week DTE window will contain at least one — treating that "
+    "presence alone as disqualifying, the same way you'd treat earnings, "
+    "would rule out practically every candidate on every ticker and isn't "
+    "what the manuals ask for (it would silently veto the entire income "
+    "strategy this trader runs). Weigh it as one factor: is this ticker "
+    "actually rate-sensitive or high-beta, and are there STACKED events "
+    "(e.g. CPI + Fed week, Fed + earnings) that compound the risk — that "
+    "combination is the manuals' real concern, not a single routine print "
+    "in isolation. Do not let the economic calendar alone drive a WAIT "
+    "recommendation on a candidate that otherwise clears delta, DTE, yield, "
+    "and liquidity — weigh it alongside those, not above them.\n\n"
+    "Important — whose positions are whose: the core strategy manuals and "
+    "the weekly plan/review may describe example or illustrative positions "
+    "(tickers, strikes, quantities) used to teach a rule — these belong to "
+    "the manuals' author or are hypothetical training material, NOT the "
+    "trader's actual holdings. The trader has NO existing position on this "
+    "ticker (that is the whole premise of this SELL/WAIT decision) — never "
+    "state or imply the trader currently owns a position on this ticker, or "
+    "on any other ticker mentioned only in the manuals or plan/review.\n\n"
     "The T-Bill hurdle and liquidity checks ARE answerable from the data "
     "you were given, not just abstract criteria — the position data includes "
     "the actual current 13-week T-Bill yield to compare premium yield "
-    "against, and each candidate row (when provided) includes a "
-    "bid_ask_pct column (bid-ask spread as a % of mid-price — lower is more "
-    "liquid; treat anything above roughly 10-15% as a real liquidity "
-    "concern worth naming) and open_interest. Use these actual numbers in "
-    "your reasoning; do not say a check 'cannot be confirmed' when the "
-    "number needed for it is sitting in the data you were given.\n\n"
+    "against, and each candidate row (when provided) includes an "
+    "annualized_yield_pct column (premium annualized over DTE, already "
+    "computed for you — do not calculate your own yield figure or say a "
+    "yield/hurdle comparison 'cannot be confirmed'; subtract the T-Bill "
+    "yield from annualized_yield_pct directly), a bid_ask_pct column "
+    "(bid-ask spread as a % of mid-price — lower is more liquid; treat "
+    "anything above roughly 10-15% as a real liquidity concern worth "
+    "naming), and open_interest. Use these actual numbers in your "
+    "reasoning; do not say a check 'cannot be confirmed' when the number "
+    "needed for it is sitting in the data you were given. Give the yield "
+    "check equal weight alongside the event-calendar check — a candidate "
+    "can fail on yield alone even if its calendar is clean, and vice "
+    "versa; don't let one check crowd the other out of your answer.\n\n"
+    "Earnings blackout per candidate — if a candidate list was provided and "
+    "an earnings_clear column is present, it already tells you whether that "
+    "specific candidate's expiry falls before the next earnings date "
+    "(CLEAR) or on/after it (THROUGH_EARNINGS) — this was computed for you "
+    "from the actual dates. Use that column directly; do not compute your "
+    "own 'days until earnings' figure per candidate, and do not describe a "
+    "candidate marked CLEAR as being inside an earnings blackout window (or "
+    "vice versa) — a real analysis miscalculated the days-until-earnings gap "
+    "for longer-dated candidates and flagged ones that were actually clear "
+    "as being inside the blackout zone.\n\n"
     "Assignment mechanics — do not get this backwards: a short PUT is "
     "assigned if the underlying closes BELOW the strike at expiry; a short "
     "CALL is assigned if the underlying closes ABOVE the strike.\n\n"

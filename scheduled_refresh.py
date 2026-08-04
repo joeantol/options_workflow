@@ -30,7 +30,12 @@ SCRIPT_DIR = Path(__file__).parent
 UNBORN_ROWS_FILE = SCRIPT_DIR / "unborn_rows.json"
 LOG_FILE = SCRIPT_DIR / "logs" / "scheduled_refresh.log"
 HTTP_TIMEOUT = 360  # seconds per individual HTTP call (LLM analysis can take 60-180s+)
-POLL_MAX    = 300   # seconds total before giving up on a single analysis
+# Must exceed the dashboard's own outer per-analysis timeout (600s, see
+# option_dashboard.py's _run_analysis closures) or this gives up polling
+# while the background thread is still legitimately working — the analysis
+# still completes and gets cached, just after this script already logged a
+# false-negative "Poll timeout".
+POLL_MAX    = 650   # seconds total before giving up on a single analysis
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 os.makedirs(LOG_FILE.parent, exist_ok=True)
@@ -202,11 +207,11 @@ def main():
             log.error("Failed to save unborn rows: %s", exc)
 
     # ── Pass 2: Re-analyze flagged (warning) positions ────────────────────────
-    # Claude drives /api/analyze itself now (primary advisor); the Luna
-    # second-opinion call is back-to-back with it here, not on its own
-    # schedule — that keeps OpenAI's automatic prompt cache (CORE manuals +
-    # weekly plan/review + Fed calendar) warm across every position in this
-    # pass, instead of paying a full-price cache rewrite per position.
+    # /api/analyze now runs Claude, then Luna, then NotebookLM inline in
+    # sequence itself (see run_roll_for_position's docstring) — no separate
+    # back-to-back /api/openai-compare call needed here anymore; that used
+    # to be how Luna ran at all, now it'd just be a redundant second Luna
+    # call on top of the one /api/analyze already made.
     flagged = [p for p in positions if p.get("flagged") and not p.get("dont_analyze")]
     skipped_dont_analyze = [p for p in positions if p.get("flagged") and p.get("dont_analyze")]
     if skipped_dont_analyze:
@@ -223,8 +228,6 @@ def main():
         _post(f"{BASE_URL}/api/reset-cache-entry", {"position_key": pk})
         status = _post_and_poll(f"{BASE_URL}/api/analyze", {"position_key": pk})
         log.info("    → /api/analyze HTTP %d", status)
-        openai_status = _post(f"{BASE_URL}/api/openai-compare", {"position_key": pk})
-        log.info("    → /api/openai-compare HTTP %d", openai_status)
 
     # ── Pass 3: Run unborn for remaining open positions ──────────────────────
     seen: set[str] = set()

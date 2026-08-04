@@ -385,10 +385,13 @@ def _scheduler_loop(mode: str, noemail: bool) -> None:
         errors.append(f"Timed out after {SCHEDULER_MAX_HOURS}h without finding new content.")
 
     # ── Send completion email ────────────────────────────────────────────────
-    if _complete and downloaded:
+    if _complete:
         subject = f"SUCCESS :: Multiplier {mode.capitalize()} complete"
-        body    = "Downloaded and loaded into NotebookLM:\n\n"
-        body   += "\n".join(f"  • {f}" for f in downloaded)
+        if downloaded:
+            body = "Downloaded and loaded into NotebookLM:\n\n"
+            body += "\n".join(f"  • {f}" for f in downloaded)
+        else:
+            body = "Already complete — finished by another run."
         if errors:
             body += "\n\nWarnings:\n" + "\n".join(f"  • {e}" for e in errors)
     else:

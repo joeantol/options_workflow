@@ -146,6 +146,33 @@ CSV_COLUMNS = [
     "implied_volatility",
 ]
 
+# Serializes ALL NotebookLM access (upload/query/delete) across every
+# concurrent analysis — module-level because run_roll_for_position() and
+# run_unborn_for_ticker() now fire it automatically on every request rather
+# than only from the CLI's one-at-a-time flow it was originally built for.
+# Confirmed live: two DIFFERENT tickers' analyses overlapping in their NB
+# query phase corrupted each other's response (RPCResponseTooLargeError) —
+# every NB call shares ONE notebook conversation
+# (_reset_notebooklm_conversation resets it before each ask specifically
+# because chat.ask's history keeps growing forever), so a second call
+# resetting/asking while a first is still mid-response is a real hazard,
+# not just a slow race.
+#
+# Acquired with a bounded timeout (never a plain `with`) — a blocking
+# threading.Lock().acquire() inside an async function freezes that whole
+# event loop until it returns, which means asyncio.wait_for's own timeout
+# (wrapping the ENTIRE Claude+Luna+NotebookLM call one level up) can't fire
+# while stuck waiting on the lock. Confirmed live: this silently ate the
+# lock-wait time out of that outer budget, then fired a timeout error the
+# instant the lock was finally acquired — discarding Claude/Luna's
+# already-successful results along with NB's, not just NB's. Bounding both
+# the lock wait AND the NB work itself (see _NOTEBOOKLM_WORK_TIMEOUT) keeps
+# every piece of this best-effort third opinion from ever threatening the
+# two opinions that already succeeded.
+_notebooklm_lock = threading.Lock()
+_NOTEBOOKLM_LOCK_TIMEOUT = 200  # seconds to wait for another analysis's NB call to finish
+_NOTEBOOKLM_WORK_TIMEOUT = 200  # seconds cap on this analysis's own NB upload+query+delete
+
 
 def get_access_token(secret: str, validity_minutes: int = 60) -> str:
     import requests
@@ -703,15 +730,33 @@ def get_underlying_price_fresh(ticker: str) -> float | None:
     return price
 
 
+def _yf_last_price(symbol: str, retries: int = 1, backoff: float = 1.5) -> float | None:
+    """fast_info.last_price for a Yahoo index symbol (^VIX, ^IRX), with a
+    short retry on a transient failure — confirmed live: a Luna unborn call
+    for SLB got 'unknown%' for the T-Bill yield (and Unknown for earnings/
+    ex-div, a separate yfinance call) purely from a momentary Yahoo hiccup;
+    re-running the exact same call seconds later succeeded. A single-shot
+    call silently drops that context from the prompt with no sign anything
+    went wrong, and the LLM then can't do the yield-vs-hurdle check at all —
+    worth one retry before actually returning None."""
+    import time as _time
+    import yfinance as yf
+    for attempt in range(retries + 1):
+        try:
+            fi = yf.Ticker(symbol).fast_info
+            val = getattr(fi, "last_price", None)
+            if val:
+                return float(val)
+        except Exception:
+            pass
+        if attempt < retries:
+            _time.sleep(backoff)
+    return None
+
+
 def get_vix() -> float | None:
     """Return the current VIX level via yfinance."""
-    try:
-        import yfinance as yf
-        fi = yf.Ticker("^VIX").fast_info
-        val = getattr(fi, "last_price", None)
-        return float(val) if val else None
-    except Exception:
-        return None
+    return _yf_last_price("^VIX")
 
 
 def get_tbill_rate() -> float | None:
@@ -723,13 +768,7 @@ def get_tbill_rate() -> float | None:
     actually given, so Claude/Luna could only say the check "cannot be
     confirmed" rather than do it.
     """
-    try:
-        import yfinance as yf
-        fi = yf.Ticker("^IRX").fast_info
-        val = getattr(fi, "last_price", None)
-        return float(val) if val else None
-    except Exception:
-        return None
+    return _yf_last_price("^IRX")
 
 
 def get_atr(ticker: str, period: int = 14) -> float | None:
@@ -2047,6 +2086,9 @@ async def run_roll_for_position(
                 "ticker": ticker,
             }
 
+        key_dates = get_key_dates(ticker)
+        vix = get_vix()
+
         # Compact candidate-strike summary from this SAME chain fetch, for
         # Claude's comparison opinion (claude_advisor.py) — reuses all_rows
         # rather than a second Public.com hit. Current leg's own type, parsed
@@ -2056,11 +2098,9 @@ async def run_roll_for_position(
             _pk_parts = pos_key.split("|")
             if len(_pk_parts) == 4:
                 chain_candidates_text = claude_advisor.build_chain_candidates_text(
-                    all_rows, _pk_parts[1].upper(), current_expiry=_pk_parts[3]
+                    all_rows, _pk_parts[1].upper(), current_expiry=_pk_parts[3],
+                    next_earnings_date=key_dates.get("earnings_date"),
                 )
-
-        key_dates = get_key_dates(ticker)
-        vix = get_vix()
 
         # Resolve spread_id and ul_cost_basis from the matched open position BEFORE querying,
         # so the cost basis context is included in the prompt.
@@ -2127,6 +2167,16 @@ async def run_roll_for_position(
             return {"error": claude_result["error"], "recommendation": "HOLD", "text": "", "ticker": ticker}
         text = claude_result["text"]
         tail_text = claude_result.get("tail_text")
+
+        # Luna (GPT-5.6) — second opinion, runs automatically right after
+        # Claude on every analysis now (same rich context, no separate
+        # on-demand click required; /api/openai-compare still exists to
+        # re-run Luna alone). Never blocks the overall result on its own
+        # error — an empty/failed Luna call just leaves these fields unset,
+        # same as if the on-demand button had failed.
+        openai_result = openai_advisor.query_openai_advisor(claude_context, chain_candidates_text)
+        import time as _time
+        _advisor_run_at = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
 
         # Expected PnL: close current position at 40% of sale price (keep 60%)
         pos_avg_price = float(matched_pos["avg_price"]) if matched_pos and matched_pos.get("avg_price") is not None else None
@@ -2330,10 +2380,94 @@ async def run_roll_for_position(
                         f"pending a candidate that actually nets a credit.\n\n---\n\n"
                     ) + text
 
+        # NotebookLM — best-effort THIRD opinion, always attempted after
+        # Claude and Luna above but never allowed to block or fail the
+        # overall result: if the upload/query/timeout chain errors out for
+        # any reason, this just leaves the notebooklm_* fields as an error
+        # note rather than propagating. Worth attempting every time anyway
+        # (not metered like the other two) — genuinely useful specifically
+        # because it sometimes disagrees with Claude/Luna.
+        notebooklm_rec = notebooklm_text_val = notebooklm_error = None
+        if not _notebooklm_lock.acquire(timeout=_NOTEBOOKLM_LOCK_TIMEOUT):
+            # Another analysis is mid-NotebookLM-call and didn't free the lock
+            # in time — skip NB this run rather than wait indefinitely (a
+            # bounded blocking acquire, safe here since each analysis runs in
+            # its own dedicated thread/event loop with nothing else competing
+            # for it, but it must stay BOUNDED — see the lock's own comment
+            # for why an unbounded wait here previously let the OUTER
+            # per-analysis timeout fire mid-lock-wait and silently discard
+            # Claude/Luna's already-successful results, not just NB's).
+            notebooklm_error = "NotebookLM busy with another analysis — skipped this run"
+        else:
+            try:
+                async def _run_nb() -> str | None:
+                    output_file = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
+                    )
+                    with open(output_file, "w", newline="") as tmp:
+                        writer = csv.DictWriter(tmp, fieldnames=CSV_COLUMNS)
+                        writer.writeheader()
+                        writer.writerows(all_rows)
+                    source_id = None
+                    try:
+                        source_id = await upload_to_notebooklm(output_file, notebook_id)
+                    finally:
+                        try:
+                            os.unlink(output_file)
+                        except OSError:
+                            pass
+                    try:
+                        if source_id:
+                            await asyncio.sleep(15)
+                        return await query_notebooklm(
+                            notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
+                            silent=True,
+                            ul_cost_basis=ul_cost_basis,
+                            chain_data=chain,
+                            current_leg_price=current_leg_price,
+                        )
+                    finally:
+                        await delete_notebooklm_source(notebook_id, source_id)
+
+                # Bounded well under query_notebooklm's own theoretical worst
+                # case (4 attempts x 90s + backoff ≈ 465s) — this caps a
+                # single ticker's NB attempt so it can never itself blow the
+                # outer per-analysis budget (see that timeout's own comment).
+                notebooklm_text_val = await asyncio.wait_for(_run_nb(), timeout=_NOTEBOOKLM_WORK_TIMEOUT)
+                if notebooklm_text_val:
+                    # The prompt now asks NB for an explicit 'Recommendation: X'
+                    # line right after the date, matching Claude/Luna's own
+                    # format — try parsing that directly first (cheap, no extra
+                    # API call) before falling back to the LLM classifier.
+                    _m = re.search(r"Recommendation:\s*\*{0,2}(ROLL|HOLD|ASSIGNMENT)\*{0,2}",
+                                    notebooklm_text_val, re.IGNORECASE)
+                    notebooklm_rec = _m.group(1).upper() if _m else _detect_recommendation(notebooklm_text_val)
+                else:
+                    notebooklm_error = "Empty response from NotebookLM"
+            except asyncio.TimeoutError:
+                log.warning("[roll] NotebookLM third opinion timed out after %ds for %s",
+                            _NOTEBOOKLM_WORK_TIMEOUT, ticker)
+                notebooklm_error = f"Timed out after {_NOTEBOOKLM_WORK_TIMEOUT}s"
+            except Exception as exc:
+                log.warning("[roll] NotebookLM third opinion failed for %s: %s", ticker, exc)
+                notebooklm_error = str(exc)
+            finally:
+                _notebooklm_lock.release()
+
         return {
             "recommendation": rec,
             "text": text,
             "tail_text": tail_text,  # so /api/ask can replay this turn for follow-ups
+            "openai_recommendation": openai_result.get("recommendation"),
+            "openai_text": openai_result.get("text"),
+            "openai_tail_text": openai_result.get("tail_text"),
+            "openai_error": openai_result.get("error"),
+            "openai_run_at": _advisor_run_at,
+            "openai_qa_thread": [],
+            "notebooklm_recommendation": notebooklm_rec,
+            "notebooklm_text": notebooklm_text_val,
+            "notebooklm_error": notebooklm_error,
+            "notebooklm_run_at": _advisor_run_at,
             "ticker": ticker,
             "chain_cash":      chain["net_cash"],       # for dashboard badge
             "chain_collected": chain["collected"],
@@ -2456,13 +2590,16 @@ async def run_unborn_for_ticker(
                 "opt_price":   row.get("mid_price") or row.get("last"),
             })
 
-        # Same chain fetch as above, reused for Claude's opinion (claude_advisor.py)
-        # — no separate Public.com hit.
-        chain_candidates_text = claude_advisor.build_chain_candidates_text(all_rows, opt_type_filter)
-
         key_dates = get_key_dates(ticker)
         vix = get_vix()
         atr = get_atr(ticker)
+
+        # Same chain fetch as above, reused for Claude's opinion (claude_advisor.py)
+        # — no separate Public.com hit.
+        chain_candidates_text = claude_advisor.build_chain_candidates_text(
+            all_rows, opt_type_filter, next_earnings_date=key_dates.get("earnings_date"),
+            ul_price=ul_price,
+        )
 
         # Claude is the primary advisor (see claude_advisor.py) — no chain CSV
         # upload/source needed since Claude reads the candidate list directly
@@ -2474,6 +2611,16 @@ async def run_unborn_for_ticker(
                     "text": "", "ticker": ticker, "strat": strat, "chain": display_rows}
         text = claude_result["text"]
         tail_text = claude_result.get("tail_text")
+
+        # Luna (GPT-5.6) — second opinion, runs automatically right after
+        # Claude on every analysis now (same rich context, no separate
+        # on-demand click required; /api/openai-compare-unborn still exists
+        # to re-run Luna alone). Never blocks the overall result on its own
+        # error — an empty/failed Luna call just leaves these fields unset,
+        # same as if the on-demand button had failed.
+        openai_result = openai_advisor.query_openai_unborn_advisor(claude_context, chain_candidates_text)
+        import time as _time
+        _advisor_run_at = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
 
         log.info("[unborn] display_rows count: %d, first: %s", len(display_rows), display_rows[0] if display_rows else None)
         # Claude already returns a clean SELL/WAIT recommendation (parsed by
@@ -2519,6 +2666,95 @@ async def run_unborn_for_ticker(
             if chosen is not None:
                 chosen = dict(chosen)
                 chosen["ideal_entry"] = _parse_ideal_entry(text)
+
+        # NotebookLM — best-effort THIRD opinion, always attempted after
+        # Claude and Luna above but never allowed to block or fail the
+        # overall result: if the upload/query/timeout chain errors out for
+        # any reason, this just leaves the notebooklm_* fields as an error
+        # note rather than propagating. Worth attempting every time anyway
+        # (not metered like the other two) — genuinely useful specifically
+        # because it sometimes disagrees with Claude/Luna.
+        notebooklm_rec = notebooklm_text_val = notebooklm_error = None
+        if not _notebooklm_lock.acquire(timeout=_NOTEBOOKLM_LOCK_TIMEOUT):
+            # See run_roll_for_position's matching comment: a bounded acquire
+            # (not an unbounded `with`) so this can never freeze the async
+            # harness long enough for the OUTER per-analysis timeout to fire
+            # mid-lock-wait and discard Claude/Luna's already-successful
+            # results, not just NB's.
+            notebooklm_error = "NotebookLM busy with another analysis — skipped this run"
+        else:
+            try:
+                async def _run_nb() -> str | None:
+                    output_file = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
+                    )
+                    with open(output_file, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                        writer.writeheader()
+                        writer.writerows(all_rows)
+                    source_id = None
+                    try:
+                        source_id = await upload_to_notebooklm(output_file, notebook_id)
+                    finally:
+                        try:
+                            os.unlink(output_file)
+                        except OSError:
+                            pass
+                    synthetic_positions = [{"symbol": ticker, "option_type": strat, "net_qty": -qty,
+                                             "avg_price": None, "strike": None, "expiry": None}]
+                    try:
+                        if source_id:
+                            await asyncio.sleep(15)
+                        return await query_notebooklm(
+                            notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
+                            silent=True,
+                            ul_cost_basis=ul_cost_basis,
+                        )
+                    finally:
+                        await delete_notebooklm_source(notebook_id, source_id)
+
+                # Bounded well under query_notebooklm's own theoretical worst
+                # case (4 attempts x 90s + backoff ≈ 465s) — caps a single
+                # ticker's NB attempt so it can't itself blow the outer
+                # per-analysis budget.
+                notebooklm_text_val = await asyncio.wait_for(_run_nb(), timeout=_NOTEBOOKLM_WORK_TIMEOUT)
+                if notebooklm_text_val:
+                    # The prompt now asks NB for an explicit 'Recommendation:
+                    # SELL/WAIT' line right after the date, matching Claude/
+                    # Luna's own format — try parsing that directly first
+                    # (cheap, no extra API call) before falling back to the
+                    # unborn-specific SELL/WAIT LLM classifier (see
+                    # _detect_unborn_action_llm's docstring for why the ROLL/
+                    # HOLD/ASSIGNMENT classifier doesn't fit this case) and its
+                    # own regex fallback, mirroring the old pre-Claude-primary
+                    # behavior this restores.
+                    _m = re.search(r"Recommendation:\s*\*{0,2}(SELL|WAIT)\*{0,2}",
+                                    notebooklm_text_val, re.IGNORECASE)
+                    if _m:
+                        notebooklm_rec = _m.group(1).upper()
+                    else:
+                        _action = _detect_unborn_action_llm(notebooklm_text_val)
+                        _explicit_do_nothing = bool(re.search(
+                            r'\brecommendation\b[:\s\*]+do\s+nothing\b', notebooklm_text_val, re.IGNORECASE
+                        ))
+                        if _action is not None:
+                            notebooklm_rec = "WAIT" if (_action == "WAIT" or _explicit_do_nothing) else "SELL"
+                        else:
+                            notebooklm_rec = "WAIT" if (_explicit_do_nothing or (
+                                (not display_rows) and bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", notebooklm_text_val, re.IGNORECASE))
+                            )) else "SELL"
+                else:
+                    notebooklm_error = "Empty response from NotebookLM"
+            except asyncio.TimeoutError:
+                log.warning("[unborn] NotebookLM third opinion timed out after %ds for %s",
+                            _NOTEBOOKLM_WORK_TIMEOUT, ticker)
+                notebooklm_error = f"Timed out after {_NOTEBOOKLM_WORK_TIMEOUT}s"
+            except Exception as exc:
+                log.warning("[unborn] NotebookLM third opinion failed for %s: %s", ticker, exc)
+                notebooklm_error = str(exc)
+            finally:
+                _notebooklm_lock.release()
+
         return {
             "recommendation": rec,
             "text": text,
@@ -2529,6 +2765,16 @@ async def run_unborn_for_ticker(
             "ul_cost_basis": ul_cost_basis,
             "ul_price": ul_price,
             "_do_nothing": _do_nothing,
+            "openai_recommendation": openai_result.get("recommendation"),
+            "openai_text": openai_result.get("text"),
+            "openai_tail_text": openai_result.get("tail_text"),
+            "openai_error": openai_result.get("error"),
+            "openai_run_at": _advisor_run_at,
+            "openai_qa_thread": [],
+            "notebooklm_recommendation": notebooklm_rec,
+            "notebooklm_text": notebooklm_text_val,
+            "notebooklm_error": notebooklm_error,
+            "notebooklm_run_at": _advisor_run_at,
             "chain_candidates_text": chain_candidates_text,  # for claude_advisor's reuse — same chain, no 2nd fetch
             "error": None,
         }
@@ -5991,45 +6237,78 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             return Response(json.dumps({"error": str(exc)}), status=500, mimetype="application/json")
 
         log.info("[web] Running ROLL analysis for %s (%s %s exp %s)", ticker, opt_type, strike_str, expiry)
-        try:
-            result = asyncio.run(
-                run_roll_for_position(fresh_token, fresh_account_id, ticker, open_positions, notebook_id, pos_key=pos_key)
-            )
-            if result.get("error"):
-                log.error("[web] Analysis error for %s: %s", ticker, result["error"])
-            else:
-                log.info("[web] Analysis complete for %s → %s", ticker, result.get("recommendation"))
-        except Exception as exc:
-            log.exception("[web] Unhandled exception for %s", ticker)
-            result = {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker}
-        finally:
-            with _cache_lock:
-                _analysis_inflight.discard(pos_key)
 
-        with _cache_lock:
-            import time as _time
-            # Preserve any claude_*/openai_* second-opinion fields already
-            # merged into this entry by api_claude_compare()/api_openai_compare()
-            # — a plain overwrite here would silently wipe them if a slow
-            # primary analysis lands after a comparison already ran, since the
-            # comparison endpoints' own writes only ever merge, never replace.
-            # Only when NOT forced: a forced re-analyze means the position's
-            # state changed enough to warrant a fresh look (auto-rerun on
-            # flag/delta/underlying change) — the old second opinions were
-            # made against the prior state and are no longer valid, so they
-            # should be dropped rather than carried forward against new data.
-            if not force:
-                _existing = _analysis_cache.get(pos_key) or {}
-                _claude_fields = {k: v for k, v in _existing.items() if k.startswith(("claude_", "openai_"))}
-                result.update(_claude_fields)
-            if not result.get("error"):
-                result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
-                _analysis_cache[pos_key] = result
-                _save_cache(_analysis_cache)
-            else:
-                result["_error_at"] = _time.time()
-                _analysis_cache[pos_key] = result
-        return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
+        # Run in a background thread, same as /api/unborn: Claude, Luna, and
+        # NotebookLM now all run inline in sequence inside
+        # run_roll_for_position() (see its docstring), which can take a good
+        # while longer than Claude alone used to — a synchronous blocking
+        # request risked the Cloudflare tunnel's own timeout on slow runs.
+        # The handler returns 202 immediately; the JS polling loop (already
+        # built to handle 202 for this exact endpoint) picks up the cached
+        # result once the background thread finishes.
+        def _run_analysis():
+            try:
+                # 600s: NotebookLM's own internal work is now self-bounded to
+                # at most ~400s (200s lock-wait + 200s query work — see
+                # _NOTEBOOKLM_LOCK_TIMEOUT/_NOTEBOOKLM_WORK_TIMEOUT), so this
+                # outer bound mainly exists as a last-resort safety net for a
+                # genuinely stuck Claude/Luna call, not a normal ceiling —
+                # firing it discards the ENTIRE result (including any
+                # already-successful Claude/Luna opinions), so it needs
+                # enough headroom to essentially never trip under normal NB
+                # slowness. Confirmed live at the old 300s: it fired mid-NB
+                # lock-wait and wiped an already-complete Claude+Luna result.
+                result = asyncio.run(
+                    asyncio.wait_for(
+                        run_roll_for_position(fresh_token, fresh_account_id, ticker, open_positions,
+                                               notebook_id, pos_key=pos_key),
+                        timeout=600,
+                    )
+                )
+                if result.get("error"):
+                    log.error("[web] Analysis error for %s: %s", ticker, result["error"])
+                else:
+                    log.info("[web] Analysis complete for %s → %s", ticker, result.get("recommendation"))
+            except asyncio.TimeoutError:
+                log.error("[web] Analysis timed out after 600s for %s", ticker)
+                result = {"error": "Analysis timed out", "recommendation": "HOLD", "text": "", "ticker": ticker}
+            except Exception as exc:
+                log.exception("[web] Unhandled exception for %s", ticker)
+                result = {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker}
+            finally:
+                with _cache_lock:
+                    _analysis_inflight.discard(pos_key)
+
+            with _cache_lock:
+                import time as _time
+                # run_roll_for_position() now runs Luna and NotebookLM inline
+                # as part of the same analysis — so `result` already has its
+                # own fresh openai_*/notebooklm_* fields every time. Preserve
+                # OLDER such fields only where fresh ones are missing
+                # (old-first, fresh-overlaid-on-top — never the reverse), so
+                # a still-independent on-demand /api/openai-compare click
+                # doesn't get clobbered by this run if it landed first, but
+                # this run's own fresh second/third opinions always win over
+                # anything older. Only when NOT forced: a forced re-analyze
+                # means the position's state changed enough that old second
+                # opinions no longer apply and should be dropped rather than
+                # carried forward.
+                if not force:
+                    _existing = _analysis_cache.get(pos_key) or {}
+                    _claude_fields = {k: v for k, v in _existing.items() if k.startswith(("claude_", "openai_", "notebooklm_"))}
+                    result = {**_claude_fields, **result}
+                if not result.get("error"):
+                    result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
+                    _analysis_cache[pos_key] = result
+                    _save_cache(_analysis_cache)
+                else:
+                    result["_error_at"] = _time.time()
+                    _analysis_cache[pos_key] = result
+
+        t = threading.Thread(target=_run_analysis, daemon=True)
+        t.start()
+        return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                        status=202, mimetype="application/json")
 
     @app.route("/api/openai-compare", methods=["POST"])
     @require_auth
@@ -6261,11 +6540,17 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         # cached result once the background thread finishes.
         def _run_analysis():
             try:
+                # 600s: see the matching comment in /api/analyze's
+                # _run_analysis for why this needs enough headroom over
+                # NotebookLM's own self-bounded worst case (~400s) to
+                # essentially never trip under normal NB slowness — firing
+                # it discards the ENTIRE result, including any
+                # already-successful Claude/Luna opinions, not just NB's.
                 result = asyncio.run(
                     asyncio.wait_for(
                         run_unborn_for_ticker(fresh_token, fresh_account_id, ticker, qty, strat,
                                               notebook_id, ul_cost_basis=ul_cost_basis),
-                        timeout=300,
+                        timeout=600,
                     )
                 )
                 if result.get("error"):
@@ -6273,7 +6558,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 else:
                     log.info("[unborn] %s → %s", ticker, result.get("recommendation"))
             except asyncio.TimeoutError:
-                log.error("[unborn] Analysis timed out after 300s for %s", ticker)
+                log.error("[unborn] Analysis timed out after 600s for %s", ticker)
                 result = {"error": "Analysis timed out", "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat}
             except Exception as exc:
                 log.exception("[unborn] Unhandled exception for %s", ticker)
@@ -6283,16 +6568,15 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     _unborn_inflight.discard(ub_key)
             with _cache_lock:
                 import time as _time
-                # Preserve claude_*/openai_* fields already merged in by
-                # api_claude_compare_unborn()/api_openai_compare_unborn() — see
-                # the matching comment in /api/analyze's write for why a plain
-                # overwrite is unsafe, and why this is skipped entirely when
-                # force=True (state changed enough to warrant a fresh look —
-                # the old second opinions no longer apply).
+                # run_unborn_for_ticker() now runs Luna and NotebookLM inline
+                # as part of the same analysis — see the matching comment in
+                # /api/analyze's write for why the merge order is old-first,
+                # fresh-overlaid-on-top (never the reverse), and why this is
+                # skipped entirely when force=True.
                 if not force:
                     _existing = _unborn_cache.get(ub_key) or {}
-                    _claude_fields = {k: v for k, v in _existing.items() if k.startswith(("claude_", "openai_"))}
-                    result.update(_claude_fields)
+                    _claude_fields = {k: v for k, v in _existing.items() if k.startswith(("claude_", "openai_", "notebooklm_"))}
+                    result = {**_claude_fields, **result}
                 if not result.get("error"):
                     result["_run_at"] = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
                     _unborn_cache[ub_key] = result
@@ -6729,6 +7013,37 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             else:
                 openai_card_html = '<div id="openai-card"></div>'
 
+            # NotebookLM — best-effort THIRD opinion, now run automatically
+            # after Claude and Luna on every analysis (see
+            # run_unborn_for_ticker's docstring). Read-only display, no ask
+            # box — it's additional/free context, not a metered advisor
+            # worth a follow-up-question UI.
+            notebooklm_text_val  = cached.get("notebooklm_text")
+            notebooklm_error_val = cached.get("notebooklm_error")
+            notebooklm_run_at_val = cached.get("notebooklm_run_at")
+            if notebooklm_text_val:
+                _nb_body = _render_advisor_markdown(notebooklm_text_val)
+                _nb_updated = (
+                    f'&nbsp;&nbsp;<span style="font-weight:normal;color:var(--muted);font-size:11px">'
+                    f'Updated {html_mod.escape(notebooklm_run_at_val)}</span>' if notebooklm_run_at_val else ""
+                )
+                notebooklm_card_html = (
+                    f'<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">'
+                    f'<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion){_nb_updated}</span>'
+                    f'<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">{_nb_body}</span>'
+                    f'</div>'
+                )
+            elif notebooklm_error_val:
+                notebooklm_card_html = (
+                    f'<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">'
+                    f'<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>'
+                    f'<span class="chain-working" style="color:var(--muted);display:block;margin-top:6px">'
+                    f'Not available this run: {html_mod.escape(notebooklm_error_val)}</span>'
+                    f'</div>'
+                )
+            else:
+                notebooklm_card_html = '<div id="notebooklm-card"></div>'
+
             primary_ask_html = (
                 '<div class="ask-section">'
                 '<div class="ask-thread" id="ask-thread"></div>'
@@ -6760,6 +7075,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 f'{primary_ask_html}'
                 f'{openai_card_html}'
                 f'{openai_ask_html}'
+                f'{notebooklm_card_html}'
             )
 
         _main_action_js = None
@@ -7594,6 +7910,37 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
             else:
                 openai_card_html = '<div id="openai-card"></div>'
 
+            # NotebookLM — best-effort THIRD opinion, now run automatically
+            # after Claude and Luna on every analysis (see
+            # run_roll_for_position's docstring). Read-only display, no ask
+            # box — it's additional/free context, not a metered advisor
+            # worth a follow-up-question UI.
+            notebooklm_text_val  = cached.get("notebooklm_text")
+            notebooklm_error_val = cached.get("notebooklm_error")
+            notebooklm_run_at_val = cached.get("notebooklm_run_at")
+            if notebooklm_text_val:
+                _nb_body = _render_advisor_markdown(notebooklm_text_val)
+                _nb_updated = (
+                    f'&nbsp;&nbsp;<span style="font-weight:normal;color:var(--muted);font-size:11px">'
+                    f'Updated {html_mod.escape(notebooklm_run_at_val)}</span>' if notebooklm_run_at_val else ""
+                )
+                notebooklm_card_html = (
+                    f'<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">'
+                    f'<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion){_nb_updated}</span>'
+                    f'<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">{_nb_body}</span>'
+                    f'</div>'
+                )
+            elif notebooklm_error_val:
+                notebooklm_card_html = (
+                    f'<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">'
+                    f'<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>'
+                    f'<span class="chain-working" style="color:var(--muted);display:block;margin-top:6px">'
+                    f'Not available this run: {html_mod.escape(notebooklm_error_val)}</span>'
+                    f'</div>'
+                )
+            else:
+                notebooklm_card_html = '<div id="notebooklm-card"></div>'
+
             primary_ask_html = (
                 '<div class="ask-section">'
                 '<div class="ask-thread" id="ask-thread"></div>'
@@ -7628,6 +7975,7 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
                 f'{primary_ask_html}'
                 f'{openai_card_html}'
                 f'{openai_ask_html}'
+                f'{notebooklm_card_html}'
             )
 
         page = f"""<!DOCTYPE html>
@@ -7940,6 +8288,23 @@ def print_positions(ticker: str, positions: list[dict]) -> None:
 
 
 def get_key_dates(ticker: str) -> dict:
+    """Thin retry wrapper around _get_key_dates_once — a momentary yfinance
+    hiccup (confirmed live: SLB came back Unknown/Unknown for both dates
+    seconds before the exact same call succeeded) otherwise silently drops
+    the earnings/ex-div context an LLM analysis depends on for the
+    earnings-blackout and early-assignment checks, with nothing to show it
+    failed. Only worth a retry when BOTH dates came back unknown — a real
+    ticker with no earnings calendar (e.g. some ETFs) legitimately returns
+    'Unknown' for earnings alone and shouldn't be retried forever."""
+    result = _get_key_dates_once(ticker)
+    if result.get("earnings_date") == "Unknown" and result.get("exdiv_date") == "Unknown":
+        import time as _time
+        _time.sleep(1.5)
+        result = _get_key_dates_once(ticker)
+    return result
+
+
+def _get_key_dates_once(ticker: str) -> dict:
     """
     Return the next earnings date and next dividend ex-date for ticker.
     Uses yfinance; falls back to estimation from historical data if live
@@ -8607,6 +8972,14 @@ async def query_notebooklm(
             "13-19)') unless every date in it is verified against its correct weekday — "
             "prefer relative phrasing like 'the rest of this week' or 'within 1-2 trading "
             "days' instead. "
+        ) + (
+            # Matches the format Claude/Luna already use (claude_advisor._SYSTEM_PROMPT)
+            # so all three advisors' recommendations are equally scannable at a
+            # glance, instead of NB's being buried a paragraph or two into prose.
+            "Immediately after that date line, on its own line by itself, write "
+            "exactly 'Recommendation: ROLL' (or 'Recommendation: HOLD', or "
+            "'Recommendation: ASSIGNMENT') stating your recommendation in one word "
+            "before any explanation — then explain your reasoning below it. "
         )
         question = (
             f"{_today_preamble}"
@@ -8632,6 +9005,14 @@ async def query_notebooklm(
             "13-19)') unless every date in it is verified against its correct weekday — "
             "prefer relative phrasing like 'the rest of this week' or 'within 1-2 trading "
             "days' instead. "
+        ) + (
+            # Matches the format Claude/Luna already use (claude_advisor._UNBORN_SYSTEM_PROMPT)
+            # so all three advisors' recommendations are equally scannable at a
+            # glance, instead of NB's being buried a paragraph or two into prose.
+            "Immediately after that date line, on its own line by itself, write "
+            "exactly 'Recommendation: SELL' (or 'Recommendation: WAIT') stating "
+            "your recommendation in one word before any explanation — then explain "
+            "your reasoning below it. "
         )
         question = (
             f"{_today_preamble}"
