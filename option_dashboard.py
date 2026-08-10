@@ -68,10 +68,7 @@ _LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 # Module-level logger — call setup_logging() to activate file output
 log = logging.getLogger("options")
 
-# Tracks when each ticker's CSV was last uploaded to NotebookLM {ticker: datetime}
-_last_upload_time: dict[str, datetime.datetime] = {}
-_last_source_ids:  dict[str, str] = {}          # ticker → most recent uploaded source_id
-_UPLOAD_TTL_MINUTES = 45  # skip re-upload if source is fresher than this
+_last_source_ids: dict[str, str] = {}  # ticker → most recent uploaded source_id, for _purge_stale_ticker_sources
 
 
 def setup_logging(level: int = logging.DEBUG) -> str:
@@ -171,7 +168,19 @@ CSV_COLUMNS = [
 # two opinions that already succeeded.
 _notebooklm_lock = threading.Lock()
 _NOTEBOOKLM_LOCK_TIMEOUT = 200  # seconds to wait for another analysis's NB call to finish
-_NOTEBOOKLM_WORK_TIMEOUT = 200  # seconds cap on this analysis's own NB upload+query+delete
+# query_notebooklm's own chat.ask retry loop is designed for up to 4 attempts
+# (90s per-attempt cap each, with 15/30/60s backoff between) — a real worst
+# case of ~465s to let all 4 run. At the old 200s this cap almost always fired
+# after only ~1.5 attempts, discarding retries the loop was explicitly built
+# to make: confirmed live, GLD/SLV/HAL/MSFT/LULU all showed a single stalled
+# first attempt (chat.ask sits ~90s with literally no bytes arriving — a real,
+# already-handled transient condition) followed immediately by this outer cap
+# firing before attempt 2 could even finish, well before RPCResponseTooLargeError
+# or any other terminal error ever had a chance to occur. 380s covers 3 full
+# attempts (90+15+90+30+90=315s) plus upload/delete overhead with margin, and
+# combined with _NOTEBOOKLM_LOCK_TIMEOUT still lands under the 600s outer
+# ceiling in run_roll_for_position/run_unborn_for_ticker's callers.
+_NOTEBOOKLM_WORK_TIMEOUT = 380  # seconds cap on this analysis's own NB upload+query+delete
 
 
 def get_access_token(secret: str, validity_minutes: int = 60) -> str:
@@ -2025,6 +2034,132 @@ def _detect_recommendation_regex(text: str) -> str:
     return "HOLD"
 
 
+def _fallback_chain_pick(display_rows: list[dict], strat: str) -> dict | None:
+    """Closest-to-30-DTE, closest-to-0.30-delta candidate from display_rows —
+    used when a SELL recommendation didn't name a strike/expiry the parser
+    could match (or named one not present in this chain snapshot)."""
+    if not display_rows:
+        return None
+    target_delta = 0.30 if strat == "CC" else -0.30
+    def _score(r):
+        try:
+            d_dist = abs(float(r.get("delta") or 0) - target_delta)
+        except (TypeError, ValueError):
+            d_dist = 1.0
+        try:
+            dte_dist = abs((r.get("dte") or 30) - 30)
+        except (TypeError, ValueError):
+            dte_dist = 30
+        return dte_dist * 0.5 + d_dist * 50
+    return min(display_rows, key=_score)
+
+
+def _pick_display_action(candidates: list[str | None], priority: list[str]) -> str | None:
+    """
+    Pick the highest-priority recommendation across Claude/Luna/NotebookLM for
+    the main dashboard table's compact Action badge — e.g. if any of the three
+    says ROLL, show ROLL even if the other two say HOLD, since the whole point
+    of that badge is "does this need my attention", not a majority vote for
+    "nothing to do". priority is ordered highest-priority first (e.g.
+    ["ROLL", "ASSIGNMENT", "HOLD"]); returns the first priority item present
+    in candidates, or None if none of candidates matches anything in priority
+    (caller should fall back to its own default in that case).
+
+    Deliberately NOT used for the primary recommendation/text shown on the
+    analyze/unborn detail pages — those pair one advisor's badge with that
+    same advisor's own reasoning prose, and swapping just the badge to a
+    DIFFERENT advisor's answer would silently create the exact badge-vs-text
+    mismatch bug already fixed once this session (the HAL PnL-guard case).
+    """
+    present = {c for c in candidates if c}
+    for p in priority:
+        if p in present:
+            return p
+    return None
+
+
+async def _run_notebooklm_roll(
+    ticker: str, notebook_id: str, key_dates: dict, vix: float | None,
+    ul_cost_basis: float, open_positions: list[dict], chain: dict,
+    current_leg_price: float | None, all_rows: list[dict],
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Best-effort THIRD opinion for an EXISTING position (ROLL/HOLD/ASSIGNMENT
+    vocabulary) — upload the chain CSV, query NotebookLM, delete the source.
+    Never allowed to block or fail the caller: any upload/query/timeout
+    error just becomes the returned error string rather than propagating,
+    since Claude/Luna's already-successful results (run inline before this
+    in run_roll_for_position, or already cached when called on-demand from
+    /api/notebooklm-compare) must never be discarded because NB was slow or
+    unavailable.
+
+    Returns (recommendation, text, error) — exactly one of (text, error) is
+    set on any given call.
+    """
+    if not _notebooklm_lock.acquire(timeout=_NOTEBOOKLM_LOCK_TIMEOUT):
+        # Another analysis is mid-NotebookLM-call and didn't free the lock in
+        # time — skip NB this run rather than wait indefinitely (a bounded
+        # blocking acquire, safe here since each analysis runs in its own
+        # dedicated thread/event loop with nothing else competing for it,
+        # but it must stay BOUNDED — see the lock's own comment for why an
+        # unbounded wait here previously let the OUTER per-analysis timeout
+        # fire mid-lock-wait and silently discard Claude/Luna's
+        # already-successful results, not just NB's).
+        return None, None, "NotebookLM busy with another analysis — skipped this run"
+    try:
+        async def _run_nb() -> str | None:
+            output_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
+            )
+            with open(output_file, "w", newline="") as tmp:
+                writer = csv.DictWriter(tmp, fieldnames=CSV_COLUMNS)
+                writer.writeheader()
+                writer.writerows(all_rows)
+            source_id = None
+            try:
+                source_id = await upload_to_notebooklm(output_file, notebook_id)
+            finally:
+                try:
+                    os.unlink(output_file)
+                except OSError:
+                    pass
+            try:
+                if source_id:
+                    await asyncio.sleep(15)
+                return await query_notebooklm(
+                    notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
+                    silent=True,
+                    ul_cost_basis=ul_cost_basis,
+                    chain_data=chain,
+                    current_leg_price=current_leg_price,
+                )
+            finally:
+                await delete_notebooklm_source(notebook_id, source_id)
+
+        # Bounded well under query_notebooklm's own theoretical worst case
+        # (4 attempts x 90s + backoff ≈ 465s) — caps a single ticker's NB
+        # attempt so it can never itself blow the caller's own budget.
+        text = await asyncio.wait_for(_run_nb(), timeout=_NOTEBOOKLM_WORK_TIMEOUT)
+        if not text:
+            return None, None, "Empty response from NotebookLM"
+        # The prompt asks NB for an explicit 'Recommendation: X' line right
+        # after the date, matching Claude/Luna's own format — try parsing
+        # that directly first (cheap, no extra API call) before falling
+        # back to the LLM classifier.
+        m = re.search(r"Recommendation:\s*\*{0,2}(ROLL|HOLD|ASSIGNMENT)\*{0,2}", text, re.IGNORECASE)
+        rec = m.group(1).upper() if m else _detect_recommendation(text)
+        return rec, text, None
+    except asyncio.TimeoutError:
+        log.warning("[roll] NotebookLM third opinion timed out after %ds for %s",
+                    _NOTEBOOKLM_WORK_TIMEOUT, ticker)
+        return None, None, f"Timed out after {_NOTEBOOKLM_WORK_TIMEOUT}s"
+    except Exception as exc:
+        log.warning("[roll] NotebookLM third opinion failed for %s: %s", ticker, exc)
+        return None, None, str(exc)
+    finally:
+        _notebooklm_lock.release()
+
+
 async def run_roll_for_position(
     token: str,
     account_id: str,
@@ -2097,9 +2232,11 @@ async def run_roll_for_position(
         if pos_key:
             _pk_parts = pos_key.split("|")
             if len(_pk_parts) == 4:
+                _catalysts = key_dates.get("biotech_catalysts") or []
                 chain_candidates_text = claude_advisor.build_chain_candidates_text(
                     all_rows, _pk_parts[1].upper(), current_expiry=_pk_parts[3],
                     next_earnings_date=key_dates.get("earnings_date"),
+                    next_biotech_catalyst_date=_catalysts[0]["date"] if _catalysts else None,
                 )
 
         # Resolve spread_id and ul_cost_basis from the matched open position BEFORE querying,
@@ -2382,80 +2519,24 @@ async def run_roll_for_position(
 
         # NotebookLM — best-effort THIRD opinion, always attempted after
         # Claude and Luna above but never allowed to block or fail the
-        # overall result: if the upload/query/timeout chain errors out for
-        # any reason, this just leaves the notebooklm_* fields as an error
-        # note rather than propagating. Worth attempting every time anyway
-        # (not metered like the other two) — genuinely useful specifically
-        # because it sometimes disagrees with Claude/Luna.
-        notebooklm_rec = notebooklm_text_val = notebooklm_error = None
-        if not _notebooklm_lock.acquire(timeout=_NOTEBOOKLM_LOCK_TIMEOUT):
-            # Another analysis is mid-NotebookLM-call and didn't free the lock
-            # in time — skip NB this run rather than wait indefinitely (a
-            # bounded blocking acquire, safe here since each analysis runs in
-            # its own dedicated thread/event loop with nothing else competing
-            # for it, but it must stay BOUNDED — see the lock's own comment
-            # for why an unbounded wait here previously let the OUTER
-            # per-analysis timeout fire mid-lock-wait and silently discard
-            # Claude/Luna's already-successful results, not just NB's).
-            notebooklm_error = "NotebookLM busy with another analysis — skipped this run"
-        else:
-            try:
-                async def _run_nb() -> str | None:
-                    output_file = os.path.join(
-                        os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
-                    )
-                    with open(output_file, "w", newline="") as tmp:
-                        writer = csv.DictWriter(tmp, fieldnames=CSV_COLUMNS)
-                        writer.writeheader()
-                        writer.writerows(all_rows)
-                    source_id = None
-                    try:
-                        source_id = await upload_to_notebooklm(output_file, notebook_id)
-                    finally:
-                        try:
-                            os.unlink(output_file)
-                        except OSError:
-                            pass
-                    try:
-                        if source_id:
-                            await asyncio.sleep(15)
-                        return await query_notebooklm(
-                            notebook_id, ticker, "ROLL", key_dates, open_positions, vix,
-                            silent=True,
-                            ul_cost_basis=ul_cost_basis,
-                            chain_data=chain,
-                            current_leg_price=current_leg_price,
-                        )
-                    finally:
-                        await delete_notebooklm_source(notebook_id, source_id)
+        # overall result. See _run_notebooklm_roll's docstring.
+        notebooklm_rec, notebooklm_text_val, notebooklm_error = await _run_notebooklm_roll(
+            ticker, notebook_id, key_dates, vix, ul_cost_basis,
+            open_positions, chain, current_leg_price, all_rows,
+        )
 
-                # Bounded well under query_notebooklm's own theoretical worst
-                # case (4 attempts x 90s + backoff ≈ 465s) — this caps a
-                # single ticker's NB attempt so it can never itself blow the
-                # outer per-analysis budget (see that timeout's own comment).
-                notebooklm_text_val = await asyncio.wait_for(_run_nb(), timeout=_NOTEBOOKLM_WORK_TIMEOUT)
-                if notebooklm_text_val:
-                    # The prompt now asks NB for an explicit 'Recommendation: X'
-                    # line right after the date, matching Claude/Luna's own
-                    # format — try parsing that directly first (cheap, no extra
-                    # API call) before falling back to the LLM classifier.
-                    _m = re.search(r"Recommendation:\s*\*{0,2}(ROLL|HOLD|ASSIGNMENT)\*{0,2}",
-                                    notebooklm_text_val, re.IGNORECASE)
-                    notebooklm_rec = _m.group(1).upper() if _m else _detect_recommendation(notebooklm_text_val)
-                else:
-                    notebooklm_error = "Empty response from NotebookLM"
-            except asyncio.TimeoutError:
-                log.warning("[roll] NotebookLM third opinion timed out after %ds for %s",
-                            _NOTEBOOKLM_WORK_TIMEOUT, ticker)
-                notebooklm_error = f"Timed out after {_NOTEBOOKLM_WORK_TIMEOUT}s"
-            except Exception as exc:
-                log.warning("[roll] NotebookLM third opinion failed for %s: %s", ticker, exc)
-                notebooklm_error = str(exc)
-            finally:
-                _notebooklm_lock.release()
+        # Main dashboard table's Action badge: highest-priority recommendation
+        # across all three advisors, not just Claude's own — see
+        # _pick_display_action's docstring for why this is a separate field
+        # from `recommendation` rather than overwriting it.
+        display_action = _pick_display_action(
+            [rec, openai_result.get("recommendation"), notebooklm_rec],
+            ["ROLL", "ASSIGNMENT", "HOLD"],
+        ) or rec
 
         return {
             "recommendation": rec,
+            "display_action": display_action,
             "text": text,
             "tail_text": tail_text,  # so /api/ask can replay this turn for follow-ups
             "openai_recommendation": openai_result.get("recommendation"),
@@ -2492,6 +2573,89 @@ async def run_roll_for_position(
 
     except Exception as exc:
         return {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker}
+
+
+async def _run_notebooklm_unborn(
+    ticker: str, notebook_id: str, strat: str, key_dates: dict, vix: float | None,
+    ul_cost_basis: float, qty: int, all_rows: list[dict], display_rows: list[dict],
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Best-effort THIRD opinion for a NEW/unborn position (SELL/WAIT
+    vocabulary) — upload the chain CSV, query NotebookLM, delete the
+    source. Never allowed to block or fail the caller — see
+    _run_notebooklm_roll's docstring for the same reasoning, mirrored here
+    for the unborn case.
+
+    Returns (recommendation, text, error) — exactly one of (text, error) is
+    set on any given call.
+    """
+    if not _notebooklm_lock.acquire(timeout=_NOTEBOOKLM_LOCK_TIMEOUT):
+        return None, None, "NotebookLM busy with another analysis — skipped this run"
+    try:
+        async def _run_nb() -> str | None:
+            output_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
+            )
+            with open(output_file, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                writer.writeheader()
+                writer.writerows(all_rows)
+            source_id = None
+            try:
+                source_id = await upload_to_notebooklm(output_file, notebook_id)
+            finally:
+                try:
+                    os.unlink(output_file)
+                except OSError:
+                    pass
+            synthetic_positions = [{"symbol": ticker, "option_type": strat, "net_qty": -qty,
+                                     "avg_price": None, "strike": None, "expiry": None}]
+            try:
+                if source_id:
+                    await asyncio.sleep(15)
+                return await query_notebooklm(
+                    notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
+                    silent=True,
+                    ul_cost_basis=ul_cost_basis,
+                )
+            finally:
+                await delete_notebooklm_source(notebook_id, source_id)
+
+        text = await asyncio.wait_for(_run_nb(), timeout=_NOTEBOOKLM_WORK_TIMEOUT)
+        if not text:
+            return None, None, "Empty response from NotebookLM"
+        # The prompt asks NB for an explicit 'Recommendation: SELL/WAIT'
+        # line right after the date, matching Claude/Luna's own format —
+        # try parsing that directly first (cheap, no extra API call) before
+        # falling back to the unborn-specific SELL/WAIT LLM classifier (see
+        # _detect_unborn_action_llm's docstring for why the ROLL/HOLD/
+        # ASSIGNMENT classifier doesn't fit this case) and its own regex
+        # fallback, mirroring the old pre-Claude-primary behavior this
+        # restores.
+        m = re.search(r"Recommendation:\s*\*{0,2}(SELL|WAIT)\*{0,2}", text, re.IGNORECASE)
+        if m:
+            rec = m.group(1).upper()
+        else:
+            action = _detect_unborn_action_llm(text)
+            explicit_do_nothing = bool(re.search(
+                r'\brecommendation\b[:\s\*]+do\s+nothing\b', text, re.IGNORECASE
+            ))
+            if action is not None:
+                rec = "WAIT" if (action == "WAIT" or explicit_do_nothing) else "SELL"
+            else:
+                rec = "WAIT" if (explicit_do_nothing or (
+                    (not display_rows) and bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", text, re.IGNORECASE))
+                )) else "SELL"
+        return rec, text, None
+    except asyncio.TimeoutError:
+        log.warning("[unborn] NotebookLM third opinion timed out after %ds for %s",
+                    _NOTEBOOKLM_WORK_TIMEOUT, ticker)
+        return None, None, f"Timed out after {_NOTEBOOKLM_WORK_TIMEOUT}s"
+    except Exception as exc:
+        log.warning("[unborn] NotebookLM third opinion failed for %s: %s", ticker, exc)
+        return None, None, str(exc)
+    finally:
+        _notebooklm_lock.release()
 
 
 async def run_unborn_for_ticker(
@@ -2596,9 +2760,11 @@ async def run_unborn_for_ticker(
 
         # Same chain fetch as above, reused for Claude's opinion (claude_advisor.py)
         # — no separate Public.com hit.
+        _catalysts = key_dates.get("biotech_catalysts") or []
         chain_candidates_text = claude_advisor.build_chain_candidates_text(
             all_rows, opt_type_filter, next_earnings_date=key_dates.get("earnings_date"),
             ul_price=ul_price,
+            next_biotech_catalyst_date=_catalysts[0]["date"] if _catalysts else None,
         )
 
         # Claude is the primary advisor (see claude_advisor.py) — no chain CSV
@@ -2647,116 +2813,51 @@ async def run_unborn_for_ticker(
             }
             log.info("[unborn] DO NOTHING recommendation for %s", ticker)
         else:
-            chosen = _parse_recommended_option(text, display_rows)
+            chosen = _parse_recommended_option(text, display_rows) or _fallback_chain_pick(display_rows, strat)
             log.info("[unborn] chosen: %s", chosen)
-            if chosen is None and display_rows:
-                # Fallback: pick option closest to 30 DTE and 0.30 delta
-                target_delta = 0.30 if strat == "CC" else -0.30
-                def _score(r):
-                    try:
-                        d_dist = abs(float(r.get("delta") or 0) - target_delta)
-                    except (TypeError, ValueError):
-                        d_dist = 1.0
-                    try:
-                        dte_dist = abs((r.get("dte") or 30) - 30)
-                    except (TypeError, ValueError):
-                        dte_dist = 30
-                    return dte_dist * 0.5 + d_dist * 50
-                chosen = min(display_rows, key=_score)
             if chosen is not None:
                 chosen = dict(chosen)
                 chosen["ideal_entry"] = _parse_ideal_entry(text)
 
         # NotebookLM — best-effort THIRD opinion, always attempted after
         # Claude and Luna above but never allowed to block or fail the
-        # overall result: if the upload/query/timeout chain errors out for
-        # any reason, this just leaves the notebooklm_* fields as an error
-        # note rather than propagating. Worth attempting every time anyway
-        # (not metered like the other two) — genuinely useful specifically
-        # because it sometimes disagrees with Claude/Luna.
-        notebooklm_rec = notebooklm_text_val = notebooklm_error = None
-        if not _notebooklm_lock.acquire(timeout=_NOTEBOOKLM_LOCK_TIMEOUT):
-            # See run_roll_for_position's matching comment: a bounded acquire
-            # (not an unbounded `with`) so this can never freeze the async
-            # harness long enough for the OUTER per-analysis timeout to fire
-            # mid-lock-wait and discard Claude/Luna's already-successful
-            # results, not just NB's.
-            notebooklm_error = "NotebookLM busy with another analysis — skipped this run"
-        else:
-            try:
-                async def _run_nb() -> str | None:
-                    output_file = os.path.join(
-                        os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
-                    )
-                    with open(output_file, "w", newline="") as f:
-                        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-                        writer.writeheader()
-                        writer.writerows(all_rows)
-                    source_id = None
-                    try:
-                        source_id = await upload_to_notebooklm(output_file, notebook_id)
-                    finally:
-                        try:
-                            os.unlink(output_file)
-                        except OSError:
-                            pass
-                    synthetic_positions = [{"symbol": ticker, "option_type": strat, "net_qty": -qty,
-                                             "avg_price": None, "strike": None, "expiry": None}]
-                    try:
-                        if source_id:
-                            await asyncio.sleep(15)
-                        return await query_notebooklm(
-                            notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
-                            silent=True,
-                            ul_cost_basis=ul_cost_basis,
-                        )
-                    finally:
-                        await delete_notebooklm_source(notebook_id, source_id)
+        # overall result. See _run_notebooklm_unborn's docstring.
+        notebooklm_rec, notebooklm_text_val, notebooklm_error = await _run_notebooklm_unborn(
+            ticker, notebook_id, strat, key_dates, vix, ul_cost_basis, qty, all_rows, display_rows,
+        )
 
-                # Bounded well under query_notebooklm's own theoretical worst
-                # case (4 attempts x 90s + backoff ≈ 465s) — caps a single
-                # ticker's NB attempt so it can't itself blow the outer
-                # per-analysis budget.
-                notebooklm_text_val = await asyncio.wait_for(_run_nb(), timeout=_NOTEBOOKLM_WORK_TIMEOUT)
-                if notebooklm_text_val:
-                    # The prompt now asks NB for an explicit 'Recommendation:
-                    # SELL/WAIT' line right after the date, matching Claude/
-                    # Luna's own format — try parsing that directly first
-                    # (cheap, no extra API call) before falling back to the
-                    # unborn-specific SELL/WAIT LLM classifier (see
-                    # _detect_unborn_action_llm's docstring for why the ROLL/
-                    # HOLD/ASSIGNMENT classifier doesn't fit this case) and its
-                    # own regex fallback, mirroring the old pre-Claude-primary
-                    # behavior this restores.
-                    _m = re.search(r"Recommendation:\s*\*{0,2}(SELL|WAIT)\*{0,2}",
-                                    notebooklm_text_val, re.IGNORECASE)
-                    if _m:
-                        notebooklm_rec = _m.group(1).upper()
-                    else:
-                        _action = _detect_unborn_action_llm(notebooklm_text_val)
-                        _explicit_do_nothing = bool(re.search(
-                            r'\brecommendation\b[:\s\*]+do\s+nothing\b', notebooklm_text_val, re.IGNORECASE
-                        ))
-                        if _action is not None:
-                            notebooklm_rec = "WAIT" if (_action == "WAIT" or _explicit_do_nothing) else "SELL"
-                        else:
-                            notebooklm_rec = "WAIT" if (_explicit_do_nothing or (
-                                (not display_rows) and bool(re.search(r"\bdoing nothing\b|\bdo nothing\b", notebooklm_text_val, re.IGNORECASE))
-                            )) else "SELL"
-                else:
-                    notebooklm_error = "Empty response from NotebookLM"
-            except asyncio.TimeoutError:
-                log.warning("[unborn] NotebookLM third opinion timed out after %ds for %s",
-                            _NOTEBOOKLM_WORK_TIMEOUT, ticker)
-                notebooklm_error = f"Timed out after {_NOTEBOOKLM_WORK_TIMEOUT}s"
-            except Exception as exc:
-                log.warning("[unborn] NotebookLM third opinion failed for %s: %s", ticker, exc)
-                notebooklm_error = str(exc)
-            finally:
-                _notebooklm_lock.release()
+        # Main dashboard table's row: highest-priority recommendation across
+        # all three advisors, not just Claude's own — mirrors
+        # run_roll_for_position's display_action, extended here since the
+        # Unborn table's columns need an actual candidate (strike/expiry/
+        # price), not just a label. Tries Claude's own SELL first (already
+        # in `chosen`/`_do_nothing`), then Luna's text, then NB's — first one
+        # that both recommends SELL AND yields a parseable/fallback candidate
+        # wins. Kept separate from `chain`/`_do_nothing` (which the detail
+        # page's own badge+text stay paired to) so this never creates the
+        # badge-vs-text mismatch already fixed once this session for the
+        # ROLL case.
+        display_do_nothing = _do_nothing
+        display_chosen = chosen
+        if _do_nothing:
+            for _alt_text, _alt_rec in (
+                (openai_result.get("text"), openai_result.get("recommendation")),
+                (notebooklm_text_val, notebooklm_rec),
+            ):
+                if _alt_rec != "SELL" or not _alt_text:
+                    continue
+                _alt_chosen = _parse_recommended_option(_alt_text, display_rows) or _fallback_chain_pick(display_rows, strat)
+                if _alt_chosen is not None:
+                    display_do_nothing = False
+                    display_chosen = dict(_alt_chosen)
+                    display_chosen["ideal_entry"] = _parse_ideal_entry(_alt_text)
+                    break
 
         return {
             "recommendation": rec,
+            "display_action": "WAIT" if display_do_nothing else "SELL",
+            "display_chain": [display_chosen] if display_chosen else [],
+            "display_do_nothing": display_do_nothing,
             "text": text,
             "tail_text": tail_text,  # so /api/ask-unborn can replay this turn for follow-ups
             "ticker": ticker,
@@ -3077,7 +3178,7 @@ window.addEventListener('resize', _alignPosSearch);
 async function fetchData() {
   document.getElementById('spinner').classList.add('active');
   try {
-    const r = await fetch('/api/eval');
+    const r = await fetch('/api/eval', {cache: 'no-store'});
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
     document.getElementById('error-bar').style.display = 'none';
@@ -3128,7 +3229,11 @@ function applyData(d) {
   for (const [key, val] of Object.entries(serverRecs)) {
     if (val.recommendation) {
       const existing = _recommendations[key];
-      const incoming = {rec: val.recommendation, chainCash: val.chain_cash ?? null, runAt: val.run_at ?? null};
+      // display_action (when present) is the highest-priority recommendation
+      // across Claude/Luna/NotebookLM, not just Claude's own — falls back to
+      // plain recommendation for older cached entries from before this field
+      // existed.
+      const incoming = {rec: val.display_action || val.recommendation, chainCash: val.chain_cash ?? null, runAt: val.run_at ?? null};
       if (!existing || existing.rec !== incoming.rec || existing.runAt !== incoming.runAt) {
         _recommendations[key] = Object.assign(existing || {}, incoming);
         changed = true;
@@ -4349,7 +4454,25 @@ function _fmrSort(col) {
   _renderFormerTable();
 }
 
-async function analyzeFormerPosition(key, btn) {
+// Shared "still working" indicator for the analyze/recalc buttons below —
+// their underlying pipeline (chain fetch + Claude + Luna + NotebookLM, all
+// sequential) routinely takes 2-4 minutes now that NotebookLM's own
+// stalled-first-attempt-then-retry pattern is given room to actually
+// succeed instead of being cut off early (see _NOTEBOOKLM_WORK_TIMEOUT's
+// comment in option_dashboard.py). A bare spinner with no elapsed time
+// reads as "stuck" well before it actually is, which is what pushed a real
+// user to reload mid-analysis — the poll loop then dies silently with no
+// error, and the button just reverts to its default label on next render,
+// looking exactly like a failure even though the backend kept working and
+// (confirmed live) did finish with a real result a couple minutes later.
+function _startElapsedTicker(render) {
+  const start = Date.now();
+  render(0);
+  const id = setInterval(() => render(Math.floor((Date.now() - start) / 1000)), 1000);
+  return () => clearInterval(id);
+}
+
+async function analyzeFormerPosition(key, btn, force) {
   const parts = key.split('|');
   const ticker = parts[0], strat = parts[1] || 'CC';
   const pos = _formerPositions.find(p => p.symbol === ticker && p.strat === strat);
@@ -4357,11 +4480,26 @@ async function analyzeFormerPosition(key, btn) {
   const cb  = pos ? (pos.ul_cost_basis || 0) : 0;
 
   btn.disabled = true;
-  btn.innerHTML = '<span style="display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle"></span>';
+  const _stopTicker = _startElapsedTicker(secs => {
+    const suffix = secs > 0 ? ` (${secs}s${secs >= 30 ? ', can take a few min' : ''})` : '';
+    btn.innerHTML = '<span style="display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle"></span>' + esc(suffix);
+  });
 
   try {
     let d;
-    let forceNow = true;
+    // Default to NOT forcing — mirrors analyzePosition's existing
+    // convention (Analyze uses a fresh-enough cache hit if one exists;
+    // Recalc/re-analyze is the explicit force path). Confirmed live: this
+    // button previously forced unconditionally, so a repeat click after an
+    // interrupted 2-4 minute wait (e.g. the user reloaded because the
+    // spinner gave no progress indication) always restarted the entire
+    // slow pipeline from scratch instead of returning the result that had
+    // already finished server-side in the background. With no cache yet
+    // (the normal first-click case for this "Former Positions" table),
+    // force:false behaves identically to force:true anyway — the server
+    // only skips straight to a fresh run either way, so first-click
+    // behavior is unchanged; only repeat clicks benefit.
+    let forceNow = !!force;
     while (true) {
       const r = await fetch('/api/unborn', {
         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -4384,8 +4522,12 @@ async function analyzeFormerPosition(key, btn) {
       }
       break;
     }
+    _stopTicker();
     if (d.error) throw new Error(d.error);
-    const chain = d.chain || [];
+    // display_chain (when present) reflects the highest-priority SELL/WAIT
+    // across Claude/Luna/NotebookLM, not just Claude's own — see
+    // run_unborn_for_ticker's docstring for that field.
+    const chain = d.display_chain || d.chain || [];
     if (chain.length) {
       const ubKey = encodeURIComponent(ticker + '|' + strat + '|' + qty);
       const _runAt = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
@@ -4396,6 +4538,7 @@ async function analyzeFormerPosition(key, btn) {
     _renderUnbornTable();
     _renderFormerTable();
   } catch(e) {
+    _stopTicker();
     btn.disabled = false;
     btn.textContent = 'Analyze';
     alert('Analysis failed for ' + ticker + ': ' + e.message);
@@ -4429,7 +4572,12 @@ async function recalcUnbornRow(key, btn) {
   const tr = btn.closest('tr');
   const btns = tr ? tr.querySelectorAll('button') : [btn];
   btns.forEach(b => { b.disabled = true; });
-  btn.innerHTML = '<span style="display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle"></span>';
+  // See analyzeFormerPosition's comment on _startElapsedTicker for why —
+  // this pipeline routinely takes 2-4 minutes now.
+  const _stopTicker = _startElapsedTicker(secs => {
+    const suffix = secs > 0 ? ` (${secs}s${secs >= 30 ? ', can take a few min' : ''})` : '';
+    btn.innerHTML = '<span style="display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle"></span>' + esc(suffix);
+  });
   // Columns: 0=Symbol,1=Type,2=Strike,3=Expiry,4=Side,5=Qty,6=DTE,7=Delta,8=UL,9=OptPrice,10=Basis,11=Ideal,12=Actions
   if (tr) [2, 3, 6, 7, 9].forEach(i => { if (tr.cells[i]) tr.cells[i].textContent = '—'; });
 
@@ -4452,8 +4600,12 @@ async function recalcUnbornRow(key, btn) {
       }
       break;
     }
+    _stopTicker();
     if (d.error) throw new Error(d.error);
-    const chain = d.chain || [];
+    // display_chain (when present) reflects the highest-priority SELL/WAIT
+    // across Claude/Luna/NotebookLM, not just Claude's own — see
+    // run_unborn_for_ticker's docstring for that field.
+    const chain = d.display_chain || d.chain || [];
     if (chain.length) {
       const ubKey = encodeURIComponent(ticker + '|' + strat + '|' + qty);
       const _runAt = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
@@ -4465,6 +4617,7 @@ async function recalcUnbornRow(key, btn) {
     await _saveUnbornToServer();
     _renderUnbornTable();
   } catch(e) {
+    _stopTicker();
     // Restore old row on error
     _unbornRows[key] = oldRow;
     _renderUnbornTable();
@@ -4521,11 +4674,21 @@ async function analyzePosition(key, btn, force) {
     btn.style.display = 'inline-flex';
     btn.style.alignItems = 'center';
     btn.style.gap = '5px';
-    btn.innerHTML = '<span style="width:11px;height:11px;border:2px solid rgba(0,0,0,0.25);border-top-color:#000;border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Analyzing…';
   } else {
     const _c = _actionCell(key);
-    if (_c) _c.innerHTML = '<span style="color:var(--muted);font-size:11px;display:inline-flex;align-items:center;gap:5px"><span style="width:10px;height:10px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Re-analyzing…</span>';
+    if (_c) _c.innerHTML = '<span style="color:var(--muted);font-size:11px;display:inline-flex;align-items:center;gap:5px"><span style="width:10px;height:10px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span><span id="analyze-elapsed-${esc(key)}">Re-analyzing…</span></span>';
   }
+  // See analyzeFormerPosition's comment on _startElapsedTicker for why —
+  // this pipeline routinely takes 2-4 minutes now.
+  const _stopTicker = _startElapsedTicker(secs => {
+    const suffix = secs > 0 ? ` (${secs}s${secs >= 30 ? ', can take a few min' : ''})` : '';
+    if (btn) {
+      btn.innerHTML = '<span style="width:11px;height:11px;border:2px solid rgba(0,0,0,0.25);border-top-color:#000;border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;flex-shrink:0"></span>Analyzing' + esc(suffix);
+    } else {
+      const _el = document.getElementById('analyze-elapsed-' + key);
+      if (_el) _el.textContent = 'Re-analyzing' + suffix;
+    }
+  });
   console.log('[analyze] starting:', key);
   try {
     let d;
@@ -4551,15 +4714,22 @@ async function analyzePosition(key, btn, force) {
       }
       break;
     }
+    _stopTicker();
     console.log('[analyze] result:', d);
     if (d.error) throw new Error(d.error);
-    const displayRec = (d.auto && d.recommendation === 'HOLD') ? 'LET EXPIRE' : d.recommendation;
+    // display_action (when present) is the highest-priority recommendation
+    // across Claude/Luna/NotebookLM, not just Claude's own — falls back to
+    // plain recommendation for the OTM-expiring "auto" short-circuit path,
+    // which never runs the three advisors at all.
+    const pickedRec = d.display_action || d.recommendation;
+    const displayRec = (d.auto && pickedRec === 'HOLD') ? 'LET EXPIRE' : pickedRec;
     const runAt = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
     _recommendations[key] = {rec: displayRec, chainCash: d.chain_cash ?? null, text: d.text ?? null, runAt};
     _saveRecs(_recommendations);
     const cell = _actionCell(key);
     if (cell) cell.innerHTML = recBadge(displayRec, key, d.chain_cash ?? null, d.text ?? null, runAt);
   } catch(e) {
+    _stopTicker();
     console.error('[analyze] error for', key, ':', e.message);
     const cell = _actionCell(key);
     if (cell) {
@@ -4624,12 +4794,16 @@ async function findUnborn() {
       class="badge badge-${cls}" style="text-decoration:none;cursor:pointer;font-size:12px;padding:4px 10px">
       Details</a>`;
 
-    // Accumulate proposed trades — always save the result, including DO NOTHING rows
-    const chain = d.chain || [];
+    // Accumulate proposed trades — always save the result, including DO NOTHING rows.
+    // display_chain/display_do_nothing (when present) reflect the
+    // highest-priority SELL/WAIT across Claude/Luna/NotebookLM, not just
+    // Claude's own — see run_unborn_for_ticker's docstring for that field.
+    const chain = d.display_chain || d.chain || [];
+    const doNothing = 'display_do_nothing' in d ? d.display_do_nothing : d._do_nothing;
     const _runAt2 = new Date().toLocaleString('en-US', {timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).replace(',','') + ' ET';
     const rowBase = chain.length ? chain[0] : {
       symbol: ticker, option_type: strat,
-      _do_nothing: !!d._do_nothing, ideal_entry: d._do_nothing ? 'DO NOTHING' : null,
+      _do_nothing: !!doNothing, ideal_entry: doNothing ? 'DO NOTHING' : null,
     };
     const row = Object.assign({}, rowBase, {_qty: qty, _ubKey: ubKey, _ul_cost_basis: d.ul_cost_basis ?? null, _run_at: _runAt2});
     _unbornRows[ticker + '|' + strat] = row;
@@ -6127,6 +6301,12 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             data["cached_recommendations"] = {
                 k: {
                     "recommendation": v.get("recommendation"),
+                    # Highest-priority recommendation across Claude/Luna/
+                    # NotebookLM, not just Claude's own — see
+                    # _pick_display_action's docstring. Falls back to
+                    # "recommendation" client-side for older cached entries
+                    # from before this field existed.
+                    "display_action": v.get("display_action"),
                     "chain_cash": v.get("chain_cash"),
                     "run_at": v.get("_run_at"),
                     "error": v.get("error"),
@@ -6138,7 +6318,8 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             data["unborn_inflight"] = list({
                 "|".join(k.split("|")[:2]) for k in _unborn_inflight
             })
-        return Response(json.dumps(_sanitize(data), default=_serial), mimetype="application/json")
+        return Response(json.dumps(_sanitize(data), default=_serial), mimetype="application/json",
+                        headers={"Cache-Control": "no-store"})
 
     @app.route("/api/dont-analyze", methods=["POST"])
     @require_auth
@@ -6167,6 +6348,16 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
         with _cache_lock:
             _cached = _analysis_cache.get(pos_key)
+            # Already running — tell the client to retry. MUST be checked
+            # before the cached-result short-circuits below: a poll landing
+            # while a fresh (force-triggered) run is still in flight must
+            # see "in progress", not a stale result from a PRIOR run — see
+            # the matching comment on /api/notebooklm-compare.
+            if pos_key in _analysis_inflight:
+                return Response(
+                    json.dumps({"status": "in_progress", "retry_after": 5}),
+                    status=202, mimetype="application/json",
+                )
             if _cached and not _cached.get("error") and not force:
                 return Response(json.dumps(_cached), mimetype="application/json")
             # Re-run errors only after a 5-minute cooldown
@@ -6174,12 +6365,6 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 import time as _t
                 if _t.time() - _cached.get("_error_at", 0) < 300:
                     return Response(json.dumps(_cached), mimetype="application/json")
-            # Already running — tell the client to retry
-            if pos_key in _analysis_inflight:
-                return Response(
-                    json.dumps({"status": "in_progress", "retry_after": 5}),
-                    status=202, mimetype="application/json",
-                )
             _analysis_inflight.add(pos_key)
 
         # Parse key: symbol|option_type|strike|expiry
@@ -6248,21 +6433,26 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         # result once the background thread finishes.
         def _run_analysis():
             try:
-                # 600s: NotebookLM's own internal work is now self-bounded to
-                # at most ~400s (200s lock-wait + 200s query work — see
-                # _NOTEBOOKLM_LOCK_TIMEOUT/_NOTEBOOKLM_WORK_TIMEOUT), so this
-                # outer bound mainly exists as a last-resort safety net for a
-                # genuinely stuck Claude/Luna call, not a normal ceiling —
-                # firing it discards the ENTIRE result (including any
-                # already-successful Claude/Luna opinions), so it needs
-                # enough headroom to essentially never trip under normal NB
-                # slowness. Confirmed live at the old 300s: it fired mid-NB
+                # 700s: NotebookLM's own internal work is now self-bounded to
+                # at most ~580s (200s lock-wait + 380s query work — see
+                # _NOTEBOOKLM_LOCK_TIMEOUT/_NOTEBOOKLM_WORK_TIMEOUT), leaving
+                # ~120s for the chain fetch + Claude + Luna calls that run
+                # before it in the same function. Raised from 600s (100s
+                # margin) alongside _NOTEBOOKLM_WORK_TIMEOUT's 200→380s bump —
+                # at the old 600s that bump would have left only ~20s for
+                # everything else, in practice tripping this "should
+                # essentially never fire" safety net on any day Claude/Luna
+                # were even modestly slow. This outer bound mainly exists as a
+                # last-resort safety net for a genuinely stuck Claude/Luna
+                # call, not a normal ceiling — firing it discards the ENTIRE
+                # result (including any already-successful Claude/Luna
+                # opinions). Confirmed live at the old 300s: it fired mid-NB
                 # lock-wait and wiped an already-complete Claude+Luna result.
                 result = asyncio.run(
                     asyncio.wait_for(
                         run_roll_for_position(fresh_token, fresh_account_id, ticker, open_positions,
                                                notebook_id, pos_key=pos_key),
-                        timeout=600,
+                        timeout=700,
                     )
                 )
                 if result.get("error"):
@@ -6270,16 +6460,17 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 else:
                     log.info("[web] Analysis complete for %s → %s", ticker, result.get("recommendation"))
             except asyncio.TimeoutError:
-                log.error("[web] Analysis timed out after 600s for %s", ticker)
+                log.error("[web] Analysis timed out after 700s for %s", ticker)
                 result = {"error": "Analysis timed out", "recommendation": "HOLD", "text": "", "ticker": ticker}
             except Exception as exc:
                 log.exception("[web] Unhandled exception for %s", ticker)
                 result = {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker}
-            finally:
-                with _cache_lock:
-                    _analysis_inflight.discard(pos_key)
-
+            # Discard from in-flight and write the fresh result in the SAME
+            # locked block — see the matching comment on
+            # /api/notebooklm-compare for why splitting these across two
+            # lock blocks re-opens the stale-read race.
             with _cache_lock:
+                _analysis_inflight.discard(pos_key)
                 import time as _time
                 # run_roll_for_position() now runs Luna and NotebookLM inline
                 # as part of the same analysis — so `result` already has its
@@ -6371,6 +6562,149 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             _save_cache(_analysis_cache)
 
         return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
+
+    @app.route("/api/notebooklm-compare", methods=["POST"])
+    @require_auth
+    def api_notebooklm_compare():
+        """
+        Third opinion via NotebookLM for an EXISTING position — on-demand
+        trigger for the "Compare with Notebook" button, shown when NB didn't
+        already run automatically as part of the main analysis (see
+        run_roll_for_position's docstring). Same background-thread + 202
+        pattern as /api/analyze, not a direct synchronous call like Luna's
+        /api/openai-compare — NB alone can take several minutes, which would
+        risk the same Cloudflare-tunnel-timeout problem a blocking request
+        already caused once this session.
+        """
+        body = flask_request.get_json(force=True, silent=True) or {}
+        pos_key = body.get("position_key", "")
+        if not pos_key:
+            return Response(json.dumps({"error": "Missing position_key"}), status=400, mimetype="application/json")
+        parts = pos_key.split("|")
+        if len(parts) != 4:
+            return Response(json.dumps({"error": f"Bad position_key: {pos_key}"}), status=400, mimetype="application/json")
+        sym, opt_type, strike_str, expiry = parts
+        ticker = sym.upper()
+
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            return Response(json.dumps({"error": "NOTEBOOKLM_NOTEBOOK_ID not set"}), status=500, mimetype="application/json")
+
+        force = bool(body.get("force"))
+        with _cache_lock:
+            existing = _analysis_cache.get(pos_key) or {}
+            # Already have a result (from this on-demand button or an earlier
+            # automatic run) and no explicit re-run requested — return it
+            # directly rather than starting another NB call. This is also
+            # what makes the button pollable: the JS re-POSTs the same
+            # request on a timer, gets 202 while in-flight (below), and once
+            # the background thread finishes and writes these fields, the
+            # very next poll lands here instead of kicking off a duplicate.
+            # In-flight check MUST come first: a poll landing while a fresh
+            # (force-triggered) run is still running must see "in progress",
+            # not a stale notebooklm_error/text left over from a PRIOR run —
+            # otherwise every poll after the first short-circuits on old
+            # cached data and the button appears to "fail instantly" even
+            # though a real run is quietly still executing in the background
+            # (confirmed live: GLD showed a several-minutes-old "Timed out
+            # after 200s" as if it had just failed again in a few seconds).
+            if pos_key in _analysis_inflight:
+                return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                                status=202, mimetype="application/json")
+            if not force and (existing.get("notebooklm_text") or existing.get("notebooklm_error")):
+                return Response(json.dumps({
+                    "recommendation": existing.get("notebooklm_recommendation"),
+                    "text": existing.get("notebooklm_text"),
+                    "error": existing.get("notebooklm_error"),
+                    "_run_at": existing.get("notebooklm_run_at"),
+                }), mimetype="application/json")
+            _analysis_inflight.add(pos_key)
+
+        def _run():
+            try:
+                fresh_token = _get_valid_token()
+                open_positions = get_all_open_positions(ticker)
+                matched_pos = None
+                for p in open_positions:
+                    try:
+                        if (str(p.get("symbol", "")).upper() == ticker
+                                and str(p.get("option_type", "")).lower() == opt_type.lower()
+                                and float(p.get("strike", "")) == float(strike_str)
+                                and str(p.get("expiry", "")) == expiry):
+                            matched_pos = p
+                            break
+                    except (TypeError, ValueError):
+                        continue
+                if matched_pos is None:
+                    raise RuntimeError(f"Position not found: {pos_key}")
+
+                key_dates = get_key_dates(ticker)
+                vix = get_vix()
+                ul_cost_basis = float(matched_pos.get("ul_cost_basis") or 0)
+                chain = get_chain_net_cash(matched_pos.get("spread_id"), fallback_pos_id=matched_pos.get("id"))
+                eval_data = get_eval_data(fresh_token, account_id, ticker=ticker, verbose=False)
+                current_leg_price = None
+                for p in eval_data.get("positions", []):
+                    try:
+                        if (str(p.get("option_type", "")).lower() == opt_type.lower()
+                                and float(p.get("strike") or -1) == float(strike_str)
+                                and str(p.get("expiry")) == expiry):
+                            current_leg_price = p.get("current_price")
+                            break
+                    except (TypeError, ValueError):
+                        continue
+
+                all_expirations = get_expirations(fresh_token, account_id, ticker)
+                cutoff = datetime.date.today() + datetime.timedelta(days=90)
+                expirations = [
+                    e for e in all_expirations
+                    if (d := (datetime.date.fromisoformat(e) if e else None)) and d <= cutoff
+                ][:40] or all_expirations[:10]
+                all_rows: list[dict] = []
+                for exp_date in expirations:
+                    chain_data = get_option_chain(fresh_token, account_id, ticker, exp_date)
+                    if not chain_data:
+                        continue
+                    for contract in chain_data.get("calls", []):
+                        all_rows.append(contract_to_row(contract, "CALL", exp_date))
+                    for contract in chain_data.get("puts", []):
+                        all_rows.append(contract_to_row(contract, "PUT", exp_date))
+
+                # 600s: matches _run_notebooklm_roll's own worst case (200s
+                # lock-wait + 380s query work — see _NOTEBOOKLM_LOCK_TIMEOUT/
+                # _NOTEBOOKLM_WORK_TIMEOUT) with a small margin, so this outer
+                # wait_for doesn't cut the call off before its own internal
+                # timeout has a chance to produce a proper error message.
+                rec, text, error = asyncio.run(
+                    asyncio.wait_for(
+                        _run_notebooklm_roll(ticker, notebook_id, key_dates, vix, ul_cost_basis,
+                                              open_positions, chain, current_leg_price, all_rows),
+                        timeout=600,
+                    )
+                )
+            except Exception as exc:
+                log.exception("[notebooklm-compare] failed for %s", pos_key)
+                rec, text, error = None, None, str(exc)
+
+            # Discard from in-flight and write the fresh result in the SAME
+            # locked block — split across two separate `with _cache_lock`
+            # blocks, a poll landing in the gap between them would see
+            # in-flight already cleared but the old notebooklm_error/text
+            # not yet overwritten, and briefly re-serve the stale result.
+            import time as _time
+            run_at = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
+            with _cache_lock:
+                _analysis_inflight.discard(pos_key)
+                entry = _analysis_cache.setdefault(pos_key, {})
+                entry["notebooklm_recommendation"] = rec
+                entry["notebooklm_text"] = text
+                entry["notebooklm_error"] = error
+                entry["notebooklm_run_at"] = run_at
+                _save_cache(_analysis_cache)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                        status=202, mimetype="application/json")
 
     @app.route("/api/openai-ask", methods=["POST"])
     @require_auth
@@ -6505,6 +6839,17 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
         with _cache_lock:
             cached = _unborn_cache.get(ub_key)
+            # In-flight check MUST come first: a poll landing while a fresh
+            # (force-triggered) run is still running must see "in progress",
+            # not a stale cached result from a PRIOR run — see the matching
+            # comment on /api/notebooklm-compare for the confirmed-live
+            # symptom (a force re-run kept re-serving a stale result from
+            # well before the triggering edit, because every poll after the
+            # first hit this cache short-circuit instead of ever seeing the
+            # new run was still in flight).
+            if ub_key in _unborn_inflight:
+                return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                                status=202, mimetype="application/json")
             if cached and not cached.get("error") and not force:
                 return Response(json.dumps(cached), mimetype="application/json")
             # Re-run errors only after a 5-minute cooldown
@@ -6512,9 +6857,6 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 import time as _t
                 if _t.time() - cached.get("_error_at", 0) < 300:
                     return Response(json.dumps(cached), mimetype="application/json")
-            if ub_key in _unborn_inflight:
-                return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
-                                status=202, mimetype="application/json")
             _unborn_inflight.add(ub_key)
 
         notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
@@ -6540,9 +6882,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         # cached result once the background thread finishes.
         def _run_analysis():
             try:
-                # 600s: see the matching comment in /api/analyze's
+                # 700s: see the matching comment in /api/analyze's
                 # _run_analysis for why this needs enough headroom over
-                # NotebookLM's own self-bounded worst case (~400s) to
+                # NotebookLM's own self-bounded worst case (~580s) to
                 # essentially never trip under normal NB slowness — firing
                 # it discards the ENTIRE result, including any
                 # already-successful Claude/Luna opinions, not just NB's.
@@ -6550,7 +6892,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     asyncio.wait_for(
                         run_unborn_for_ticker(fresh_token, fresh_account_id, ticker, qty, strat,
                                               notebook_id, ul_cost_basis=ul_cost_basis),
-                        timeout=600,
+                        timeout=700,
                     )
                 )
                 if result.get("error"):
@@ -6558,15 +6900,17 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 else:
                     log.info("[unborn] %s → %s", ticker, result.get("recommendation"))
             except asyncio.TimeoutError:
-                log.error("[unborn] Analysis timed out after 600s for %s", ticker)
+                log.error("[unborn] Analysis timed out after 700s for %s", ticker)
                 result = {"error": "Analysis timed out", "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat}
             except Exception as exc:
                 log.exception("[unborn] Unhandled exception for %s", ticker)
                 result = {"error": str(exc), "recommendation": "HOLD", "text": "", "ticker": ticker, "strat": strat}
-            finally:
-                with _cache_lock:
-                    _unborn_inflight.discard(ub_key)
+            # Discard from in-flight and write the fresh result in the SAME
+            # locked block — see the matching comment on
+            # /api/notebooklm-compare for why splitting these across two
+            # lock blocks re-opens the stale-read race.
             with _cache_lock:
+                _unborn_inflight.discard(ub_key)
                 import time as _time
                 # run_unborn_for_ticker() now runs Luna and NotebookLM inline
                 # as part of the same analysis — see the matching comment in
@@ -6647,6 +6991,136 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 
         return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
 
+    @app.route("/api/notebooklm-compare-unborn", methods=["POST"])
+    @require_auth
+    def api_notebooklm_compare_unborn():
+        """
+        Third opinion via NotebookLM for a NEW/unborn position — on-demand
+        trigger for the "Compare with Notebook" button, shown when NB didn't
+        already run automatically as part of the main analysis (see
+        run_unborn_for_ticker's docstring). Same background-thread + 202
+        pattern as /api/unborn, not a direct synchronous call like Luna's
+        /api/openai-compare-unborn — see the matching comment on
+        /api/notebooklm-compare for why.
+        """
+        body = flask_request.get_json(force=True, silent=True) or {}
+        ub_key = body.get("ub_key", "")
+        if not ub_key:
+            return Response(json.dumps({"error": "Missing ub_key"}), status=400, mimetype="application/json")
+
+        with _cache_lock:
+            cached = _unborn_cache.get(ub_key)
+            if cached is None:
+                resolved_key, cached = _resolve_unborn_prefix_match(ub_key, _unborn_cache)
+                if resolved_key is not None:
+                    ub_key = resolved_key
+        if not cached or cached.get("error"):
+            return Response(json.dumps({"error": f"No unborn analysis cached for {ub_key} — click Find/Analyze first."}), status=404, mimetype="application/json")
+
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            return Response(json.dumps({"error": "NOTEBOOKLM_NOTEBOOK_ID not set"}), status=500, mimetype="application/json")
+
+        ticker = cached.get("ticker", "")
+        strat = cached.get("strat", "CC")
+        ul_cost_basis = cached.get("ul_cost_basis") or 0
+        try:
+            qty = int(ub_key.split("|")[2])
+        except (IndexError, ValueError):
+            qty = 1
+
+        force = bool(body.get("force"))
+        with _cache_lock:
+            # Already have a result (from this on-demand button or an earlier
+            # automatic run) and no explicit re-run requested — return it
+            # directly rather than starting another NB call. Also what makes
+            # the button pollable — see the matching comment on
+            # /api/notebooklm-compare.
+            # In-flight check MUST come first: a poll landing while a fresh
+            # (force-triggered) run is still running must see "in progress",
+            # not a stale notebooklm_error/text left over from a PRIOR run —
+            # see the matching comment on /api/notebooklm-compare for the
+            # confirmed-live symptom (GLD/SLV appearing to fail in a few
+            # seconds when the real prior failure was a 200s timeout).
+            if ub_key in _unborn_inflight:
+                return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                                status=202, mimetype="application/json")
+            if not force and (cached.get("notebooklm_text") or cached.get("notebooklm_error")):
+                return Response(json.dumps({
+                    "recommendation": cached.get("notebooklm_recommendation"),
+                    "text": cached.get("notebooklm_text"),
+                    "error": cached.get("notebooklm_error"),
+                    "_run_at": cached.get("notebooklm_run_at"),
+                }), mimetype="application/json")
+            _unborn_inflight.add(ub_key)
+
+        def _run():
+            try:
+                fresh_token = _get_valid_token()
+                all_expirations = get_expirations(fresh_token, account_id, ticker)
+                today = datetime.date.today()
+                all_expirations = [e for e in all_expirations if (datetime.date.fromisoformat(e) - today).days >= 7]
+                expirations = all_expirations[:20]
+                all_rows: list[dict] = []
+                for exp_date in expirations:
+                    chain_data = get_option_chain(fresh_token, account_id, ticker, exp_date)
+                    if not chain_data:
+                        continue
+                    for contract in chain_data.get("calls", []):
+                        all_rows.append(contract_to_row(contract, "CALL", exp_date))
+                    for contract in chain_data.get("puts", []):
+                        all_rows.append(contract_to_row(contract, "PUT", exp_date))
+
+                ul_price = get_underlying_price(ticker)
+                opt_type_filter = "CALL" if strat == "CC" else "PUT"
+                display_rows = []
+                for row in all_rows:
+                    if row.get("option_type", "").upper() != opt_type_filter:
+                        continue
+                    try:
+                        dte = (datetime.date.fromisoformat(row["expiration_date"]) - today).days
+                    except (KeyError, ValueError):
+                        dte = None
+                    display_rows.append({
+                        "symbol": ticker, "option_type": opt_type_filter,
+                        "strike": row.get("strike_price"), "expiry": row.get("expiration_date"),
+                        "side": "Short", "dte": dte, "delta": row.get("delta"),
+                        "ul_price": ul_price, "opt_price": row.get("mid_price") or row.get("last"),
+                    })
+
+                key_dates = get_key_dates(ticker)
+                vix = get_vix()
+                # 600s: see the matching comment on /api/notebooklm-compare's
+                # equivalent wait_for.
+                rec, text, error = asyncio.run(
+                    asyncio.wait_for(
+                        _run_notebooklm_unborn(ticker, notebook_id, strat, key_dates, vix,
+                                                ul_cost_basis, qty, all_rows, display_rows),
+                        timeout=600,
+                    )
+                )
+            except Exception as exc:
+                log.exception("[notebooklm-compare-unborn] failed for %s", ub_key)
+                rec, text, error = None, None, str(exc)
+
+            # Discard from in-flight and write the fresh result in the SAME
+            # locked block — see the matching comment on /api/notebooklm-compare
+            # for why splitting these across two lock blocks re-opens the race.
+            import time as _time
+            run_at = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
+            with _cache_lock:
+                _unborn_inflight.discard(ub_key)
+                entry = _unborn_cache.setdefault(ub_key, dict(cached))
+                entry["notebooklm_recommendation"] = rec
+                entry["notebooklm_text"] = text
+                entry["notebooklm_error"] = error
+                entry["notebooklm_run_at"] = run_at
+                _save_unborn_cache(_unborn_cache)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                        status=202, mimetype="application/json")
+
     @app.route("/api/openai-ask-unborn", methods=["POST"])
     @require_auth
     def api_openai_ask_unborn():
@@ -6713,14 +7187,20 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         purely because Pass 3 happened to run them, not because anyone asked
         to track them.
         """
-        chain = result.get("chain") or []
+        # display_chain/display_do_nothing (when present) reflect the
+        # highest-priority SELL/WAIT across Claude/Luna/NotebookLM — see
+        # run_unborn_for_ticker's docstring for that field. Fall back to the
+        # plain chain/_do_nothing for older cached entries that predate it.
+        chain = result.get("display_chain") if "display_chain" in result else result.get("chain")
+        chain = chain or []
+        do_nothing = result.get("display_do_nothing") if "display_do_nothing" in result else result.get("_do_nothing")
         if chain:
             row = dict(chain[0])
         else:
             row = {
                 "symbol": ticker, "option_type": strat,
-                "_do_nothing": bool(result.get("_do_nothing")),
-                "ideal_entry": "DO NOTHING" if result.get("_do_nothing") else None,
+                "_do_nothing": bool(do_nothing),
+                "ideal_entry": "DO NOTHING" if do_nothing else None,
             }
         row.update({
             "_qty": qty,
@@ -6884,10 +7364,23 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         ub_key = urllib.parse.unquote(ub_key)
         # Exact match first; fall back to prefix match (handles cost-basis
         # suffix added server-side — the _ubKey stored on the display row is
-        # deliberately ticker|strat|qty only, no cost basis).
+        # deliberately ticker|strat|qty only, no cost basis). Keep the
+        # RESOLVED (full, cost-basis-suffixed) key separately for anything
+        # sent back to the server (the page's _POS_KEY, used by "Ask a
+        # follow-up") — /api/ask does an exact dict lookup with no
+        # prefix-match fallback of its own, so handing it back the
+        # unresolved 3-part ub_key always missed the real 4-part cache
+        # entry and produced a confusing "No analysis yet — click Analyze
+        # first" even though the page above it was rendering that exact
+        # analysis. title_str/ticker_sym below intentionally keep using the
+        # original short ub_key, not this one, so the page header doesn't
+        # start showing the cost-basis suffix.
         cached = _unborn_cache.get(ub_key)
+        resolved_ub_key = ub_key
         if cached is None:
-            _, cached = _resolve_unborn_prefix_match(ub_key, _unborn_cache)
+            _resolved, cached = _resolve_unborn_prefix_match(ub_key, _unborn_cache)
+            if _resolved is not None:
+                resolved_ub_key = _resolved
         parts  = ub_key.split("|")   # TICKER|STRAT|QTY
         title_str = html_mod.escape(" · ".join(parts))
         ticker_sym = html_mod.escape(parts[0].upper())
@@ -7044,6 +7537,20 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             else:
                 notebooklm_card_html = '<div id="notebooklm-card"></div>'
 
+            # Button shown whenever there's no SUCCESSFUL NB result yet —
+            # covers both "never attempted" and "attempted automatically but
+            # errored/timed out" (NB is best-effort and legitimately times
+            # out sometimes; the trader should be able to retry it, not get
+            # stuck with a permanent error and no way to ask again short of
+            # a full re-analysis). Once there's real text, the card above
+            # shows it and this button goes away.
+            notebooklm_badge_html = (
+                '' if notebooklm_text_val else
+                '<button onclick="notebooklmCompareUnborn(this)" '
+                'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#f59e0b;color:#000;'
+                'border:none;border-radius:4px;cursor:pointer">Compare with Notebook</button>'
+            )
+
             primary_ask_html = (
                 '<div class="ask-section">'
                 '<div class="ask-thread" id="ask-thread"></div>'
@@ -7069,6 +7576,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 f'<div style="margin-bottom:16px">'
                 f'<span class="badge badge-{rec_cls}" style="font-size:15px;padding:6px 16px">{html_mod.escape(rec)}</span>'
                 f'<span id="openai-badge-slot">{openai_badge_html}</span>'
+                f'<span id="notebooklm-badge-slot">{notebooklm_badge_html}</span>'
                 f'{run_at_html}'
                 f'</div>'
                 f'<div class="rec-body">{"".join(lines_out)}</div>'
@@ -7148,7 +7656,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 </header>
 {body_html}
 <script>
-const _POS_KEY = {json.dumps(ub_key)};
+const _POS_KEY = {json.dumps(resolved_ub_key)};
 const _MAIN_ACTION = {json.dumps(_main_action_js)};
 const _OPENAI_SAVED_QA = {json.dumps(cached.get("openai_qa_thread", []) if cached else [])};
 function esc(s) {{
@@ -7225,6 +7733,53 @@ async function openaiCompareUnborn(btn) {{
     if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">Luna error: ${{esc(e.message)}}</span>`;
   }} finally {{
     if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with Luna'; }}
+  }}
+}}
+
+async function notebooklmCompareUnborn(btn) {{
+  if (btn) {{ btn.disabled = true; btn.textContent = 'Comparing… (can take a few minutes)'; }}
+  const slot = document.getElementById('notebooklm-badge-slot');
+  try {{
+    let d;
+    let forceNow = true;
+    while (true) {{
+      const r = await fetch('/api/notebooklm-compare-unborn', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{ub_key: _POS_KEY, force: forceNow}})
+      }});
+      // Only force the first request — see analyzeFormerPosition's comment
+      // on the PPIH infinite-loop bug for why resending force on every poll
+      // is dangerous: a fast-completing retry could bypass the "already has
+      // a result" short-circuit forever instead of ever returning it.
+      forceNow = false;
+      d = await r.json();
+      if (r.status === 202 && d.status === 'in_progress') {{
+        await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
+        continue;
+      }}
+      break;
+    }}
+    if (slot) slot.innerHTML = '';
+    if (d.error) {{
+      const card = document.getElementById('notebooklm-card');
+      if (card) card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
+        + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>`
+        + `<span class="chain-working" style="color:var(--muted);display:block;margin-top:6px">Not available this run: ${{esc(d.error)}}</span>`
+        + `</div>`;
+      return;
+    }}
+    const card = document.getElementById('notebooklm-card');
+    if (card) {{
+      const body = renderAdvisorMarkdown(d.text || '');
+      card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
+        + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion)</span>`
+        + `<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">${{body}}</span>`
+        + `</div>`;
+    }}
+  }} catch(e) {{
+    if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(e.message)}}</span>`;
+    if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with Notebook'; }}
   }}
 }}
 const _SAVED_QA = {json.dumps(cached.get("qa_thread", []) if cached else [])};
@@ -7337,6 +7892,18 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
             if cached is None:
                 cached = _unborn_cache.get(pos_key)
                 _in_unborn = cached is not None
+                if cached is None:
+                    # The unborn cache's real keys carry a cost-basis suffix
+                    # (TICKER|STRAT|QTY|COST_BASIS) that callers sending the
+                    # short display key (TICKER|STRAT|QTY) won't have — see
+                    # the matching fix/comment on unborn_detail() for the
+                    # confirmed-live symptom (MO's follow-up 404ing with "No
+                    # analysis yet" despite the page above it showing a real
+                    # cached analysis for that exact ticker).
+                    resolved_key, cached = _resolve_unborn_prefix_match(pos_key, _unborn_cache)
+                    if resolved_key is not None:
+                        pos_key = resolved_key
+                        _in_unborn = True
         if not cached or not cached.get("text"):
             return Response(json.dumps({"error": "No analysis yet for this position — click Analyze first."}),
                             status=404, mimetype="application/json")
@@ -7941,6 +8508,20 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
             else:
                 notebooklm_card_html = '<div id="notebooklm-card"></div>'
 
+            # Button shown whenever there's no SUCCESSFUL NB result yet —
+            # covers both "never attempted" and "attempted automatically but
+            # errored/timed out" (NB is best-effort and legitimately times
+            # out sometimes; the trader should be able to retry it, not get
+            # stuck with a permanent error and no way to ask again short of
+            # a full re-analysis). Once there's real text, the card above
+            # shows it and this button goes away.
+            notebooklm_badge_html = (
+                '' if notebooklm_text_val else
+                '<button onclick="notebooklmCompare(this)" '
+                'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#f59e0b;color:#000;'
+                'border:none;border-radius:4px;cursor:pointer">Compare with Notebook</button>'
+            )
+
             primary_ask_html = (
                 '<div class="ask-section">'
                 '<div class="ask-thread" id="ask-thread"></div>'
@@ -7966,6 +8547,7 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
                 f'<div style="margin-bottom:16px">'
                 f'<span class="badge badge-{rec_cls}" style="font-size:15px;padding:6px 16px">{html_mod.escape(rec)}</span>'
                 f'<span id="openai-badge-slot">{openai_badge_html}</span>'
+                f'<span id="notebooklm-badge-slot">{notebooklm_badge_html}</span>'
                 f'{run_at_html}'
                 f'</div>'
                 f'<div class="rec-body">{"".join(lines_out)}</div>'
@@ -8143,6 +8725,53 @@ async function openaiCompare(btn) {{
     if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with Luna'; }}
   }}
 }}
+
+async function notebooklmCompare(btn) {{
+  if (btn) {{ btn.disabled = true; btn.textContent = 'Comparing… (can take a few minutes)'; }}
+  const slot = document.getElementById('notebooklm-badge-slot');
+  try {{
+    let d;
+    let forceNow = true;
+    while (true) {{
+      const r = await fetch('/api/notebooklm-compare', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{position_key: _POS_KEY, force: forceNow}})
+      }});
+      // Only force the first request — see analyzeFormerPosition's comment
+      // on the PPIH infinite-loop bug for why resending force on every poll
+      // is dangerous: a fast-completing retry could bypass the "already has
+      // a result" short-circuit forever instead of ever returning it.
+      forceNow = false;
+      d = await r.json();
+      if (r.status === 202 && d.status === 'in_progress') {{
+        await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
+        continue;
+      }}
+      break;
+    }}
+    if (slot) slot.innerHTML = '';
+    if (d.error) {{
+      const card = document.getElementById('notebooklm-card');
+      if (card) card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
+        + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>`
+        + `<span class="chain-working" style="color:var(--muted);display:block;margin-top:6px">Not available this run: ${{esc(d.error)}}</span>`
+        + `</div>`;
+      return;
+    }}
+    const card = document.getElementById('notebooklm-card');
+    if (card) {{
+      const body = renderAdvisorMarkdown(d.text || '');
+      card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
+        + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion)</span>`
+        + `<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">${{body}}</span>`
+        + `</div>`;
+    }}
+  }} catch(e) {{
+    if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(e.message)}}</span>`;
+    if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with Notebook'; }}
+  }}
+}}
 (function() {{
   const thread = document.getElementById('ask-thread');
   for (const item of _SAVED_QA) {{
@@ -8287,6 +8916,295 @@ def print_positions(ticker: str, positions: list[dict]) -> None:
     print_box(lines, title=f"  {ticker} — Open Positions  ")
 
 
+_SECTOR_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ticker_sector_cache.json")
+_CATALYST_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".biotech_catalyst_cache.json")
+
+# Corporate suffixes stripped off a company's yfinance longName to get a
+# search term for clinicaltrials.gov — e.g. "Moderna, Inc." -> "Moderna".
+# clinicaltrials.gov's registered sponsor name is often NOT the same as the
+# ticker's display name (confirmed live: Moderna's actual trial sponsor is
+# "ModernaTX, Inc.", not "Moderna, Inc."), so an exact-name query misses
+# real trials — this feeds a broad free-text sponsor search instead, with
+# the core word then used to verify (substring match) that a result's real
+# lead sponsor is actually this company and not just a collaborator
+# mentioned in an unrelated trial (confirmed live: searching "Moderna"
+# alone surfaced a Vertex Pharmaceuticals trial that merely references
+# Moderna's mRNA platform).
+_CORP_SUFFIXES = re.compile(
+    r'\b(inc|incorporated|corp|corporation|co|company|ltd|limited|plc|llc|'
+    r'holdings?|pharmaceuticals?|therapeutics|biosciences?|bio|pharma|'
+    r'n\.?v\.?|s\.?a\.?|ag)\b\.?',
+    re.IGNORECASE,
+)
+
+# Manual escape hatch for tickers where clinicaltrials.gov's registered
+# sponsor entity name has NO overlapping word with the public company name
+# at all — confirmed live: Moderna's actual sponsor entity is "ModernaTX,
+# Inc.", and CT.gov's search does token matching, not substring/prefix
+# matching, so searching "Moderna" (or any variant/wildcard of it) never
+# surfaces "ModernaTX" trials; there's no general algorithmic fix for this
+# since it's an arbitrary naming choice, not a pattern. Add an entry here
+# if you notice a biotech position showing zero catalysts despite having
+# known upcoming trials — one-time, per ticker, not ongoing maintenance.
+_SPONSOR_NAME_OVERRIDES = {
+    "MRNA": "ModernaTX",
+}
+
+
+def _classify_biotech_llm(company_name: str, business_summary: str) -> bool | None:
+    """
+    Ask Claude (Haiku, same lightweight-classification pattern as
+    _detect_unborn_action_llm) whether a company is a clinical-stage /
+    binary-catalyst-driven biotech — i.e. whether clinical trial results
+    are a real risk to check for, regardless of what taxonomy bucket a data
+    provider happens to file it under.
+
+    yfinance's industry string alone isn't reliable for this: it correctly
+    tags some clinical-stage companies as "Biotechnology" (e.g. Moderna,
+    Definium Therapeutics, Cybin) but files others under adjacent labels
+    like "Medical Care Facilities" (confirmed live: COMPASS Pathways, a
+    clinical-stage psilocybin-therapy company squarely in scope for this
+    check, comes back "Medical Care Facilities" — there is no such thing as
+    a free, official GICS data source to fall back on either; GICS itself
+    is a licensed MSCI/S&P taxonomy, and yfinance's sector/industry strings
+    are Yahoo's own loose approximation of it, not the real thing). Only
+    called for sector=="Healthcare" tickers whose industry ISN'T already
+    "Biotechnology" — that fast path skips the LLM call entirely for both
+    the obvious-yes case and the vast majority of tickers that aren't
+    healthcare-adjacent at all, so this only runs for the genuinely
+    ambiguous slice.
+
+    Returns None (not a guess) on any failure, so the caller falls back to
+    treating it as not-biotech rather than blocking the analysis on this.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key or not company_name:
+        return None
+    import requests
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": _ANTHROPIC_MODEL,
+                "max_tokens": 8,
+                "system": (
+                    "You classify companies for options-trading risk purposes. Reply "
+                    "with exactly one word: YES if this company is a clinical-stage or "
+                    "binary-catalyst-driven biotech/biopharmaceutical company — i.e. one "
+                    "whose stock price could move sharply on a clinical trial readout, "
+                    "FDA decision, or similar single-event catalyst — or NO if it is not "
+                    "(e.g. a hospital/clinic operator, insurer, diagnostics-services "
+                    "company, or profitable diversified pharma company whose share price "
+                    "isn't dominated by individual trial results). No other text."
+                ),
+                "messages": [{
+                    "role": "user",
+                    "content": f"Company: {company_name}\n\nBusiness summary: {(business_summary or 'N/A')[:2000]}",
+                }],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        content = resp.json().get("content", [])
+        reply = (content[0].get("text", "") if content else "").strip().upper()
+        if reply in ("YES", "NO"):
+            return reply == "YES"
+        log.warning("[biotech-classify] unexpected reply %r for %s", reply, company_name)
+    except Exception as exc:
+        log.warning("[biotech-classify] failed for %s: %s", company_name, exc)
+    return None
+
+
+def _ticker_sector_info(ticker: str) -> dict:
+    """Sector/industry/long-name/is_biotech for ticker. Sector/industry come
+    from yfinance's full .info (a heavier quoteSummary call than fast_info,
+    but this never changes day to day, so the WHOLE result — including the
+    is_biotech verdict, which may involve an LLM call — is cached
+    indefinitely on disk rather than re-fetched/re-classified on every
+    analysis. Avoids adding to the rate-limit pressure already seen on
+    quoteSummary-backed calls (see get_ul_cost_basis_from_db and the 429s
+    logged against other quoteSummary-derived lookups), and avoids paying
+    for a fresh LLM classification call every time."""
+    import json
+    cache: dict = {}
+    if os.path.exists(_SECTOR_CACHE_FILE):
+        try:
+            with open(_SECTOR_CACHE_FILE, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+    if ticker in cache:
+        return cache[ticker]
+    result = {"sector": None, "industry": None, "long_name": None, "is_biotech": False}
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        sector = info.get("sector")
+        industry = info.get("industry")
+        long_name = info.get("longName") or info.get("shortName")
+        # Fast, free, obvious-yes path — no LLM call needed.
+        is_biotech = bool(industry) and "biotechnology" in industry.lower()
+        # Genuinely ambiguous slice only: Healthcare-sector but not already
+        # tagged Biotechnology (see _classify_biotech_llm's docstring for
+        # why yfinance's industry label alone misses real cases here).
+        if not is_biotech and sector and sector.lower() == "healthcare":
+            verdict = _classify_biotech_llm(long_name, info.get("longBusinessSummary"))
+            if verdict is not None:
+                is_biotech = verdict
+        result = {
+            "sector": sector,
+            "industry": industry,
+            "long_name": long_name,
+            "is_biotech": is_biotech,
+        }
+    except Exception as exc:
+        log.warning("[biotech] sector lookup failed for %s: %s", ticker, exc)
+        return result  # don't cache a failed lookup — worth retrying next time
+    cache[ticker] = result
+    try:
+        with open(_SECTOR_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+    return result
+
+
+def is_biotech_ticker(ticker: str) -> bool:
+    """True if this ticker is a clinical-stage / binary-catalyst-driven
+    biotech — the actual classification work (yfinance industry fast path,
+    LLM fallback for ambiguous Healthcare-sector tickers) lives in and is
+    cached by _ticker_sector_info; see its docstring and
+    _classify_biotech_llm's for why a single yfinance string isn't enough
+    on its own (confirmed live: correctly tags Moderna/Definium
+    Therapeutics/Cybin as Biotechnology, but files COMPASS Pathways — an
+    equally clinical-stage, binary-catalyst company — under 'Medical Care
+    Facilities' instead)."""
+    return bool(_ticker_sector_info(ticker).get("is_biotech"))
+
+
+def get_biotech_catalyst_dates(ticker: str, window_days: int = 180) -> list[dict]:
+    """Upcoming clinical-trial primary-completion dates (a proxy for when
+    results are likely to be read out / announced) for ticker's company,
+    via clinicaltrials.gov's public v2 API — free, official, no ToS risk.
+
+    Caveat worth knowing: 'primary completion date' is when the trial's
+    last-subject data collection is expected to finish, not necessarily the
+    exact day the company announces results (which typically lags by weeks
+    to months and is not itself a clinicaltrials.gov field) — treat this as
+    'a catalyst is expected around here', not a precise announcement date.
+    Most dates also come back with type ESTIMATED rather than ACTUAL, and
+    sponsors revise them over time; that distinction is passed through
+    rather than discarded so the LLM can weight it appropriately, mirroring
+    the confirmed/estimated distinction already used for earnings dates.
+
+    Only meaningful for is_biotech_ticker() tickers — sponsor-name search
+    against clinicaltrials.gov for a non-drug-developer company is
+    meaningless. Cached per ticker per day (trial dates shift; daily is a
+    reasonable freshness bar without hitting the API on every analysis
+    call). Best-effort: returns [] on any failure, never raises — this is
+    supplementary risk context, not a number the rest of the pipeline
+    depends on existing.
+    """
+    import datetime as _dt
+    import json
+    today = _dt.date.today()
+    cache: dict = {}
+    if os.path.exists(_CATALYST_CACHE_FILE):
+        try:
+            with open(_CATALYST_CACHE_FILE, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+    entry = cache.get(ticker)
+    if entry and entry.get("_date") == today.isoformat():
+        return entry.get("catalysts", [])
+
+    company = _ticker_sector_info(ticker).get("long_name")
+    if not company and ticker.upper() not in _SPONSOR_NAME_OVERRIDES:
+        return []
+    if ticker.upper() in _SPONSOR_NAME_OVERRIDES:
+        core = _SPONSOR_NAME_OVERRIDES[ticker.upper()]
+    else:
+        # Leading significant word(s) once corporate suffixes are stripped —
+        # e.g. "Moderna, Inc." -> "Moderna", "Vertex Pharmaceuticals
+        # Incorporated" -> "Vertex". Falls back to the first raw word if
+        # stripping suffixes empties the string entirely (e.g. a one-word
+        # name that happens to match a suffix pattern).
+        core = _CORP_SUFFIXES.sub("", company).strip(" ,.")
+        core = core.split(",")[0].split()[0] if core else company.split()[0]
+
+    catalysts: list[dict] = []
+    try:
+        import requests
+        resp = requests.get(
+            "https://clinicaltrials.gov/api/v2/studies",
+            params={
+                "query.spons": core,
+                "filter.overallStatus": "ACTIVE_NOT_RECRUITING,RECRUITING,ENROLLING_BY_INVITATION",
+                "fields": "NCTId,BriefTitle,Phase,PrimaryCompletionDate,PrimaryCompletionDateType,OverallStatus,LeadSponsorName",
+                "pageSize": 100,
+            },
+            timeout=15,
+            headers={"User-Agent": "options-workflow-dashboard/1.0"},
+        )
+        resp.raise_for_status()
+        studies = resp.json().get("studies", [])
+        cutoff = today + _dt.timedelta(days=window_days)
+        for s in studies:
+            proto = s.get("protocolSection", {})
+            sponsor_name = proto.get("sponsorCollaboratorsModule", {}).get("leadSponsor", {}).get("name", "")
+            # Reject free-text search hits where COMPANY is merely a
+            # collaborator/mentioned party, not the actual lead sponsor —
+            # see this function's docstring for the confirmed-live Vertex/
+            # Moderna false-positive this guards against.
+            if core.lower() not in sponsor_name.lower():
+                continue
+            status_mod = proto.get("statusModule", {})
+            pc = status_mod.get("primaryCompletionDateStruct", {})
+            date_str = pc.get("date")
+            if not date_str:
+                continue
+            try:
+                # yfinance/clinicaltrials.gov dates can be month-precision
+                # only (e.g. "2026-08") — anchor to the 1st for comparison
+                # purposes rather than dropping the whole record.
+                parts = date_str.split("-")
+                pc_date = _dt.date(int(parts[0]), int(parts[1]) if len(parts) > 1 else 1,
+                                    int(parts[2]) if len(parts) > 2 else 1)
+            except (ValueError, IndexError):
+                continue
+            if not (today <= pc_date <= cutoff):
+                continue
+            ident = proto.get("identificationModule", {})
+            design = proto.get("designModule", {})
+            catalysts.append({
+                "nct_id": ident.get("nctId"),
+                "title": (ident.get("briefTitle") or "")[:120],
+                "phase": "/".join(design.get("phases", []) or []) or "N/A",
+                "date": pc_date.isoformat(),
+                "date_precision": "day" if len(parts) > 2 else ("month" if len(parts) > 1 else "year"),
+                "date_type": pc.get("type", "UNKNOWN"),
+                "status": status_mod.get("overallStatus", "UNKNOWN"),
+            })
+        catalysts.sort(key=lambda c: c["date"])
+    except Exception as exc:
+        log.warning("[biotech] catalyst lookup failed for %s (%s): %s", ticker, company, exc)
+        return []  # don't cache a failed lookup — worth retrying next time
+
+    cache[ticker] = {"_date": today.isoformat(), "catalysts": catalysts}
+    try:
+        with open(_CATALYST_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+    return catalysts
+
+
 def get_key_dates(ticker: str) -> dict:
     """Thin retry wrapper around _get_key_dates_once — a momentary yfinance
     hiccup (confirmed live: SLB came back Unknown/Unknown for both dates
@@ -8332,16 +9250,29 @@ def _get_key_dates_once(ticker: str) -> dict:
         "exdiv_date": "Unknown",
         "exdiv_source": "unknown",
         "dividend_amount": "N/A",
+        "is_etf": False,
     }
 
     t = yf.Ticker(ticker)
 
+    # Fetched once and reused below (both the earnings-skip check and the
+    # dividend lookup need fast_info) — also surfaced on the result itself
+    # so callers (claude_advisor's prompt builders) can tell an ETF's
+    # structural "no earnings calendar" apart from a real data-fetch gap,
+    # instead of both collapsing into the same "Unknown" string. Confirmed
+    # live: with no distinction, Luna's SLV analysis treated "earnings date
+    # unknown" as an open data gap worth flagging/caveating, when an ETF
+    # not having earnings at all isn't unknown — it's not applicable.
+    try:
+        result["is_etf"] = getattr(t.fast_info, "quote_type", "").upper() == "ETF"
+    except Exception:
+        pass
+
     # ── Earnings date (skip for ETFs — they have no earnings calendar) ─────────
     all_cal_dates = []  # every earnings date the calendar knows about, past or future
     try:
-        fi_check = t.fast_info
         # ETFs report quoteType as "ETF"; skip earnings lookup to avoid quoteSummary 404s
-        if getattr(fi_check, "quote_type", "").upper() == "ETF":
+        if result["is_etf"]:
             raise StopIteration  # jump to except, leave earnings_date as "Unknown"
         cal = t.calendar  # dict or DataFrame depending on yfinance version
         # Newer yfinance returns a dict; older returns a DataFrame
@@ -8372,7 +9303,7 @@ def _get_key_dates_once(ticker: str) -> dict:
     # (not report dates) and understate the gap to the next report by weeks.
     if result["earnings_source"] != "confirmed":
         try:
-            if getattr(t.fast_info, "quote_type", "").upper() == "ETF":
+            if result["is_etf"]:
                 raise StopIteration
             hist_earnings = list(all_cal_dates)
             if not hist_earnings:
@@ -8430,6 +9361,17 @@ def _get_key_dates_once(ticker: str) -> dict:
                     result["exdiv_source"] = "estimated"
         except Exception:
             pass
+
+    # ── Clinical trial catalysts (biotech only) ─────────────────────────────
+    # A biotech's earnings date is rarely the binary risk event — a clinical
+    # trial readout is, and it isn't covered by the earnings-blackout check
+    # at all since it has nothing to do with a scheduled earnings release.
+    # Only checked for tickers yfinance classifies as Biotechnology (see
+    # is_biotech_ticker's docstring for why that's narrower than 'Healthcare'
+    # sector) — running a sponsor-name search against clinicaltrials.gov for
+    # every non-biotech ticker would be pure wasted API calls.
+    result["is_biotech"] = is_biotech_ticker(ticker)
+    result["biotech_catalysts"] = get_biotech_catalyst_dates(ticker) if result["is_biotech"] else []
 
     return result
 
@@ -8594,16 +9536,6 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> str | None:
     stem = base.split(".")[0].upper()
     uploading_ticker = stem if (1 <= len(stem) <= 5 and stem.isupper()) else None
 
-    # Skip upload if we recently uploaded this ticker
-    if uploading_ticker:
-        last = _last_upload_time.get(uploading_ticker)
-        if last and (datetime.datetime.now() - last).total_seconds() < _UPLOAD_TTL_MINUTES * 60:
-            log.info("Skipping upload for %s — uploaded %.0f min ago (TTL %d min)",
-                     uploading_ticker,
-                     (datetime.datetime.now() - last).total_seconds() / 60,
-                     _UPLOAD_TTL_MINUTES)
-            return None
-
     log.info("Uploading %s to NotebookLM notebook %s ...", file_path, notebook_id)
     try:
         async with NotebookLMClient.from_storage() as client:
@@ -8618,10 +9550,8 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> str | None:
             source = await client.sources.add_file(notebook_id, file_path, wait=False)
 
         source_id = source.id if source else None
-        if uploading_ticker:
-            _last_upload_time[uploading_ticker] = datetime.datetime.now()
-            if source_id:
-                _last_source_ids[uploading_ticker] = source_id
+        if uploading_ticker and source_id:
+            _last_source_ids[uploading_ticker] = source_id
         log.info("Upload complete: %s (source_id=%s)", os.path.basename(file_path), source_id)
         return source_id
     except Exception as exc:
@@ -8834,16 +9764,40 @@ async def query_notebooklm(
     # Only include clauses where data is actually known
     _earnings_known = dates.get("earnings_date", "Unknown").lower() not in ("unknown", "n/a", "")
     _exdiv_known    = dates.get("exdiv_date",   "Unknown").lower() not in ("unknown", "n/a", "")
-    earnings_note = (
-        f"the next earnings announcement is {dates['earnings_date']} ({dates['earnings_source']})"
-        if _earnings_known else ""
-    )
+    # An ETF has no earnings calendar at all — state that explicitly rather
+    # than silently omitting the clause, so it isn't read as an unresolved
+    # data gap worth flagging (see the matching fix/comment in
+    # claude_advisor._key_dates_lines for the confirmed-live SLV case this
+    # came from).
+    if dates.get("is_etf"):
+        earnings_note = "this ticker is an ETF with no earnings calendar — the earnings-blackout rule does not apply"
+    else:
+        earnings_note = (
+            f"the next earnings announcement is {dates['earnings_date']} ({dates['earnings_source']})"
+            if _earnings_known else ""
+        )
     exdiv_note = (
         f"the next ex-dividend date is {dates['exdiv_date']} "
         f"({dates['exdiv_source']}, {dates['dividend_amount']} per share)"
         if _exdiv_known else ""
     )
-    known_notes = [n for n in [earnings_note, exdiv_note] if n]
+    # Clinical trial catalysts — a binary, underlying-moving event for a
+    # biotech that has nothing to do with the earnings calendar above, so it
+    # needs its own explicit clause or NB never learns about it. Treat with
+    # the same seriousness as the earnings blackout (see the matching
+    # system-prompt language in claude_advisor.py's _SYSTEM_PROMPT/
+    # _UNBORN_SYSTEM_PROMPT for why this trader wants that framing).
+    _catalysts_nb = dates.get("biotech_catalysts") or []
+    catalyst_note = ""
+    if _catalysts_nb:
+        _c0 = _catalysts_nb[0]
+        catalyst_note = (
+            f"this is a biotech ticker with a clinical trial catalyst expected around "
+            f"{_c0['date']} ({_c0.get('date_type', 'unknown').lower()}, {_c0.get('phase', 'N/A')} trial, "
+            f"\"{_c0.get('title', '')}\") — a binary, underlying-moving event to be treated with the same "
+            f"seriousness as an earnings blackout when it falls inside the option's window"
+        )
+    known_notes = [n for n in [earnings_note, exdiv_note, catalyst_note] if n]
     dates_clause = ("Note that " + " and ".join(known_notes) + ". ") if known_notes else ""
 
     vix_note = f"the current VIX is {vix:.2f}" if vix is not None else ""
@@ -8980,6 +9934,14 @@ async def query_notebooklm(
             "exactly 'Recommendation: ROLL' (or 'Recommendation: HOLD', or "
             "'Recommendation: ASSIGNMENT') stating your recommendation in one word "
             "before any explanation — then explain your reasoning below it. "
+            "The PLAN and REVIEW sources are training data for METHODOLOGY ONLY — "
+            "how this trader thinks, what rules they apply. They are NEVER a source "
+            "of fact about what positions currently exist. Any specific position, "
+            "ticker, strike, or quantity mentioned there — even ones naming this "
+            "same ticker, or a different option type on it — is illustrative or "
+            "historical narrative, not live portfolio data; never cite it as "
+            "something the trader currently holds. The only real position is the "
+            "one described in the position data below. "
         )
         question = (
             f"{_today_preamble}"
@@ -9013,6 +9975,14 @@ async def query_notebooklm(
             "exactly 'Recommendation: SELL' (or 'Recommendation: WAIT') stating "
             "your recommendation in one word before any explanation — then explain "
             "your reasoning below it. "
+            "The PLAN and REVIEW sources are training data for METHODOLOGY ONLY — "
+            "how this trader thinks, what rules they apply. They are NEVER a source "
+            "of fact about what positions currently exist. Any specific position, "
+            "ticker, strike, or quantity mentioned there — even ones naming this "
+            "same ticker, or a different option type on it — is illustrative or "
+            "historical narrative, not live portfolio data; never cite it as "
+            "something the trader currently holds. There is NO existing position "
+            "on this ticker — that is the whole premise of this decision. "
         )
         question = (
             f"{_today_preamble}"

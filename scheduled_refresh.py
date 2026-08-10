@@ -30,12 +30,12 @@ SCRIPT_DIR = Path(__file__).parent
 UNBORN_ROWS_FILE = SCRIPT_DIR / "unborn_rows.json"
 LOG_FILE = SCRIPT_DIR / "logs" / "scheduled_refresh.log"
 HTTP_TIMEOUT = 360  # seconds per individual HTTP call (LLM analysis can take 60-180s+)
-# Must exceed the dashboard's own outer per-analysis timeout (600s, see
+# Must exceed the dashboard's own outer per-analysis timeout (700s, see
 # option_dashboard.py's _run_analysis closures) or this gives up polling
 # while the background thread is still legitimately working — the analysis
 # still completes and gets cached, just after this script already logged a
 # false-negative "Poll timeout".
-POLL_MAX    = 650   # seconds total before giving up on a single analysis
+POLL_MAX    = 750   # seconds total before giving up on a single analysis
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 os.makedirs(LOG_FILE.parent, exist_ok=True)
@@ -182,7 +182,13 @@ def main():
                 {"ticker": ticker, "qty": qty, "strat": strat, "cost_basis": cb, "force": True},
             )
             log.info("    → /api/unborn HTTP %d", status)
-            chain = result.get("chain") or []
+            # display_chain (when present) reflects the highest-priority
+            # SELL/WAIT across Claude/Luna/NotebookLM, not just Claude's own
+            # — see run_unborn_for_ticker's docstring in option_dashboard.py.
+            # This write runs AFTER the server's own _persist_unborn_display_row
+            # (which already prefers display_chain), so using the plain
+            # Claude-only "chain" here would silently clobber it back.
+            chain = result.get("display_chain") or result.get("chain") or []
             if chain:
                 now_et = _dt.datetime.now(_dt.timezone.utc).astimezone(
                     _dt.timezone(_dt.timedelta(hours=-4))  # ET (EDT)

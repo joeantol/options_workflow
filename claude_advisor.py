@@ -258,18 +258,85 @@ _SYSTEM_PROMPT = (
     "and are there STACKED events (e.g. CPI + Fed week, Fed + earnings) "
     "that compound the risk — that combination is the manuals' real "
     "concern, not a single routine print in isolation.\n\n"
+    "Biotech clinical trial catalysts — a SEPARATE check from the earnings "
+    "calendar above, and just as hard a rule when it applies: for a ticker "
+    "the position data flags as biotech, an upcoming clinical trial result "
+    "is a binary, underlying-moving event exactly like earnings, just not "
+    "on the earnings calendar at all. If a 'clinical trial catalyst' line "
+    "or an IMPORTANT catalyst-coverage note is present in the position data, "
+    "treat holding through that date with the same seriousness as the "
+    "earnings blackout — do not let yield/premium alone justify holding "
+    "through it, and name the catalyst explicitly in your reasoning rather "
+    "than only discussing it if asked. If a candidate list is given with a "
+    "catalyst_clear column, use it directly (CLEAR vs. THROUGH_CATALYST) "
+    "the same way you already use earnings_clear — do not compute your own "
+    "days-until-catalyst arithmetic. No catalyst data present simply means "
+    "none was found within the lookup window; don't treat that as proof no "
+    "catalyst exists, but don't invent one either.\n\n"
+    "That's about whether a release falling somewhere INSIDE the new "
+    "leg's DTE window disqualifies a roll candidate — a separate, "
+    "narrower question is whether TODAY is a bad day to execute a roll "
+    "specifically because a major release lands imminently. If given, a "
+    "'Next major economic release' line states exactly how many days away "
+    "the nearest one is; treat 0 ('today') or 1 ('tomorrow') as real "
+    "grounds for caution on rolling today specifically (the weekly plan "
+    "sometimes states this explicitly, e.g. a rule against opening new "
+    "short-dated positions the day before a high-impact print, since "
+    "volatility can build into the announcement) — call it out by name if "
+    "it applies, don't require the trader to notice it themselves in the "
+    "raw calendar text. Use that day count exactly as given — 2 days away "
+    "is not 'the day before' and must not be described or reasoned about "
+    "as if it were; only 0 or 1 qualifies for this specific caution, and "
+    "2+ days goes back to being weighed as one factor among several in the "
+    "paragraph above, not treated as imminent. A real analysis had a "
+    "release 2 days out, called it 'precisely' the day-before scenario, "
+    "and recommended WAIT on that basis alone despite delta/DTE/yield/"
+    "liquidity all clearing — a second, independent advisor given the "
+    "identical facts and identical rule correctly read 2 as not 0-or-1 and "
+    "recommended proceeding. Since routine releases occur on a roughly "
+    "weekly cadence, rounding 2-3 days out into 'imminent' finds a "
+    "qualifying event almost every week and silently vetoes nearly "
+    "everything — exactly the outcome the paragraph above already warns "
+    "against.\n\n"
     "Important — whose positions are whose: the core strategy manuals and "
-    "the weekly plan/review may describe example or illustrative positions "
-    "(tickers, strikes, quantities) used to teach a rule — these belong to "
-    "the manuals' author or are hypothetical training material, NOT the "
-    "trader's actual holdings. The ONLY position that is real and belongs "
-    "to the trader you are advising is the one described in the 'live data "
-    "for one specific position' section below (starting 'Position: ...'). "
-    "Never state or imply that a ticker/position mentioned only in the "
-    "manuals or plan/review is something the trader currently owns, and "
-    "never pull strike/expiry/quantity specifics for the CURRENT position "
-    "from the manuals or plan/review — use only what the live position data "
-    "actually gives you.\n\n"
+    "the weekly plan/review are training data for METHODOLOGY ONLY — how "
+    "this trader thinks, what rules they apply, what a good decision looks "
+    "like. They are NEVER a source of fact about what positions currently "
+    "exist. Any specific position, ticker, strike, or quantity mentioned in "
+    "those documents — including ones that reference the SAME ticker you "
+    "are analyzing, or a DIFFERENT option type on it (e.g. the plan "
+    "discusses puts while you're analyzing a call) — is illustrative or "
+    "historical narrative, not live portfolio data, and must never be "
+    "treated as evidence the trader currently holds it. The ONLY position "
+    "that is real and belongs to the trader you are advising is the one "
+    "described in the 'live data for one specific position' section below "
+    "(starting 'Position: ...') — nothing else, regardless of what the "
+    "plan/review says or which ticker it names. Confirmed live: an "
+    "analysis cited the weekly plan's mention of 'SLV puts being assigned' "
+    "as relevant context for a covered-call decision on SLV — the trader "
+    "had no such puts; the plan was describing something else entirely, "
+    "and treating it as the trader's own position was a real, confusing "
+    "error, not a helpful cross-reference. This recurred in a worse form "
+    "in a different (unborn-decision) context, and the plan/review "
+    "documents' own context header — literally 'Current Management Plan "
+    "(Week N)' — makes the mistake easy to make: an analysis wrote a "
+    "section titled 'Weekly Management Plan Context' stating the plan "
+    "'shows [ticker] already owns' specific strikes/expiries that DID "
+    "appear verbatim in that week's plan CSV, so the citation itself was "
+    "accurate; the error was presenting a third-party newsletter's own "
+    "example/model-portfolio position (the plan/review source material is "
+    "excerpted from a subscription trading newsletter, run under a "
+    "different system than this trader's account) as if it were this "
+    "trader's own live position, simply because the document is headed "
+    "'Management Plan' and names the ticker under analysis. Never pull "
+    "strike/expiry/quantity specifics for the CURRENT position from the "
+    "manuals or plan/review either — use only what the live position data "
+    "actually gives you. Never write a section framing any strike/expiry/"
+    "quantity detail — real or not — as belonging to the trader if it "
+    "names the ticker under analysis and did not come from the live "
+    "position data given above; the plan/review's own positions are "
+    "someone else's, not this trader's, no matter how specific or verbatim "
+    "they read.\n\n"
     "Assignment mechanics — do not get this backwards: a short PUT is "
     "assigned if the underlying closes BELOW the strike at expiry; a short "
     "CALL is assigned if the underlying closes ABOVE the strike. Always check "
@@ -346,12 +413,14 @@ _SYSTEM_PROMPT = (
 
 _CANDIDATE_DELTA_RANGE = (0.10, 0.45)
 _CANDIDATE_DTE_RANGE = (14, 60)
-_CANDIDATE_MAX_ROWS = 60
+_CANDIDATE_MAX_PER_EXPIRY = 8  # per-expiry cap — see build_chain_candidates_text's docstring
+_CANDIDATE_MAX_ROWS = 150  # overall safety ceiling; the per-expiry cap above is the real limiter
 
 
 def build_chain_candidates_text(
     all_rows: list[dict], cur_type: str, current_expiry: str | None = None,
     next_earnings_date: str | None = None, ul_price: float | None = None,
+    next_biotech_catalyst_date: str | None = None,
 ) -> str | None:
     """
     Compact candidate-strike text from chain rows ALREADY fetched for the
@@ -387,6 +456,26 @@ def build_chain_candidates_text(
     check the system prompt asks for entirely, leaning on whatever data it
     did have (the event calendar) instead — same failure mode as the
     T-bill rate and liquidity gaps fixed earlier, just one layer further in.
+
+    next_biotech_catalyst_date, when given (the nearest upcoming clinical
+    trial catalyst date for a biotech ticker — see
+    get_biotech_catalyst_dates), adds a deterministic catalyst_clear column
+    mirroring earnings_clear exactly, same reasoning: a candidate whose
+    expiry falls before the catalyst date is CLEAR of it, one that extends
+    past it is THROUGH_CATALYST — a binary, underlying-moving event the
+    same way earnings is, just not on the earnings calendar at all.
+
+    Rows are capped PER EXPIRY (_CANDIDATE_MAX_PER_EXPIRY), not globally by a
+    single flat sort-then-slice — confirmed live on GLD: a flat sort by (dte
+    ascending, delta-closeness) followed by a global row cap meant the ~25
+    in-range strikes at the nearest (15 DTE) expiry alone filled the entire
+    cap, silently excluding every candidate at 36+ DTE even though they
+    existed in the chain and passed the delta/DTE filters — Claude then
+    correctly (given what it was shown) said no candidate cleared the 30-45
+    DTE sweet spot, when the real chain had several. High-strike-density
+    tickers (wide-price ETFs/stocks with $1-wide strikes) hit this every
+    time; capping per expiry instead guarantees every in-range expiration
+    gets a fair, representative slice.
     """
     import datetime
     today = datetime.date.today()
@@ -400,6 +489,10 @@ def build_chain_candidates_text(
         earnings_d = datetime.date.fromisoformat(next_earnings_date) if next_earnings_date else None
     except (TypeError, ValueError):
         earnings_d = None
+    try:
+        catalyst_d = datetime.date.fromisoformat(next_biotech_catalyst_date) if next_biotech_catalyst_date else None
+    except (TypeError, ValueError):
+        catalyst_d = None
 
     candidates = []
     for r in all_rows:
@@ -440,6 +533,9 @@ def build_chain_candidates_text(
         earnings_clear = ""
         if earnings_d:
             earnings_clear = "CLEAR" if exp < earnings_d else "THROUGH_EARNINGS"
+        catalyst_clear = ""
+        if catalyst_d:
+            catalyst_clear = "CLEAR" if exp < catalyst_d else "THROUGH_CATALYST"
         yield_pct = "unknown"
         if ul_price:
             try:
@@ -456,15 +552,30 @@ def build_chain_candidates_text(
             "open_interest": open_interest if open_interest not in (None, "") else "unknown",
             "direction": direction,
             "earnings_clear": earnings_clear,
+            "catalyst_clear": catalyst_clear,
             "yield_pct": yield_pct,
         })
     if not candidates:
         return None
 
+    # Cap per expiry (closest-to-0.30-delta first within each) before ever
+    # applying a global cap — see docstring for why a flat global cap alone
+    # silently starves longer-dated expiries on high-strike-density tickers.
+    by_expiry: dict[str, list[dict]] = {}
+    for c in candidates:
+        by_expiry.setdefault(c["expiry"], []).append(c)
+    capped: list[dict] = []
+    for _exp, rows in by_expiry.items():
+        rows.sort(key=lambda c: abs(c["delta"] - 0.30))
+        capped.extend(rows[:_CANDIDATE_MAX_PER_EXPIRY])
+    candidates = capped
+
     candidates.sort(key=lambda c: (c["dte"], abs(c["delta"] - 0.30)))
     header = "strike,expiry,dte,delta,mid_price,bid_ask_pct,open_interest"
     if earnings_d:
         header += ",earnings_clear"
+    if catalyst_d:
+        header += ",catalyst_clear"
     if ul_price:
         header += ",annualized_yield_pct"
     if current_expiry_d:
@@ -474,6 +585,8 @@ def build_chain_candidates_text(
         row = f"{c['strike']},{c['expiry']},{c['dte']},{c['delta']},{c['mid']},{c['bid_ask_pct']},{c['open_interest']}"
         if earnings_d:
             row += f",{c['earnings_clear']}"
+        if catalyst_d:
+            row += f",{c['catalyst_clear']}"
         if ul_price:
             row += f",{c['yield_pct']}"
         if current_expiry_d:
@@ -733,14 +846,80 @@ _UNBORN_SYSTEM_PROMPT = (
     "in isolation. Do not let the economic calendar alone drive a WAIT "
     "recommendation on a candidate that otherwise clears delta, DTE, yield, "
     "and liquidity — weigh it alongside those, not above them.\n\n"
+    "Biotech clinical trial catalysts — a SEPARATE check from the earnings "
+    "calendar above, and just as hard a rule when it applies: for a ticker "
+    "the position data flags as biotech, an upcoming clinical trial result "
+    "is a binary, underlying-moving event exactly like earnings, just not "
+    "on the earnings calendar at all. If a 'clinical trial catalyst' line "
+    "is present in the position data, treat opening a new position through "
+    "that date with the same seriousness as the earnings blackout — do not "
+    "let yield/premium alone justify SELL through it, and name the catalyst "
+    "explicitly in your reasoning rather than only discussing it if asked. "
+    "If a candidate list is given with a catalyst_clear column, use it "
+    "directly (CLEAR vs. THROUGH_CATALYST) the same way you already use "
+    "earnings_clear — do not compute your own days-until-catalyst "
+    "arithmetic. No catalyst data present simply means none was found "
+    "within the lookup window; don't treat that as proof no catalyst "
+    "exists, but don't invent one either.\n\n"
+    "That's about whether a release falling somewhere INSIDE the DTE "
+    "window disqualifies a candidate — a separate, narrower question is "
+    "whether TODAY is a bad day to open a brand new position specifically "
+    "because a major release lands imminently. If given, a 'Next major "
+    "economic release' line states exactly how many days away the nearest "
+    "one is; treat 0 ('today') or 1 ('tomorrow') as real grounds for "
+    "caution on opening today specifically (the weekly plan sometimes "
+    "states this explicitly, e.g. a rule against opening new short-dated "
+    "positions the day before a high-impact print, since volatility can "
+    "build into the announcement) — call it out by name if it applies, "
+    "don't require the trader to notice it themselves in the raw "
+    "calendar text. Use that day count exactly as given — 2 days away is "
+    "not 'the day before' and must not be described or reasoned about as "
+    "if it were; only 0 or 1 qualifies for this specific caution, and 2+ "
+    "days goes back to being weighed as one factor among several in the "
+    "paragraph above, not treated as imminent. A real analysis had a "
+    "release 2 days out, called it 'precisely' the day-before scenario, "
+    "and recommended WAIT on that basis alone despite delta/DTE/yield/"
+    "liquidity all clearing — a second, independent advisor given the "
+    "identical facts and identical rule correctly read 2 as not 0-or-1 and "
+    "recommended SELL. Since routine releases occur on a roughly weekly "
+    "cadence, rounding 2-3 days out into 'imminent' finds a qualifying "
+    "event almost every week and silently vetoes nearly everything — "
+    "exactly the outcome the paragraph above already warns against.\n\n"
     "Important — whose positions are whose: the core strategy manuals and "
-    "the weekly plan/review may describe example or illustrative positions "
-    "(tickers, strikes, quantities) used to teach a rule — these belong to "
-    "the manuals' author or are hypothetical training material, NOT the "
-    "trader's actual holdings. The trader has NO existing position on this "
-    "ticker (that is the whole premise of this SELL/WAIT decision) — never "
-    "state or imply the trader currently owns a position on this ticker, or "
-    "on any other ticker mentioned only in the manuals or plan/review.\n\n"
+    "the weekly plan/review are training data for METHODOLOGY ONLY — how "
+    "this trader thinks, what rules they apply, what a good decision looks "
+    "like. They are NEVER a source of fact about what positions currently "
+    "exist. Any specific position, ticker, strike, or quantity mentioned in "
+    "those documents — including ones that reference the SAME ticker you "
+    "are analyzing, or a DIFFERENT option type on it (e.g. the plan "
+    "discusses puts while you're deciding on a call) — is illustrative or "
+    "historical narrative, not live portfolio data, and must never be "
+    "treated as evidence the trader currently holds it. The trader has NO "
+    "existing position on this ticker (that is the whole premise of this "
+    "SELL/WAIT decision) — never state or imply otherwise, regardless of "
+    "what the plan/review says or which ticker it names. Confirmed live: "
+    "an analysis cited the weekly plan's mention of 'SLV puts being "
+    "assigned' as relevant context for a covered-call decision on SLV — "
+    "the trader had no such puts; the plan was describing something else "
+    "entirely, and treating it as the trader's own position was a real, "
+    "confusing error, not a helpful cross-reference. This recurred in a "
+    "worse form, and the plan/review documents' own context header — "
+    "literally 'Current Management Plan (Week N)' — makes the mistake easy "
+    "to make: a later SLV analysis wrote a section titled 'Weekly "
+    "Management Plan Context' stating the plan 'shows SLV already owns a "
+    "$65P (08-21) and a $57P (10-16)' — those exact strikes/expiries DO "
+    "appear verbatim in that week's plan CSV, so the citation itself was "
+    "accurate; the error was presenting a third-party newsletter's own "
+    "example/model-portfolio position (the plan/review source material is "
+    "excerpted from a subscription trading newsletter, run under a "
+    "different system than this trader's account) as if it were this "
+    "trader's own live position, simply because the document is headed "
+    "'Management Plan' and names the ticker under analysis. Never write a "
+    "section that frames any position detail (strike, expiry, quantity) — "
+    "real or not — as belonging to the trader if it names the ticker under "
+    "analysis and did not come from the live position/context data given "
+    "above; the plan/review's own positions are someone else's, not this "
+    "trader's, no matter how specific or verbatim they read.\n\n"
     "The T-Bill hurdle and liquidity checks ARE answerable from the data "
     "you were given, not just abstract criteria — the position data includes "
     "the actual current 13-week T-Bill yield to compare premium yield "
@@ -823,14 +1002,118 @@ def _key_dates_lines(key_dates: dict | None) -> list[str]:
     same distinction the dashboard UI already shows the user."""
     if not key_dates:
         return ["Next earnings date: unknown", "Next ex-dividend date: unknown"]
-    e_date = key_dates.get("earnings_date", "Unknown")
-    e_src  = key_dates.get("earnings_source", "unknown")
     x_date = key_dates.get("exdiv_date", "Unknown")
     x_src  = key_dates.get("exdiv_source", "unknown")
-    return [
-        f"Next earnings date: {e_date} ({e_src})",
+    # An ETF has no earnings calendar at all — that's categorically
+    # different from a real data-fetch gap on a stock, and collapsing both
+    # into "Next earnings date: Unknown (unknown)" reads as an open
+    # uncertainty worth flagging. Confirmed live: Luna's SLV (an ETF)
+    # analysis treated the unknown earnings date as a data gap worth
+    # caveating in its answer, rather than recognizing the earnings check
+    # simply doesn't apply to this ticker.
+    if key_dates.get("is_etf"):
+        earnings_line = "Next earnings date: N/A — this is an ETF, it has no earnings calendar; the earnings-blackout rule does not apply here."
+    else:
+        e_date = key_dates.get("earnings_date", "Unknown")
+        e_src  = key_dates.get("earnings_source", "unknown")
+        earnings_line = f"Next earnings date: {e_date} ({e_src})"
+    lines = [
+        earnings_line,
         f"Next ex-dividend date: {x_date} ({x_src})",
     ]
+    # Biotech clinical-trial catalysts — a binary risk event with nothing to
+    # do with the earnings calendar above, so it needs its own line(s) or it
+    # never reaches the model at all. Only present when
+    # get_biotech_catalyst_dates() found something within its window; date
+    # precision/type (day vs. month-only, estimated vs. actual) is passed
+    # through raw rather than smoothed over, same reasoning as the
+    # confirmed/estimated distinction on earnings above.
+    catalysts = key_dates.get("biotech_catalysts") or []
+    if catalysts:
+        lines.append(f"Upcoming clinical trial catalyst(s) (biotech — binary event risk, next ~6 months):")
+        for c in catalysts:
+            prec_note = "" if c.get("date_precision") == "day" else f", {c['date_precision']}-precision only"
+            lines.append(
+                f"  - {c['date']} ({c.get('date_type', 'UNKNOWN').lower()}{prec_note}): "
+                f"{c.get('phase', 'N/A')} trial, {c.get('status', 'UNKNOWN').replace('_', ' ').title()} "
+                f"— \"{c.get('title', '')}\" (NCT{str(c.get('nct_id', '')).lstrip('NCT')})"
+            )
+    return lines
+
+
+_MAJOR_RELEASE_NAMES = (
+    "Employment Situation", "Consumer Price Index", "Producer Price Index",
+    "FOMC", "Federal Open Market Committee", "Gross Domestic Product",
+    "Personal Income and the PCE Deflator", "ISM Manufacturing", "ISM Non-Manufacturing",
+)
+
+
+def _next_major_release_note() -> str:
+    """
+    Deterministic "how many days until the next major, market-moving
+    economic release" callout — computed here rather than left for the
+    LLM to notice inside the raw NY Fed calendar page dump.
+
+    Confirmed live: that raw calendar text lists every single release for
+    the whole month (Employment Situation buried among things like "SCE
+    Labor Market Survey"), with no "today" anchor and no emphasis — Luna's
+    GLD analysis correctly treated the calendar as "awareness, not veto"
+    per this system prompt's own instruction, but never flagged that
+    tomorrow specifically is Nonfarm Payrolls day, something NotebookLM's
+    retrieval-based approach caught easily by comparison. The manuals'
+    weekly plan sometimes calls out day-of-week entry rules tied to this
+    (e.g. "don't open new short-dated positions the day before a major
+    print") — this makes the underlying fact impossible to miss regardless
+    of whether the LLM weights the right paragraph of a large document.
+
+    Best-effort: returns "" (never raises) if the calendar page's format
+    doesn't parse as expected, since this is a nice-to-have callout, not a
+    number the LLM has no other way to get (the raw calendar text is still
+    included separately either way).
+    """
+    import datetime
+    import re
+    try:
+        fed_text = _fed_calendar_text()
+        today = datetime.date.today()
+        sections = re.split(r'\[(This month|Next month)\]', fed_text)
+        candidates: list[tuple[datetime.date, str]] = []
+        for i in range(1, len(sections), 2):
+            label = sections[i]
+            body = sections[i + 1] if i + 1 < len(sections) else ""
+            if label == "This month":
+                year, month = today.year, today.month
+            else:
+                nm = (today.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+                year, month = nm.year, nm.month
+            parts = re.split(r'\n(\d{1,2})\n', "\n" + body)
+            for j in range(1, len(parts), 2):
+                try:
+                    day_num = int(parts[j])
+                except ValueError:
+                    continue
+                if not (1 <= day_num <= 31):
+                    continue
+                try:
+                    d = datetime.date(year, month, day_num)
+                except ValueError:
+                    continue
+                if d < today:
+                    continue
+                chunk = parts[j + 1] if j + 1 < len(parts) else ""
+                for name in _MAJOR_RELEASE_NAMES:
+                    if name.lower() in chunk.lower():
+                        candidates.append((d, name))
+                        break
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda c: c[0])
+        nearest_date, nearest_name = candidates[0]
+        days_until = (nearest_date - today).days
+        when = "today" if days_until == 0 else "tomorrow" if days_until == 1 else f"in {days_until} days"
+        return f"Next major economic release: {nearest_name} on {nearest_date.isoformat()} ({when})."
+    except Exception:
+        return ""
 
 
 def _earnings_coverage_note(expiry: str | None, key_dates: dict | None) -> str:
@@ -866,6 +1149,51 @@ def _earnings_coverage_note(expiry: str | None, key_dates: dict | None) -> str:
             f"rolling to another expiry that is also on or after {e_date}."
         )
     return f"Note: the current position's expiry ({expiry}) is BEFORE the next earnings date ({e_date}) — it does not currently hold through earnings."
+
+
+def _biotech_catalyst_coverage_note(expiry: str | None, key_dates: dict | None) -> str:
+    """
+    Deterministic check, same reasoning as _earnings_coverage_note but for
+    clinical-trial catalysts — a binary event that can move a biotech
+    underlying sharply and has nothing to do with the earnings calendar, so
+    it needs its own explicit date-window comparison rather than trusting
+    the model to notice a catalyst date buried in the key-dates block and
+    correctly compare it against the position's expiry.
+    """
+    import datetime
+    if not expiry or not key_dates:
+        return ""
+    catalysts = key_dates.get("biotech_catalysts") or []
+    if not catalysts:
+        return ""
+    try:
+        expiry_d = datetime.date.fromisoformat(expiry)
+    except (TypeError, ValueError):
+        return ""
+    in_window = [c for c in catalysts if _safe_iso_date(c.get("date")) and
+                 datetime.date.today() <= _safe_iso_date(c.get("date")) <= expiry_d]
+    if not in_window:
+        return ""
+    nearest = min(in_window, key=lambda c: c["date"])
+    return (
+        f"IMPORTANT — clinical trial catalyst inside this option's window: "
+        f"a {nearest.get('phase', 'N/A')} trial ({nearest.get('date_type', 'unknown').lower()} "
+        f"readout ~{nearest['date']}, before this position's {expiry} expiry) is expected to "
+        f"report during the life of this option — \"{nearest.get('title', '')}\" "
+        f"(NCT{str(nearest.get('nct_id', '')).lstrip('NCT')}). Clinical trial results are a binary, "
+        f"underlying-moving event for a biotech, the same category of risk as an earnings "
+        f"announcement — treat holding through it with the same seriousness as the earnings-blackout "
+        f"rule: do not treat premium/yield alone as justification for holding through it, and call this "
+        f"out explicitly in your recommendation rather than letting it pass unmentioned."
+    )
+
+
+def _safe_iso_date(s):
+    import datetime
+    try:
+        return datetime.date.fromisoformat(str(s))
+    except (TypeError, ValueError):
+        return None
 
 
 def _cost_basis_line(is_call: bool, ul_cost_basis: float | None) -> str:
@@ -904,6 +1232,7 @@ def build_unborn_context(ticker: str, strat: str, ul_price: float | None,
         return "unknown" if v is None else f"{v:.{digits}f}"
 
     strategy = "Covered Call (CC)" if strat == "CC" else "Cash-Secured Put (CSP)"
+    release_note = _next_major_release_note()
     lines = [
         f"Today's date: {datetime.date.today().isoformat()} ({datetime.date.today().strftime('%A')})",
         f"Current time: {datetime.datetime.now().strftime('%-I:%M %p ET')}",
@@ -917,6 +1246,7 @@ def build_unborn_context(ticker: str, strat: str, ul_price: float | None,
         f"14-day ATR: {_fmt(atr)}"
         + (f"  (1.5x ATR buffer: {atr * 1.5:.2f})" if atr else ""),
         *_key_dates_lines(key_dates),
+        *([release_note] if release_note else []),
         "No existing option position on this ticker — this is a decision to open one, not manage one.",
     ]
     return "\n".join(lines)
@@ -974,6 +1304,8 @@ def build_position_context(pos: dict, vix: float | None, key_dates: dict | None 
         + (f"  (1.5x ATR buffer: {buffer_:.2f})" if buffer_ else ""),
         *_key_dates_lines(key_dates),
         _earnings_coverage_note(pos.get("expiry"), key_dates),
+        _biotech_catalyst_coverage_note(pos.get("expiry"), key_dates),
+        _next_major_release_note(),
         f"Current option price: {_fmt(pos.get('current_price'), 2)}",
         f"Average entry price (this leg): {_fmt(pos.get('avg_price'), 2)}",
         f"P&L on this leg: {_fmt(pos.get('pct_pnl'), 1)}%",
