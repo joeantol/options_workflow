@@ -31,6 +31,7 @@ OPTIONS_DIR = Path("/Users/joeandbabs/work/retirement/options")
 _CORE_CACHE_FILE = Path(__file__).parent / ".core_docs_cache.json"
 _WEEKLY_CACHE_FILE = Path(__file__).parent / ".weekly_docs_cache.json"
 _FED_CACHE_FILE = Path(__file__).parent / ".fed_calendar_cache.json"
+_WEEKLY_WINDOWS_CACHE_FILE = Path(__file__).parent / ".weekly_windows_cache.json"
 
 # Same URL source already uploaded to the NotebookLM notebook (verified via
 # the notebooklm client's sources.list()) — mirrored here rather than picking
@@ -298,6 +299,61 @@ _SYSTEM_PROMPT = (
     "qualifying event almost every week and silently vetoes nearly "
     "everything — exactly the outcome the paragraph above already warns "
     "against.\n\n"
+    "The CURRENT week's plan's own specific guidance about this release "
+    "OVERRIDES the generic 0-or-1-day rule above, when it has any — it "
+    "does not just supplement that rule as one more thing to mention "
+    "alongside the caution. The weekly plan is often written with that "
+    "exact release already in mind — naming which specific days are clean "
+    "to trade and which exact time a post-release window opens (e.g. "
+    "'Tuesday and Wednesday are clean days, Thursday is clean after "
+    "10am'). If the plan explicitly clears TODAY (or the specific window "
+    "you're evaluating), that is the trader's own current, deliberate "
+    "call on this exact event — already made with the release's timing in "
+    "mind — and it stands even when the release itself is 0 or 1 days "
+    "away. Do not apply the 0-or-1-day caution on top of an explicit "
+    "clearance; check for the plan's specific day-by-day guidance FIRST, "
+    "and only fall back to the generic 0-or-1-day rule when the plan is "
+    "silent on the specific day/window in question. A trader reported "
+    "exactly this failure: PPI landing the next day correctly triggered "
+    "the 0-or-1-day rule, but the current week's plan explicitly named "
+    "today as a clean trading day regardless — the analysis flagged the "
+    "release as a reason not to trade anyway, never checking whether the "
+    "plan had already cleared today specifically.\n\n"
+    "When you do find the plan's own window language, verify TODAY's "
+    "actual weekday and time (both given above) against the window's "
+    "stated boundary before concluding you're inside or outside it — "
+    "don't just note which weekday the window names and assume today "
+    "doesn't qualify. 'Two clean days, anything not placed by Wednesday's "
+    "close belongs in the Thursday window' means ALL of Wednesday up to "
+    "market close is inside the clean window, not just Wednesday morning "
+    "or 'before some point today' — if today's date/weekday is Wednesday "
+    "and the current time is before market close, you are inside that "
+    "window, full stop. A trader reported exactly this second-order "
+    "failure: an analysis correctly located and quoted the plan's 'until "
+    "Wednesday's close' language, then in the very next sentence "
+    "concluded today (Wednesday, mid-morning) was 'already past' that "
+    "same window — a direct contradiction of the sentence it had just "
+    "cited. Quoting the right text is not the same as checking it "
+    "against today's actual date and time.\n\n"
+    "Correctly concluding you ARE inside the plan's clean window is the "
+    "end of the PPI-timing question, not a new starting point for "
+    "re-litigating it with generic caution. Do not follow up an 'inside "
+    "the window' conclusion with reasoning like 'but it's still only N "
+    "hours until the release, so the position is vulnerable to overnight "
+    "repricing' or 'don't open new positions hours before a major "
+    "release' — that IS the generic 0-or-1-day caution in different "
+    "words, and the plan's explicit clearance already accounted for "
+    "exactly that timing when it named this window as clean. A trader "
+    "reported exactly this third-order failure: an analysis correctly "
+    "found the plan's window language, correctly verified today's "
+    "date/time placed it inside that window, then still recommended WAIT "
+    "by falling back to 'less than 7 hours until close, vulnerable to "
+    "PPI repricing overnight, don't open positions hours before a major "
+    "economic release' — silently overriding the plan's clearance with "
+    "the very generic rule it was supposed to supersede. If the plan "
+    "clears the window, the release-timing question is closed; WAIT must "
+    "rest on some OTHER factor (liquidity, spread, delta/DTE fit) if one "
+    "exists, not on the release itself.\n\n"
     "Important — whose positions are whose: the core strategy manuals and "
     "the weekly plan/review are training data for METHODOLOGY ONLY — how "
     "this trader thinks, what rules they apply, what a good decision looks "
@@ -336,7 +392,16 @@ _SYSTEM_PROMPT = (
     "names the ticker under analysis and did not come from the live "
     "position data given above; the plan/review's own positions are "
     "someone else's, not this trader's, no matter how specific or verbatim "
-    "they read.\n\n"
+    "they read. This recurred in a worse, cross-ticker form: a GLD analysis "
+    "quoted a PLTR row from the Week 35 plan CSV verbatim under a heading "
+    "reading 'From the Week 35 Management Plan (your current positions)', "
+    "calling it 'your exact situation' — the trader holds no PLTR position "
+    "at all, and the ticker under analysis was GLD, not PLTR. Never use the "
+    "phrase 'your current position(s)' or any other ownership framing when "
+    "referencing plan/review content, regardless of which ticker the row "
+    "names. If you quote or paraphrase a plan/review row for illustration, "
+    "label it explicitly as the newsletter's own example — never as "
+    "belonging to the trader.\n\n"
     "Assignment mechanics — do not get this backwards: a short PUT is "
     "assigned if the underlying closes BELOW the strike at expiry; a short "
     "CALL is assigned if the underlying closes ABOVE the strike. Always check "
@@ -347,6 +412,19 @@ _SYSTEM_PROMPT = (
     "language. A real analysis said assignment would happen 'this Friday' "
     "for a position that didn't expire for another 58 days; that kind of "
     "answer is actively dangerous, not just imprecise.\n\n"
+    "Moneyness terminology — a 'Moneyness:' line in the position data "
+    "already tells you IN THE MONEY, OUT OF THE MONEY, or AT THE MONEY, "
+    "computed directly from the underlying vs. strike. Use that label "
+    "verbatim; do not independently derive or restate ITM/OTM/ATM from the "
+    "underlying/strike numbers yourself, and do not let delta or how small "
+    "the percentage cushion looks override it — a position can have high "
+    "delta and still be out of the money. Confirmed live: even WITH the "
+    "correct numbers in view and an explicit stated rule for deriving "
+    "moneyness, an analysis still described a short call as 'in the money' "
+    "while its own cited numbers (underlying $411.46 vs. $420 strike) "
+    "showed the opposite — this is exactly the kind of directional error "
+    "free-text reasoning gets wrong even when told the rule, which is why "
+    "the label is now computed for you instead of left for you to derive.\n\n"
     "Do not compute your own PnL, premium, or yield figures — treat every "
     "number given in the position data as authoritative; if you reference a "
     "number, use one that was given to you. If you recommend ROLL and a "
@@ -680,7 +758,23 @@ def _post_to_claude(api_key: str, system_prompt: str, messages: list) -> "reques
         if resp.status_code >= 500 and attempt < len(_RETRY_BACKOFF):
             time.sleep(_RETRY_BACKOFF[attempt])
             continue
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # requests' own raise_for_status() message is just "400 Client
+            # Error: Bad Request for url: ..." — no indication of WHY, which
+            # is exactly what showed up as a dead-end error to the trader
+            # (confirmed live: a USAR follow-up question surfaced only that
+            # generic line with no way to diagnose it further). Anthropic's
+            # error body always names the actual problem (e.g. a malformed
+            # content block, an over-length prompt) — surface it instead of
+            # discarding it.
+            try:
+                detail = resp.json().get("error", {}).get("message") or resp.text[:500]
+            except Exception:
+                detail = resp.text[:500]
+            raise requests.exceptions.HTTPError(
+                f"{resp.status_code} {resp.reason} for url: {resp.url} — {detail}",
+                response=resp,
+            )
         return resp
     raise last_exc
 
@@ -885,6 +979,61 @@ _UNBORN_SYSTEM_PROMPT = (
     "cadence, rounding 2-3 days out into 'imminent' finds a qualifying "
     "event almost every week and silently vetoes nearly everything — "
     "exactly the outcome the paragraph above already warns against.\n\n"
+    "The CURRENT week's plan's own specific guidance about this release "
+    "OVERRIDES the generic 0-or-1-day rule above, when it has any — it "
+    "does not just supplement that rule as one more thing to mention "
+    "alongside the caution. The weekly plan is often written with that "
+    "exact release already in mind — naming which specific days are clean "
+    "to trade and which exact time a post-release window opens (e.g. "
+    "'Tuesday and Wednesday are clean days, Thursday is clean after "
+    "10am'). If the plan explicitly clears TODAY (or the specific window "
+    "you're evaluating), that is the trader's own current, deliberate "
+    "call on this exact event — already made with the release's timing in "
+    "mind — and it stands even when the release itself is 0 or 1 days "
+    "away. Do not apply the 0-or-1-day caution on top of an explicit "
+    "clearance; check for the plan's specific day-by-day guidance FIRST, "
+    "and only fall back to the generic 0-or-1-day rule when the plan is "
+    "silent on the specific day/window in question. A trader reported "
+    "exactly this failure: PPI landing the next day correctly triggered "
+    "the 0-or-1-day rule, but the current week's plan explicitly named "
+    "today as a clean trading day regardless — the analysis flagged the "
+    "release as a reason not to trade anyway, never checking whether the "
+    "plan had already cleared today specifically.\n\n"
+    "When you do find the plan's own window language, verify TODAY's "
+    "actual weekday and time (both given above) against the window's "
+    "stated boundary before concluding you're inside or outside it — "
+    "don't just note which weekday the window names and assume today "
+    "doesn't qualify. 'Two clean days, anything not placed by Wednesday's "
+    "close belongs in the Thursday window' means ALL of Wednesday up to "
+    "market close is inside the clean window, not just Wednesday morning "
+    "or 'before some point today' — if today's date/weekday is Wednesday "
+    "and the current time is before market close, you are inside that "
+    "window, full stop. A trader reported exactly this second-order "
+    "failure: an analysis correctly located and quoted the plan's 'until "
+    "Wednesday's close' language, then in the very next sentence "
+    "concluded today (Wednesday, mid-morning) was 'already past' that "
+    "same window — a direct contradiction of the sentence it had just "
+    "cited. Quoting the right text is not the same as checking it "
+    "against today's actual date and time.\n\n"
+    "Correctly concluding you ARE inside the plan's clean window is the "
+    "end of the PPI-timing question, not a new starting point for "
+    "re-litigating it with generic caution. Do not follow up an 'inside "
+    "the window' conclusion with reasoning like 'but it's still only N "
+    "hours until the release, so the position is vulnerable to overnight "
+    "repricing' or 'don't open new positions hours before a major "
+    "release' — that IS the generic 0-or-1-day caution in different "
+    "words, and the plan's explicit clearance already accounted for "
+    "exactly that timing when it named this window as clean. A trader "
+    "reported exactly this third-order failure: an analysis correctly "
+    "found the plan's window language, correctly verified today's "
+    "date/time placed it inside that window, then still recommended WAIT "
+    "by falling back to 'less than 7 hours until close, vulnerable to "
+    "PPI repricing overnight, don't open positions hours before a major "
+    "economic release' — silently overriding the plan's clearance with "
+    "the very generic rule it was supposed to supersede. If the plan "
+    "clears the window, the release-timing question is closed; WAIT must "
+    "rest on some OTHER factor (liquidity, spread, delta/DTE fit) if one "
+    "exists, not on the release itself.\n\n"
     "Important — whose positions are whose: the core strategy manuals and "
     "the weekly plan/review are training data for METHODOLOGY ONLY — how "
     "this trader thinks, what rules they apply, what a good decision looks "
@@ -919,7 +1068,17 @@ _UNBORN_SYSTEM_PROMPT = (
     "real or not — as belonging to the trader if it names the ticker under "
     "analysis and did not come from the live position/context data given "
     "above; the plan/review's own positions are someone else's, not this "
-    "trader's, no matter how specific or verbatim they read.\n\n"
+    "trader's, no matter how specific or verbatim they read. This recurred "
+    "in a worse, cross-ticker form: a GLD analysis quoted a PLTR row from "
+    "the Week 35 plan CSV verbatim under a heading reading 'From the Week "
+    "35 Management Plan (your current positions)', calling it 'your exact "
+    "situation' — the trader holds no PLTR position at all, and the ticker "
+    "under analysis was GLD, not PLTR. Never use the phrase 'your current "
+    "position(s)' or any other ownership framing when referencing plan/"
+    "review content, regardless of which ticker the row names. If you "
+    "quote or paraphrase a plan/review row for illustration, label it "
+    "explicitly as the newsletter's own example — never as belonging to "
+    "the trader.\n\n"
     "The T-Bill hurdle and liquidity checks ARE answerable from the data "
     "you were given, not just abstract criteria — the position data includes "
     "the actual current 13-week T-Bill yield to compare premium yield "
@@ -1086,7 +1245,16 @@ def _next_major_release_note() -> str:
             else:
                 nm = (today.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
                 year, month = nm.year, nm.month
-            parts = re.split(r'\n(\d{1,2})\n', "\n" + body)
+            # Lookahead on the trailing newline (not consuming it) rather
+            # than a plain \n(\d{1,2})\n split — confirmed live: a day with
+            # NO events (e.g. day 9) is followed immediately by the next
+            # day's own bare number line ("...\n09\n10\nInitial Claims...").
+            # A consuming split matches "\n09\n" first, using up the very
+            # newline "\n10\n" would need as its own leading boundary, so
+            # "10" and everything after it silently merges into day 9's
+            # chunk instead of starting its own — PPI (actually on the
+            # 10th) got reported a day early as a result.
+            parts = re.split(r'\n(\d{1,2})(?=\n)', "\n" + body)
             for j in range(1, len(parts), 2):
                 try:
                     day_num = int(parts[j])
@@ -1112,6 +1280,101 @@ def _next_major_release_note() -> str:
         days_until = (nearest_date - today).days
         when = "today" if days_until == 0 else "tomorrow" if days_until == 1 else f"in {days_until} days"
         return f"Next major economic release: {nearest_name} on {nearest_date.isoformat()} ({when})."
+    except Exception:
+        return ""
+
+
+_WEEKLY_WINDOW_HEADER_PAT = re.compile(
+    r'(Monday|Tuesday|Wednesday|Thursday|Friday) from [^\n:]{0,40}:', re.IGNORECASE
+)
+_WEEKLY_CANDIDATE_LINE_PAT = re.compile(
+    r'^[A-Z]{1,6}\s*\$[\d.]+[CP]\s*\[|^(Aggressive|Balanced|Conservative)\s*[—-]'
+)
+
+
+def _weekly_calendar_windows_note() -> str:
+    """
+    Verbatim excerpt of the current week's PLAN PDF's own day-by-day
+    trading-window guidance (e.g. "Two clean days is the whole opportunity
+    here... Thursday from 10:00 AM: After the Wholesale Inflation
+    Number...") — surfaced as its own deterministic block rather than left
+    for the LLM to notice inside the full weekly plan.
+
+    Confirmed live: a trader reported the models citing only the core
+    manuals' generic "be aware of routine releases" framing for an
+    upcoming PPI print, never mentioning that the CURRENT week's own plan
+    explicitly named which days/windows were already clear to trade
+    around that exact release. Root cause was more fundamental than a
+    retrieval/attention issue: _weekly_docs_text() prefers the PLAN CSV
+    over the PDF whenever a CSV exists (cheaper — see its own docstring),
+    and the CSV is a pure position-management table with none of this
+    calendar-timing narrative at all — that commentary only exists in the
+    PDF's prose, in a section usually titled "Where the Premium Is This
+    Week" and broken into "{Weekday} from {time}: ..." sub-sections. This
+    runs independently of _weekly_docs_text's own CSV/PDF choice
+    specifically so that narrative is never silently dropped just because
+    a CSV happens to exist this week.
+
+    Candidate-strike lines (the newsletter's own specific ticker picks —
+    e.g. "AMAT $470C [2026-09-18] (11 DTE, Δ +0.39, 84.3% ann.)...") are
+    stripped out: they're a different kind of content (illustrative
+    example positions, already covered by the "training data for
+    METHODOLOGY ONLY" instruction elsewhere in this prompt) that would
+    otherwise bloat this excerpt without adding timing information.
+
+    Best-effort: returns "" (never raises, never re-extracts more than
+    once per day) if no plan PDF is found or its text doesn't contain the
+    "{Weekday} from {time}:" section format this newsletter normally uses
+    — the calendar page and full weekly docs text are still included
+    separately either way, so this is a nice-to-have surfacing aid, not
+    the only path to this information.
+    """
+    import datetime
+    try:
+        today = datetime.date.today().isoformat()
+        cached: dict = {}
+        if _WEEKLY_WINDOWS_CACHE_FILE.exists():
+            try:
+                cached = json.loads(_WEEKLY_WINDOWS_CACHE_FILE.read_text())
+            except (json.JSONDecodeError, OSError):
+                cached = {}
+        files = _current_week_files()
+        plan_pdf = files.get("PLAN_pdf")
+        plan_week = _week_num_of(plan_pdf) if plan_pdf else None
+        cache_key = f"{today}_plan{plan_week}"
+        if cached.get("_key") == cache_key:
+            return cached.get("text", "")
+
+        result = ""
+        if plan_pdf:
+            text = _extract_pdf_text(plan_pdf)
+            start_marker = re.search(r'Where the Premium Is This Week', text, re.IGNORECASE)
+            first_header = _WEEKLY_WINDOW_HEADER_PAT.search(text)
+            if start_marker or first_header:
+                start_pos = start_marker.start() if start_marker else max(0, first_header.start() - 100)
+                end_marker = re.search(r'Three Rules for This Week|Rules for This Week', text)
+                end_pos = end_marker.start() if end_marker and end_marker.start() > start_pos else min(len(text), start_pos + 6000)
+                block = text[start_pos:end_pos]
+                kept = [
+                    line for line in block.split("\n")
+                    if not _WEEKLY_CANDIDATE_LINE_PAT.match(line.strip())
+                ]
+                filtered = "\n".join(kept)
+                filtered = re.sub(r'[ \t]+', ' ', filtered)
+                filtered = re.sub(r'\n{2,}', '\n', filtered).strip()
+                if filtered:
+                    result = (
+                        "This week's plan's own day-by-day trading-window guidance "
+                        "(verbatim excerpt — use this directly for entry timing "
+                        "rather than generic core-manual reasoning about the "
+                        "calendar, per the instruction above):\n" + filtered
+                    )
+
+        try:
+            _WEEKLY_WINDOWS_CACHE_FILE.write_text(json.dumps({"_key": cache_key, "text": result}))
+        except OSError:
+            pass
+        return result
     except Exception:
         return ""
 
@@ -1196,6 +1459,38 @@ def _safe_iso_date(s):
         return None
 
 
+def _moneyness_line(underlying: float | None, strike: float | None, option_type: str | None) -> str:
+    """
+    Deterministic ITM/OTM/ATM label, computed here rather than left for the
+    model to derive from the raw underlying/strike numbers — confirmed
+    live: even with an explicit system-prompt rule stating the correct
+    direction ("short CALL: ITM means underlying ABOVE strike") and the
+    correct numbers right in front of it, an analysis still described a
+    short GLD call as "in the money by $8.54" while underlying ($411.46)
+    sat BELOW strike ($420.00) — i.e. actually out of the money by that
+    same $8.54. Same lesson as earnings_clear/roll_direction_vs_current/
+    catalyst_clear: a precomputed label the model is told to use verbatim
+    is far more reliable than trusting free-text reasoning over correct
+    inputs, even when the reasoning rule itself is stated explicitly.
+    """
+    if underlying is None or strike is None:
+        return "Moneyness: unknown (missing underlying or strike price)."
+    is_call = str(option_type or "").lower() == "call"
+    diff = (underlying - strike) if is_call else (strike - underlying)
+    pct = abs(diff) / strike * 100 if strike else 0.0
+    if diff > 0:
+        state = "IN THE MONEY"
+    elif diff < 0:
+        state = "OUT OF THE MONEY"
+    else:
+        state = "AT THE MONEY"
+    return (
+        f"Moneyness: {state} by ${abs(diff):.2f} ({pct:.1f}%) — underlying "
+        f"${underlying:.2f} vs. strike ${strike:.2f}. Use this label "
+        f"directly; do not independently assert ITM/OTM/ATM."
+    )
+
+
 def _cost_basis_line(is_call: bool, ul_cost_basis: float | None) -> str:
     """
     Cost basis matters only for calls (covered-call strikes should sit at or
@@ -1233,6 +1528,7 @@ def build_unborn_context(ticker: str, strat: str, ul_price: float | None,
 
     strategy = "Covered Call (CC)" if strat == "CC" else "Cash-Secured Put (CSP)"
     release_note = _next_major_release_note()
+    windows_note = _weekly_calendar_windows_note()
     lines = [
         f"Today's date: {datetime.date.today().isoformat()} ({datetime.date.today().strftime('%A')})",
         f"Current time: {datetime.datetime.now().strftime('%-I:%M %p ET')}",
@@ -1247,6 +1543,7 @@ def build_unborn_context(ticker: str, strat: str, ul_price: float | None,
         + (f"  (1.5x ATR buffer: {atr * 1.5:.2f})" if atr else ""),
         *_key_dates_lines(key_dates),
         *([release_note] if release_note else []),
+        *([windows_note] if windows_note else []),
         "No existing option position on this ticker — this is a decision to open one, not manage one.",
     ]
     return "\n".join(lines)
@@ -1299,6 +1596,7 @@ def build_position_context(pos: dict, vix: float | None, key_dates: dict | None 
         f"to expect early assignment before then.",
         f"Days to expiration: {pos.get('dte')}",
         f"Underlying price: {_fmt(pos.get('underlying'), 2)}",
+        _moneyness_line(pos.get('underlying'), pos.get('strike'), pos.get('option_type')),
         _cost_basis_line(str(pos.get('option_type', '')).lower() == 'call', pos.get('ul_cost_basis')),
         f"14-day ATR: {_fmt(atr, 2)}"
         + (f"  (1.5x ATR buffer: {buffer_:.2f})" if buffer_ else ""),
@@ -1306,6 +1604,7 @@ def build_position_context(pos: dict, vix: float | None, key_dates: dict | None 
         _earnings_coverage_note(pos.get("expiry"), key_dates),
         _biotech_catalyst_coverage_note(pos.get("expiry"), key_dates),
         _next_major_release_note(),
+        _weekly_calendar_windows_note(),
         f"Current option price: {_fmt(pos.get('current_price'), 2)}",
         f"Average entry price (this leg): {_fmt(pos.get('avg_price'), 2)}",
         f"P&L on this leg: {_fmt(pos.get('pct_pnl'), 1)}%",

@@ -182,6 +182,24 @@ _NOTEBOOKLM_LOCK_TIMEOUT = 200  # seconds to wait for another analysis's NB call
 # ceiling in run_roll_for_position/run_unborn_for_ticker's callers.
 _NOTEBOOKLM_WORK_TIMEOUT = 380  # seconds cap on this analysis's own NB upload+query+delete
 
+# Max age before an orphaned {TICKER}.csv source is swept up by
+# _purge_stale_ticker_sources. Under the lock above, only one ticker's chain
+# CSV can legitimately be mid-flight at a time, so anything older than
+# _NOTEBOOKLM_LOCK_TIMEOUT + _NOTEBOOKLM_WORK_TIMEOUT (580s worst case) is
+# provably orphaned, not in-flight. Previously this was 1 day, which meant a
+# source whose post-query delete never ran (e.g. its background daemon
+# thread got killed mid-query by a dashboard restart — daemon threads have
+# no graceful shutdown, so the "finally: delete_notebooklm_source" cleanup
+# never executes) sat in the notebook accumulating for up to 24h before
+# being cleaned. Confirmed live: two dashboard restarts left HAL.csv,
+# SIL.csv, and SLB.csv orphaned; by the time the notebook held 25
+# accumulated sources, fresh chat.ask() calls on GLD/GDX/MO/BKR started
+# failing with a genuine server-side "too large" rejection, misdiagnosed
+# downstream as account rate limiting. 20 minutes gives ~2x margin over the
+# 580s worst case for clock skew/processing overhead while still self-healing
+# within one dashboard restart cycle instead of a full day.
+_STALE_TICKER_SOURCE_MAX_AGE = datetime.timedelta(minutes=20)
+
 
 def get_access_token(secret: str, validity_minutes: int = 60) -> str:
     import requests
@@ -2078,10 +2096,100 @@ def _pick_display_action(candidates: list[str | None], priority: list[str]) -> s
     return None
 
 
+def _test_trade_button_html(cached: dict, advisor: str, field_prefix: str = "") -> str:
+    """
+    "Enter Test Trade" button (or its already-entered/unavailable state) for
+    one advisor's own suggested roll on the analyze detail page.
+
+    advisor: "claude" | "openai" | "notebooklm" — passed through to the
+    page's enterTestRoll() JS call and used to key this advisor's own
+    already-entered tracking field, so entering one advisor's test trade
+    doesn't block entering another's for the same position (see
+    run_roll_for_position's three independent _project_roll_pnl calls,
+    one per advisor, each with its own field_prefix-namespaced sto_* keys
+    in the cache — "" for Claude, "openai_" for Luna, "notebooklm_" for NB).
+    """
+    done_key = "test_trade_new_position_id" if advisor == "claude" else f"{advisor}_test_trade_new_position_id"
+    slot_id  = "enter-test-roll-slot" if advisor == "claude" else f"enter-test-roll-slot-{advisor}"
+    can_test = (
+        cached.get("position_id") is not None
+        and cached.get("btc_chain_price") is not None
+        and cached.get(f"{field_prefix}sto_chain_price") is not None
+        and cached.get(f"{field_prefix}sto_strike") is not None
+        and cached.get(f"{field_prefix}sto_expiry") is not None
+        and cached.get(f"{field_prefix}sto_option_type") is not None
+    )
+    new_pos = cached.get(done_key)
+    if new_pos:
+        return (
+            f'<span id="{slot_id}" style="margin-left:10px;color:var(--ok);font-size:12px">'
+            f'&#10003; Test trade entered (journal position #{new_pos})</span>'
+        )
+    if can_test:
+        # advisor is always one of the three literal values this module
+        # calls this function with (see the docstring) — a plain quoted
+        # f-string is safe here without needing json.dumps (which, unlike
+        # elsewhere in this file, isn't imported at module scope reachable
+        # from this function — confirmed live: a bare NameError 500'd the
+        # whole BKR analyze page on the very first real click-through).
+        return (
+            f"""<span id="{slot_id}"><button onclick="enterTestRoll(this, '{advisor}')" """
+            'style="margin-left:10px;font-size:12px;padding:4px 10px;background:#6366f1;color:#fff;'
+            'border:none;border-radius:4px;cursor:pointer">Enter Test Trade</button></span>'
+        )
+    return f'<span id="{slot_id}"></span>'
+
+
+_NB_UPLOAD_MAX_PER_EXPIRY = 20  # generous vs. Claude/Luna's tighter 8 — NB gets no
+                                 # separate curated candidate table, so its own
+                                 # uploaded source needs more per expiry to work with.
+
+
+def _cap_csv_rows_for_upload(all_rows: list[dict], max_per_expiry: int = _NB_UPLOAD_MAX_PER_EXPIRY) -> list[dict]:
+    """
+    Cap the option-chain CSV uploaded to NotebookLM to at most
+    max_per_expiry rows per expiration date, closest to a 0.30 delta
+    target — the same per-expiry-capping pattern already proven for
+    Claude/Luna's own candidate table (claude_advisor.build_chain_
+    candidates_text's _CANDIDATE_MAX_PER_EXPIRY), now applied to the raw
+    file NB itself ingests. Confirmed live: GLD's full calls-only chain
+    (17 expirations within 90 days x 100-170 strikes each = 2,240 rows,
+    337KB) consistently got stuck in NotebookLM's own upload pipeline with
+    status=ERROR and Type=Unknown — NB's file-type/ingestion sniffer
+    apparently can't reliably classify a CSV this large, and every ERROR
+    poll during upload_to_notebooklm's wait_until_ready check reported it
+    as still ERROR rather than a transient hiccup that resolves. A typical
+    position's chain (e.g. ALM, 35 rows) uploads fine. Capping brings a
+    wide-strike-density ETF like GLD down to a few hundred rows while
+    keeping every expiration represented — the earlier calls-only-only fix
+    (query_notebooklm's tail_text trim, contract-type filtering) reduced
+    the PROMPT sent alongside the upload but never touched the uploaded
+    FILE's own row count, so it left this specific failure mode untouched.
+    """
+    if len(all_rows) <= max_per_expiry:
+        return all_rows
+    by_expiry: dict[str, list[dict]] = {}
+    for r in all_rows:
+        by_expiry.setdefault(r.get("expiration_date"), []).append(r)
+
+    def _delta_dist(row: dict) -> float:
+        try:
+            return abs(abs(float(row.get("delta") or 0)) - 0.30)
+        except (TypeError, ValueError):
+            return 999.0
+
+    capped: list[dict] = []
+    for _exp, rows in by_expiry.items():
+        rows.sort(key=_delta_dist)
+        capped.extend(rows[:max_per_expiry])
+    return capped
+
+
 async def _run_notebooklm_roll(
     ticker: str, notebook_id: str, key_dates: dict, vix: float | None,
     ul_cost_basis: float, open_positions: list[dict], chain: dict,
     current_leg_price: float | None, all_rows: list[dict],
+    tail_text: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Best-effort THIRD opinion for an EXISTING position (ROLL/HOLD/ASSIGNMENT
@@ -2114,7 +2222,7 @@ async def _run_notebooklm_roll(
             with open(output_file, "w", newline="") as tmp:
                 writer = csv.DictWriter(tmp, fieldnames=CSV_COLUMNS)
                 writer.writeheader()
-                writer.writerows(all_rows)
+                writer.writerows(_cap_csv_rows_for_upload(all_rows))
             source_id = None
             try:
                 source_id = await upload_to_notebooklm(output_file, notebook_id)
@@ -2132,6 +2240,7 @@ async def _run_notebooklm_roll(
                     ul_cost_basis=ul_cost_basis,
                     chain_data=chain,
                     current_leg_price=current_leg_price,
+                    tail_text=tail_text,
                 )
             finally:
                 await delete_notebooklm_source(notebook_id, source_id)
@@ -2158,6 +2267,170 @@ async def _run_notebooklm_roll(
         return None, None, str(exc)
     finally:
         _notebooklm_lock.release()
+
+
+def _project_roll_pnl(
+    advisor_text: str, adapted_rows: list[dict], cur_type: str, cur_expiry: str | None,
+    cur_strike: float | None, btc_chain_price: float | None, current_leg_price: float | None,
+    chain: dict, pos_qty: int, ticker: str,
+) -> dict:
+    """
+    Parse the STO leg an advisor recommended out of its own response text,
+    match it against the live chain snapshot, and deterministically compute
+    the full projected roll-chain PnL (BTC current leg, STO new leg, and
+    the eventual 60%-profit close of that new leg). Extracted out of
+    run_roll_for_position so the same hard PnL guard applied to Claude's
+    own ROLL recommendation can be run identically against Luna's — Luna
+    shares Claude's same raw "Net chain cash collected to date" context
+    line but was never subject to this deterministic override, so a
+    money-losing roll recommended by Luna alone could still win the main
+    dashboard's priority-pick badge even after Claude's own version of the
+    same mistake got caught and downgraded to HOLD.
+
+    Returns a dict with sto_chain_price/sto_chain_desc/projected_roll_pnl/
+    roll_btc_cost/roll_sto_credit/roll_close_cost/roll_close_price — all
+    None if no STO leg could be confidently parsed out of advisor_text.
+    """
+    _empty = {
+        "sto_chain_price": None, "sto_chain_desc": None, "projected_roll_pnl": None,
+        "roll_btc_cost": None, "roll_sto_credit": None, "roll_close_cost": None,
+        "roll_close_price": None, "sto_strike": None, "sto_expiry": None,
+        "sto_option_type": None,
+    }
+    # See run_roll_for_position's original inline comments (same logic,
+    # unchanged) for why this multi-step fallback chain is needed rather
+    # than a naive whole-text-only search.
+    _rec_opt = None
+    _sto_snippet = None
+    for _pattern in (r'STO\s+leg\s*:[^\n]{0,150}', r'(?:sell\s+to\s+open|\bSTO\b)[^\n]{0,150}'):
+        for _sto_m in re.finditer(_pattern, advisor_text, re.IGNORECASE):
+            _candidate = _parse_recommended_option(_sto_m.group(0), adapted_rows, trust_any_date=True)
+            if _candidate and _candidate.get("strike") is not None:
+                _rec_opt = _candidate
+                _sto_snippet = _sto_m.group(0)
+                break
+        if _rec_opt:
+            break
+
+    if _rec_opt and _sto_snippet:
+        _type_m = re.search(r'\b(call|put)s?\b', _sto_snippet, re.IGNORECASE)
+        _prefer_type = _type_m.group(1).upper() if _type_m else cur_type
+        _rec_opt = _parse_recommended_option(
+            _sto_snippet, adapted_rows, prefer_type=_prefer_type, trust_any_date=True
+        ) or _rec_opt
+
+    if not _rec_opt:
+        _rec_opt = _parse_recommended_option(advisor_text, adapted_rows, prefer_type=cur_type)
+    if (_rec_opt and not _sto_snippet and cur_strike is not None
+            and str(_rec_opt.get("option_type", "")).upper() == cur_type
+            and _rec_opt.get("expiry") == cur_expiry):
+        try:
+            _same_strike = float(_rec_opt.get("strike") or -1) == cur_strike
+        except (TypeError, ValueError):
+            _same_strike = False
+        if _same_strike:
+            _masked_text = re.sub(
+                rf'{cur_strike:g}(\.0+)?\s*(?:CALL|PUT)', '', advisor_text, flags=re.IGNORECASE
+            )
+            if cur_expiry:
+                _masked_text = _masked_text.replace(cur_expiry, '')
+            _rec_opt = _parse_recommended_option(_masked_text, adapted_rows, prefer_type=cur_type)
+            if (_rec_opt and str(_rec_opt.get("option_type", "")).upper() == cur_type
+                    and _rec_opt.get("expiry") == cur_expiry):
+                try:
+                    if float(_rec_opt.get("strike") or -1) == cur_strike:
+                        _rec_opt = None
+                except (TypeError, ValueError):
+                    _rec_opt = None
+    if not _rec_opt:
+        return dict(_empty)
+
+    try:
+        sto_chain_price = float(
+            _rec_opt.get("mid_price") or _rec_opt.get("last") or _rec_opt.get("opt_price") or 0
+        ) or None
+    except (TypeError, ValueError):
+        sto_chain_price = None
+    if not sto_chain_price:
+        return dict(_empty)
+
+    sto_chain_desc = (
+        f"{ticker} {_rec_opt.get('strike')} "
+        f"{str(_rec_opt.get('option_type','')).upper()} "
+        f"exp {_rec_opt.get('expiry')}"
+    )
+    # Structured fields (not just the formatted desc string) so callers that
+    # need to actually ACT on this candidate — e.g. entering a test trade in
+    # the journal — don't have to re-parse sto_chain_desc's free text.
+    sto_strike       = _rec_opt.get("strike")
+    sto_expiry       = _rec_opt.get("expiry")
+    sto_option_type  = str(_rec_opt.get("option_type", "")).upper()
+
+    # Base result: the STO leg itself is already fully resolved at this
+    # point (strike/expiry/type/price) regardless of whether the BTC side
+    # can be priced — this is what "Enter Test Trade" actually needs paired
+    # with the separately-tracked top-level btc_chain_price, so it must
+    # survive even when the PnL projection below can't be computed.
+    _result = dict(_empty)
+    _result.update({
+        "sto_chain_price": sto_chain_price,
+        "sto_chain_desc": sto_chain_desc,
+        "sto_strike": sto_strike,
+        "sto_expiry": sto_expiry,
+        "sto_option_type": sto_option_type,
+    })
+
+    # Confirmed live on MSFT: btc_chain_price came back None (the current
+    # leg's own strike/expiry didn't match anything in this fetch's chain
+    # snapshot) and current_leg_price was ALSO None (matched_pos here comes
+    # from get_all_open_positions()'s raw DB join, which has no live-price
+    # column at all — current_leg_price is only ever populated when a
+    # caller happens to pass a real one in). The old `... or 0.0` fallback
+    # silently treated that as "costs $0 to close" — on a 3-contract deep-
+    # ITM position actually costing ~$82.65/share (~$24,795) to buy back,
+    # that fabricated a +$5,844 "projected profit" on a roll that was
+    # actually a ~$21,930 debit, so the hard PnL guard never fired and a
+    # severely money-losing ROLL stood unchallenged. If the close price
+    # genuinely can't be determined, the honest answer is "can't verify
+    # this roll's math" — not "assume it's free." Confirmed live AGAIN on
+    # BKR: this bail-out used to `return dict(_empty)` wholesale, discarding
+    # the STO leg fields set just above even though they parsed perfectly
+    # fine — "Enter Test Trade" then failed with "missing confirmed roll
+    # data" for a candidate NB had, in fact, clearly and correctly named.
+    if btc_chain_price is None and current_leg_price is None:
+        return _result
+    _btc_price = btc_chain_price if btc_chain_price is not None else current_leg_price
+    roll_btc_cost = round(
+        _btc_price * 100 * pos_qty
+        + auto_comm("buy", _btc_price, pos_qty, is_close=True)
+        + auto_fees("buy", _btc_price, pos_qty, ticker),
+        2,
+    )
+    _adj_net = round(chain["net_cash"] - roll_btc_cost, 2)
+
+    roll_sto_credit = round(
+        sto_chain_price * 100 * pos_qty
+        - auto_comm("sell", sto_chain_price, pos_qty, is_close=False)
+        - auto_fees("sell", sto_chain_price, pos_qty, ticker),
+        2,
+    )
+    roll_close_price = round(sto_chain_price * 0.40, 4)
+    roll_close_cost = round(
+        roll_close_price * 100 * pos_qty
+        + auto_comm("buy", roll_close_price, pos_qty, is_close=True)
+        + auto_fees("buy", roll_close_price, pos_qty, ticker),
+        2,
+    )
+    projected_roll_pnl = round(_adj_net + roll_sto_credit - roll_close_cost, 2)
+
+    _result.update({
+        "projected_roll_pnl": projected_roll_pnl,
+        "roll_btc_cost": roll_btc_cost,
+        "roll_sto_credit": roll_sto_credit,
+        "roll_close_cost": roll_close_cost,
+        "roll_close_price": roll_close_price,
+    })
+    return _result
 
 
 async def run_roll_for_position(
@@ -2202,15 +2475,30 @@ async def run_roll_for_position(
             if (_d := _parse_exp(e)) is not None and _d <= _cutoff
         ][:40] or all_expirations[:10]
 
+        # Rolls never change instrument type (see build_chain_candidates_text's
+        # docstring) — only fetch/keep the position's own CALL or PUT side.
+        # Confirmed live: GLD's uploaded CSV (both sides, every expiry) was
+        # large enough to fail NotebookLM's own upload processing outright
+        # (NB's UI showed "Error uploading source, try again!"); halving the
+        # row count by dropping the side nothing downstream ever uses (Claude/
+        # Luna's chain_candidates_text and the STO/BTC price matching both
+        # already filter to this same type) directly addresses that.
+        _roll_type = pos_key.split("|")[1].upper() if pos_key and "|" in pos_key else None
+        _roll_side = "calls" if _roll_type == "CALL" else "puts" if _roll_type == "PUT" else None
+
         all_rows: list[dict] = []
         for exp_date in expirations:
             chain = get_option_chain(token, account_id, ticker, exp_date)
             if not chain:
                 continue
-            for contract in chain.get("calls", []):
-                all_rows.append(contract_to_row(contract, "CALL", exp_date))
-            for contract in chain.get("puts", []):
-                all_rows.append(contract_to_row(contract, "PUT", exp_date))
+            if _roll_side is None:
+                for contract in chain.get("calls", []):
+                    all_rows.append(contract_to_row(contract, "CALL", exp_date))
+                for contract in chain.get("puts", []):
+                    all_rows.append(contract_to_row(contract, "PUT", exp_date))
+            else:
+                for contract in chain.get(_roll_side, []):
+                    all_rows.append(contract_to_row(contract, _roll_type, exp_date))
 
         if not all_rows:
             return {
@@ -2277,7 +2565,6 @@ async def run_roll_for_position(
                 log.warning("No position matched pos_key=%r in open_positions", pos_key)
 
         chain = get_chain_net_cash(spread_id, fallback_pos_id=matched_pos.get("id") if matched_pos else None)
-        current_leg_price = float(matched_pos["current_price"]) if matched_pos and matched_pos.get("current_price") is not None else None
 
         # Claude is the primary advisor (see claude_advisor.py) — build the
         # same rich position context /api/openai-compare uses for the second
@@ -2297,6 +2584,20 @@ async def run_roll_for_position(
                 continue
         if claude_pos is None:
             return {"error": f"Position not found in live eval data for {ticker}", "recommendation": "HOLD", "text": "", "ticker": ticker}
+
+        # current_leg_price is the fallback the PnL guard uses when the live
+        # chain snapshot fetched for THIS analysis doesn't happen to contain
+        # a row matching the current leg's own strike/expiry (e.g. a 429
+        # from Public.com on that one expiry — see the WARNING logs this
+        # session). matched_pos (from get_all_open_positions()'s raw DB
+        # join) has no live-price column at all, so sourcing the fallback
+        # from it was silently always None — confirmed live on MSFT: with
+        # BOTH the chain-snapshot lookup and this fallback coming back None,
+        # the guard fabricated a $0 close cost, turning a real ~$24,795 buy-
+        # back into a phantom "cheap roll" that stood unchallenged. claude_pos
+        # (from the same live eval_data() pull used for the rich context
+        # above) has the real current_price this fallback needs.
+        current_leg_price = float(claude_pos["current_price"]) if claude_pos.get("current_price") is not None else None
 
         claude_context = claude_advisor.build_position_context(claude_pos, eval_data.get("vix"), key_dates, get_tbill_rate())
         claude_result = claude_advisor.query_claude_advisor(claude_context, chain_candidates_text)
@@ -2328,9 +2629,30 @@ async def run_roll_for_position(
         # number from PLAN/REVIEW prose rather than reading the uploaded chain).
         btc_chain_price = sto_chain_price = None
         sto_chain_desc  = None
+        sto_strike = sto_expiry = sto_option_type = None
         projected_roll_pnl = None
         roll_btc_cost = roll_sto_credit = roll_close_cost = roll_close_price = None
-        if rec == "ROLL" and pos_qty and matched_pos:
+        openai_sto_chain_price = openai_sto_chain_desc = None
+        openai_sto_strike = openai_sto_expiry = openai_sto_option_type = None
+        openai_projected_roll_pnl = None
+        notebooklm_sto_chain_price = notebooklm_sto_chain_desc = None
+        notebooklm_sto_strike = notebooklm_sto_expiry = notebooklm_sto_option_type = None
+        notebooklm_projected_roll_pnl = None
+        # Shared by all three advisors' guards below (same position, same
+        # chain snapshot) — defaulted here so referencing them after this
+        # block (for the NotebookLM guard, which needs notebooklm_rec that
+        # isn't known until after the NB call further down) never raises
+        # NameError even when there's no valid position/qty to guard at all.
+        _adapted_rows: list = []
+        _cur_type = _cur_expiry = None
+        _cur_strike = None
+        # Gate on having a real position to check against, not on any one
+        # advisor's own recommendation — this now feeds THREE independent
+        # guards (Claude, Luna, and NotebookLM after its own call below),
+        # not just Claude's own (see _project_roll_pnl's docstring for why
+        # every advisor needs it, not just the primary one).
+        _luna_rec = openai_result.get("recommendation")
+        if pos_qty and matched_pos:
             _adapted_rows = [
                 {
                     "strike": r["strike_price"], "expiry": r["expiration_date"],
@@ -2340,7 +2662,9 @@ async def run_roll_for_position(
                 for r in all_rows
             ]
 
-            # Current (BTC) leg's price from the same chain snapshot.
+            # Current (BTC) leg's price from the same chain snapshot — shared
+            # by both advisors' guards below since it's the position's own
+            # existing leg, independent of what either advisor recommended.
             try:
                 _cur_strike = float(matched_pos.get("strike"))
             except (TypeError, ValueError):
@@ -2360,138 +2684,33 @@ async def run_roll_for_position(
                         btc_chain_price = None
                     break
 
-            # New (STO) leg's price — whatever the advisor recommended, matched
-            # against the same chain snapshot.
-            #
-            # The system prompt (claude_advisor._SYSTEM_PROMPT, shared by both
-            # advisors) now asks for an exact, standalone "STO leg: <strike> "
-            # "<PUT/CALL>, <expiry>, <price> mid-price." anchor line specifically
-            # so this doesn't have to guess — try that first. Fall back to any
-            # "sell to open"/"STO" mention for older cached responses or a model
-            # that ignores the formatting instruction, and finally to the whole
-            # text. A naive whole-text-only search is dangerous: the prose
-            # elsewhere (e.g. describing the assignment-loss scenario at the
-            # CURRENT strike) restates the current leg's own strike/expiry, and
-            # a first-match scan over the whole text can grab that instead — or
-            # worse, stitch together a strike from one sentence and an expiry
-            # from a completely unrelated one (confirmed live: "strike $124" in
-            # the Hold-scenario paragraph combined with the correct "2026-08-21"
-            # roll-target expiry into a nonexistent "124 PUT exp 2026-08-21").
-            # There can be more than one anchor/STO mention (e.g. a summary line
-            # like "(simultaneous BTC/STO)" before the actual detailed one) —
-            # try each candidate in turn and keep the first that actually yields
-            # a strike, rather than just the first mention.
-            _rec_opt = None
-            _sto_snippet = None
-            for _pattern in (r'STO\s+leg\s*:[^\n]{0,150}', r'(?:sell\s+to\s+open|\bSTO\b)[^\n]{0,150}'):
-                for _sto_m in re.finditer(_pattern, text, re.IGNORECASE):
-                    _candidate = _parse_recommended_option(_sto_m.group(0), _adapted_rows, trust_any_date=True)
-                    if _candidate and _candidate.get("strike") is not None:
-                        _rec_opt = _candidate
-                        _sto_snippet = _sto_m.group(0)
-                        break
-                if _rec_opt:
-                    break
-
-            if _rec_opt and _sto_snippet:
-                # The snippet almost always states the type explicitly ("...105.00
-                # Put exp..."); re-run matching with that as a hard preference so a
-                # same-strike/same-expiry row of the OTHER type can't win the tie
-                # (chain rows list calls before puts, so it otherwise would).
-                # Rolls also essentially never change instrument type, so the
-                # current leg's own type is a solid fallback if the snippet
-                # doesn't spell it out.
-                _type_m = re.search(r'\b(call|put)s?\b', _sto_snippet, re.IGNORECASE)
-                _prefer_type = _type_m.group(1).upper() if _type_m else _cur_type
-                _rec_opt = _parse_recommended_option(
-                    _sto_snippet, _adapted_rows, prefer_type=_prefer_type, trust_any_date=True
-                ) or _rec_opt
-
-            if not _rec_opt:
-                _rec_opt = _parse_recommended_option(text, _adapted_rows, prefer_type=_cur_type)
-            # Still landed on the current leg's own strike (whole-text fallback
-            # only) — strip those mentions and retry so it lands on the next
-            # distinct strike/expiry actually being recommended.
-            if (_rec_opt and not _sto_snippet and _cur_strike is not None
-                    and str(_rec_opt.get("option_type", "")).upper() == _cur_type
-                    and _rec_opt.get("expiry") == _cur_expiry):
-                try:
-                    _same_strike = float(_rec_opt.get("strike") or -1) == _cur_strike
-                except (TypeError, ValueError):
-                    _same_strike = False
-                if _same_strike:
-                    _masked_text = re.sub(
-                        rf'{_cur_strike:g}(\.0+)?\s*(?:CALL|PUT)', '', text, flags=re.IGNORECASE
-                    )
-                    if _cur_expiry:
-                        _masked_text = _masked_text.replace(_cur_expiry, '')
-                    _rec_opt = _parse_recommended_option(_masked_text, _adapted_rows, prefer_type=_cur_type)
-                    # Still landed on the current leg (or nothing distinct found) —
-                    # there's no genuinely new leg to confirm a price for.
-                    if (_rec_opt and str(_rec_opt.get("option_type", "")).upper() == _cur_type
-                            and _rec_opt.get("expiry") == _cur_expiry):
-                        try:
-                            if float(_rec_opt.get("strike") or -1) == _cur_strike:
-                                _rec_opt = None
-                        except (TypeError, ValueError):
-                            _rec_opt = None
-            if _rec_opt:
-                try:
-                    sto_chain_price = float(
-                        _rec_opt.get("mid_price") or _rec_opt.get("last")
-                        or _rec_opt.get("opt_price") or 0
-                    ) or None
-                except (TypeError, ValueError):
-                    sto_chain_price = None
-                if sto_chain_price:
-                    sto_chain_desc = (
-                        f"{ticker} {_rec_opt.get('strike')} "
-                        f"{str(_rec_opt.get('option_type','')).upper()} "
-                        f"exp {_rec_opt.get('expiry')}"
-                    )
-
-            # Full projected roll-chain PnL: net cash to date, minus the real cost
-            # to BTC the current leg, plus the new leg's STO credit, minus the cost
-            # to close that new leg at 40% of its own premium (60% profit capture) —
-            # i.e. "if I execute this exact roll and then eventually take my usual
-            # profit on the new leg, is the WHOLE chain profitable." Computed from
-            # the same verified chain-snapshot prices as the Confirmed Prices line,
-            # not from NotebookLM's own (previously unreliable) arithmetic. This also
-            # doubles as the hard PnL guard: a ROLL recommendation that fails this
-            # check gets forced to HOLD.
-            #
-            # Commission/fees on the three hypothetical legs (BTC current, STO new,
-            # eventual BTC of new at 40%) are estimated via the journal's own
-            # Fidelity fee schedule (auto_comm/auto_fees) so this lines up with what
-            # the journal will actually record once the trades are entered for real
-            # — chain["net_cash"] already has the real leg's fees baked in, so only
-            # these three projected legs need it added here.
-            if sto_chain_price:
-                _btc_price = btc_chain_price if btc_chain_price is not None else current_leg_price
-                _btc_price = _btc_price or 0.0
-                roll_btc_cost = round(
-                    _btc_price * 100 * pos_qty
-                    + auto_comm("buy", _btc_price, pos_qty, is_close=True)
-                    + auto_fees("buy", _btc_price, pos_qty, ticker),
-                    2,
+            # Claude's own guard — computed from Claude's own recommended STO
+            # leg, exposed via the top-level sto_chain_price/projected_roll_pnl/
+            # etc. fields the "Confirmed Prices"/Execution Instructions UI reads.
+            if rec == "ROLL":
+                _pnl = _project_roll_pnl(
+                    text, _adapted_rows, _cur_type, _cur_expiry, _cur_strike,
+                    btc_chain_price, current_leg_price, chain, pos_qty, ticker,
                 )
-                _adj_net = round(chain["net_cash"] - roll_btc_cost, 2)
-
-                roll_sto_credit = round(
-                    sto_chain_price * 100 * pos_qty
-                    - auto_comm("sell", sto_chain_price, pos_qty, is_close=False)
-                    - auto_fees("sell", sto_chain_price, pos_qty, ticker),
-                    2,
-                )
-                roll_close_price = round(sto_chain_price * 0.40, 4)
-                roll_close_cost = round(
-                    roll_close_price * 100 * pos_qty
-                    + auto_comm("buy", roll_close_price, pos_qty, is_close=True)
-                    + auto_fees("buy", roll_close_price, pos_qty, ticker),
-                    2,
-                )
-                projected_roll_pnl = round(_adj_net + roll_sto_credit - roll_close_cost, 2)
-                if projected_roll_pnl < 0:
+                sto_chain_price    = _pnl["sto_chain_price"]
+                sto_chain_desc     = _pnl["sto_chain_desc"]
+                projected_roll_pnl = _pnl["projected_roll_pnl"]
+                roll_btc_cost      = _pnl["roll_btc_cost"]
+                roll_sto_credit    = _pnl["roll_sto_credit"]
+                roll_close_cost    = _pnl["roll_close_cost"]
+                roll_close_price   = _pnl["roll_close_price"]
+                sto_strike         = _pnl["sto_strike"]
+                sto_expiry         = _pnl["sto_expiry"]
+                sto_option_type    = _pnl["sto_option_type"]
+                # Full projected roll-chain PnL: net cash to date, minus the real
+                # cost to BTC the current leg, plus the new leg's STO credit,
+                # minus the cost to close that new leg at 40% of its own premium
+                # (60% profit capture) — i.e. "if I execute this exact roll and
+                # then eventually take my usual profit on the new leg, is the
+                # WHOLE chain profitable." This also doubles as the hard PnL
+                # guard: a ROLL recommendation that fails this check gets forced
+                # to HOLD.
+                if projected_roll_pnl is not None and projected_roll_pnl < 0:
                     rec = "HOLD"
                     log.warning(
                         "Overriding ROLL→HOLD for %s: deterministic projected chain PnL "
@@ -2517,13 +2736,88 @@ async def run_roll_for_position(
                         f"pending a candidate that actually nets a credit.\n\n---\n\n"
                     ) + text
 
+            # Luna's own guard — same math, run independently against
+            # Luna's own recommended STO leg. Luna shares Claude's raw "Net
+            # chain cash collected to date" context line but was never
+            # subject to this deterministic override, so a money-losing
+            # roll Luna recommended on its own could still win the main
+            # dashboard's priority-pick badge even after Claude's version
+            # of the same mistake got caught and downgraded to HOLD.
+            if _luna_rec == "ROLL" and openai_result.get("text"):
+                _luna_pnl = _project_roll_pnl(
+                    openai_result["text"], _adapted_rows, _cur_type, _cur_expiry, _cur_strike,
+                    btc_chain_price, current_leg_price, chain, pos_qty, ticker,
+                )
+                openai_sto_chain_price    = _luna_pnl["sto_chain_price"]
+                openai_sto_chain_desc     = _luna_pnl["sto_chain_desc"]
+                openai_sto_strike         = _luna_pnl["sto_strike"]
+                openai_sto_expiry         = _luna_pnl["sto_expiry"]
+                openai_sto_option_type    = _luna_pnl["sto_option_type"]
+                openai_projected_roll_pnl = _luna_pnl["projected_roll_pnl"]
+                _luna_projected_pnl = _luna_pnl["projected_roll_pnl"]
+                if _luna_projected_pnl is not None and _luna_projected_pnl < 0:
+                    openai_result["recommendation"] = "HOLD"
+                    log.warning(
+                        "Overriding Luna ROLL→HOLD for %s: deterministic projected chain PnL "
+                        "%.2f < 0 (recommended premium ~$%.2f)",
+                        ticker, _luna_projected_pnl, _luna_pnl["sto_chain_price"]
+                    )
+                    openai_result["text"] = (
+                        f"**Overridden: HOLD, not ROLL.** The reasoning below recommends "
+                        f"rolling this position, but the actual chain-cash math on that "
+                        f"specific roll comes out to a **${_luna_projected_pnl:,.2f} loss** "
+                        f"(not the ~${_luna_pnl['sto_chain_price']:.2f}/share premium the "
+                        f"reasoning cites) once the real cost to close the current leg and "
+                        f"the cost to eventually close the new leg are included — so this "
+                        f"roll doesn't pay for itself, and the recommendation has been "
+                        f"changed to HOLD pending a candidate that actually nets a "
+                        f"credit.\n\n---\n\n"
+                    ) + openai_result["text"]
+
         # NotebookLM — best-effort THIRD opinion, always attempted after
         # Claude and Luna above but never allowed to block or fail the
         # overall result. See _run_notebooklm_roll's docstring.
         notebooklm_rec, notebooklm_text_val, notebooklm_error = await _run_notebooklm_roll(
             ticker, notebook_id, key_dates, vix, ul_cost_basis,
             open_positions, chain, current_leg_price, all_rows,
+            tail_text=tail_text,
         )
+
+        # NotebookLM's own guard — same math as Claude's/Luna's above, run
+        # against NB's own recommended STO leg now that its call has
+        # completed. Reuses the shared _adapted_rows/_cur_type/_cur_expiry/
+        # _cur_strike/btc_chain_price computed earlier in this function (see
+        # the "Shared by all three advisors' guards" comment above) rather
+        # than refetching anything.
+        if notebooklm_rec == "ROLL" and notebooklm_text_val and pos_qty and matched_pos:
+            _nb_pnl = _project_roll_pnl(
+                notebooklm_text_val, _adapted_rows, _cur_type, _cur_expiry, _cur_strike,
+                btc_chain_price, current_leg_price, chain, pos_qty, ticker,
+            )
+            notebooklm_sto_chain_price    = _nb_pnl["sto_chain_price"]
+            notebooklm_sto_chain_desc     = _nb_pnl["sto_chain_desc"]
+            notebooklm_sto_strike         = _nb_pnl["sto_strike"]
+            notebooklm_sto_expiry         = _nb_pnl["sto_expiry"]
+            notebooklm_sto_option_type    = _nb_pnl["sto_option_type"]
+            notebooklm_projected_roll_pnl = _nb_pnl["projected_roll_pnl"]
+            if notebooklm_projected_roll_pnl is not None and notebooklm_projected_roll_pnl < 0:
+                notebooklm_rec = "HOLD"
+                log.warning(
+                    "Overriding NotebookLM ROLL→HOLD for %s: deterministic projected chain PnL "
+                    "%.2f < 0 (recommended premium ~$%.2f)",
+                    ticker, notebooklm_projected_roll_pnl, notebooklm_sto_chain_price
+                )
+                notebooklm_text_val = (
+                    f"**Overridden: HOLD, not ROLL.** The reasoning below recommends "
+                    f"rolling this position, but the actual chain-cash math on that "
+                    f"specific roll comes out to a **${notebooklm_projected_roll_pnl:,.2f} loss** "
+                    f"(not the ~${notebooklm_sto_chain_price:.2f}/share premium the "
+                    f"reasoning cites) once the real cost to close the current leg and "
+                    f"the cost to eventually close the new leg are included — so this "
+                    f"roll doesn't pay for itself, and the recommendation has been "
+                    f"changed to HOLD pending a candidate that actually nets a "
+                    f"credit.\n\n---\n\n"
+                ) + notebooklm_text_val
 
         # Main dashboard table's Action badge: highest-priority recommendation
         # across all three advisors, not just Claude's own — see
@@ -2545,10 +2839,22 @@ async def run_roll_for_position(
             "openai_error": openai_result.get("error"),
             "openai_run_at": _advisor_run_at,
             "openai_qa_thread": [],
+            "openai_sto_chain_price": openai_sto_chain_price,
+            "openai_sto_chain_desc":  openai_sto_chain_desc,
+            "openai_sto_strike":      openai_sto_strike,
+            "openai_sto_expiry":      openai_sto_expiry,
+            "openai_sto_option_type": openai_sto_option_type,
+            "openai_projected_roll_pnl": openai_projected_roll_pnl,
             "notebooklm_recommendation": notebooklm_rec,
             "notebooklm_text": notebooklm_text_val,
             "notebooklm_error": notebooklm_error,
             "notebooklm_run_at": _advisor_run_at,
+            "notebooklm_sto_chain_price": notebooklm_sto_chain_price,
+            "notebooklm_sto_chain_desc":  notebooklm_sto_chain_desc,
+            "notebooklm_sto_strike":      notebooklm_sto_strike,
+            "notebooklm_sto_expiry":      notebooklm_sto_expiry,
+            "notebooklm_sto_option_type": notebooklm_sto_option_type,
+            "notebooklm_projected_roll_pnl": notebooklm_projected_roll_pnl,
             "ticker": ticker,
             "chain_cash":      chain["net_cash"],       # for dashboard badge
             "chain_collected": chain["collected"],
@@ -2558,10 +2864,14 @@ async def run_roll_for_position(
             "has_test_trade":  chain["has_test"],
             "pos_avg_price":   pos_avg_price,
             "pos_qty":         pos_qty,
+            "position_id":     matched_pos.get("id") if matched_pos else None,  # journal DB row, for Enter Test Trade
             "ul_cost_basis":   ul_cost_basis,
             "btc_chain_price": btc_chain_price,
             "sto_chain_price": sto_chain_price,
             "sto_chain_desc":  sto_chain_desc,
+            "sto_strike":      sto_strike,
+            "sto_expiry":      sto_expiry,
+            "sto_option_type": sto_option_type,
             "projected_roll_pnl": projected_roll_pnl,
             "roll_btc_cost":    roll_btc_cost,     # incl. estimated commission/fees
             "roll_sto_credit":  roll_sto_credit,   # incl. estimated commission/fees
@@ -2578,6 +2888,7 @@ async def run_roll_for_position(
 async def _run_notebooklm_unborn(
     ticker: str, notebook_id: str, strat: str, key_dates: dict, vix: float | None,
     ul_cost_basis: float, qty: int, all_rows: list[dict], display_rows: list[dict],
+    tail_text: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Best-effort THIRD opinion for a NEW/unborn position (SELL/WAIT
@@ -2599,7 +2910,7 @@ async def _run_notebooklm_unborn(
             with open(output_file, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
                 writer.writeheader()
-                writer.writerows(all_rows)
+                writer.writerows(_cap_csv_rows_for_upload(all_rows))
             source_id = None
             try:
                 source_id = await upload_to_notebooklm(output_file, notebook_id)
@@ -2617,6 +2928,7 @@ async def _run_notebooklm_unborn(
                     notebook_id, ticker, strat, key_dates, synthetic_positions, vix,
                     silent=True,
                     ul_cost_basis=ul_cost_basis,
+                    tail_text=tail_text,
                 )
             finally:
                 await delete_notebooklm_source(notebook_id, source_id)
@@ -2654,6 +2966,106 @@ async def _run_notebooklm_unborn(
     except Exception as exc:
         log.warning("[unborn] NotebookLM third opinion failed for %s: %s", ticker, exc)
         return None, None, str(exc)
+    finally:
+        _notebooklm_lock.release()
+
+
+async def ask_notebooklm_followup(ticker: str, notebook_id: str, all_rows: list[dict], question: str) -> dict:
+    """
+    Follow-up question against NotebookLM's most recent analysis for this
+    ticker — mirrors ask_position_followup/ask_unborn_followup's role for
+    Claude/Luna, but NB has no per-call conversation reconstruction of its
+    own (its "memory" lives server-side in the notebook's own chat thread).
+    Two things this has to work around that Claude/Luna don't:
+      1. The chain CSV source is deleted right after the ORIGINAL query
+         completes (see _run_notebooklm_roll/_run_notebooklm_unborn's own
+         upload/delete pattern) — a follow-up asked moments or minutes
+         later has nothing to reference unless a fresh copy is re-uploaded
+         first, so this does that (and deletes it again after).
+      2. query_notebooklm() resets the notebook's conversation before every
+         call specifically so unrelated analyses don't bleed into each
+         other — a follow-up must NOT do that, or NB would have no memory
+         of the answer being followed up on. This calls chat.ask() directly
+         instead of going through query_notebooklm().
+
+    Returns {"answer": str, "error": str | None}.
+    """
+    if not _notebooklm_lock.acquire(timeout=_NOTEBOOKLM_LOCK_TIMEOUT):
+        return {"answer": "", "error": "NotebookLM busy with another analysis — try again shortly"}
+    try:
+        from notebooklm import NotebookLMClient
+
+        async def _run() -> str | None:
+            output_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), f"{ticker.upper()}.csv"
+            )
+            with open(output_file, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                writer.writeheader()
+                writer.writerows(_cap_csv_rows_for_upload(all_rows))
+            source_id = None
+            try:
+                source_id = await upload_to_notebooklm(output_file, notebook_id)
+            finally:
+                try:
+                    os.unlink(output_file)
+                except OSError:
+                    pass
+            try:
+                if source_id:
+                    await asyncio.sleep(15)
+                # chat.ask() itself has no retry here (unlike query_notebooklm's
+                # 4-attempt backoff loop) because that loop resets the notebook's
+                # conversation before every attempt — fine for a fresh analysis,
+                # but a follow-up NEEDS the existing conversation intact to have
+                # any memory of what's being followed up on. A bounded retry on
+                # the same live conversation (no reset) gets the resilience back
+                # without that side effect. Confirmed live on BKR: a follow-up
+                # question hit "NotebookLM busy" then "Timed out after 380s" on
+                # two straight single-shot attempts, succeeding only on a third,
+                # user-initiated retry — exactly the kind of transient flakiness
+                # query_notebooklm already absorbs invisibly for the main query.
+                #
+                # Each attempt gets its OWN bounded timeout — without this, a
+                # single stalled attempt (confirmed live: chat.ask() can hang
+                # silently for the full outer budget with no exception, same
+                # root cause documented on _PER_ATTEMPT_TIMEOUT below) would
+                # consume the entire outer _NOTEBOOKLM_WORK_TIMEOUT by itself,
+                # leaving no room for a second or third try. 2 attempts x 150s
+                # + one 15s backoff = 315s, safely inside the 380s outer cap
+                # alongside the 15s upload-settle sleep above.
+                _last_ask_exc: Exception | None = None
+                for _attempt in range(2):
+                    try:
+                        async with NotebookLMClient.from_storage() as client:
+                            result = await asyncio.wait_for(
+                                client.chat.ask(notebook_id, question), timeout=150
+                            )
+                        return getattr(result, "answer", None) or str(result)
+                    except Exception as exc:
+                        _last_ask_exc = exc
+                        if _attempt == 0:
+                            log.warning(
+                                "[notebooklm-ask] chat.ask failed for %s (attempt 1/2), retrying — %s",
+                                ticker, exc,
+                            )
+                            await asyncio.sleep(15)
+                if _last_ask_exc:
+                    raise _last_ask_exc
+                return None
+            finally:
+                await delete_notebooklm_source(notebook_id, source_id)
+
+        text = await asyncio.wait_for(_run(), timeout=_NOTEBOOKLM_WORK_TIMEOUT)
+        if not text:
+            return {"answer": "", "error": "Empty response from NotebookLM"}
+        return {"answer": text, "error": None}
+    except asyncio.TimeoutError:
+        log.warning("[notebooklm-ask] timed out after %ds for %s", _NOTEBOOKLM_WORK_TIMEOUT, ticker)
+        return {"answer": "", "error": f"Timed out after {_NOTEBOOKLM_WORK_TIMEOUT}s"}
+    except Exception as exc:
+        log.warning("[notebooklm-ask] failed for %s: %s", ticker, exc)
+        return {"answer": "", "error": str(exc)}
     finally:
         _notebooklm_lock.release()
 
@@ -2711,15 +3123,19 @@ async def run_unborn_for_ticker(
             }
         expirations = all_expirations[:num_expirations]
 
+        # CC only ever wants calls, CSP only ever wants puts — see the
+        # matching comment in run_roll_for_position for why halving the
+        # uploaded CSV's row count matters (confirmed live on GLD).
+        _unborn_side = "calls" if strat == "CC" else "puts"
+        _unborn_type = "CALL" if strat == "CC" else "PUT"
+
         all_rows: list[dict] = []
         for exp_date in expirations:
             chain = get_option_chain(token, account_id, ticker, exp_date)
             if not chain:
                 continue
-            for contract in chain.get("calls", []):
-                all_rows.append(contract_to_row(contract, "CALL", exp_date))
-            for contract in chain.get("puts", []):
-                all_rows.append(contract_to_row(contract, "PUT", exp_date))
+            for contract in chain.get(_unborn_side, []):
+                all_rows.append(contract_to_row(contract, _unborn_type, exp_date))
 
         if not all_rows:
             return {
@@ -2824,6 +3240,7 @@ async def run_unborn_for_ticker(
         # overall result. See _run_notebooklm_unborn's docstring.
         notebooklm_rec, notebooklm_text_val, notebooklm_error = await _run_notebooklm_unborn(
             ticker, notebook_id, strat, key_dates, vix, ul_cost_basis, qty, all_rows, display_rows,
+            tail_text=tail_text,
         )
 
         # Main dashboard table's row: highest-priority recommendation across
@@ -3819,7 +4236,7 @@ let _unbornAutoRecalcDone = false;
 let _prevFlags      = {}; // posKey → "flagged|nFlags|reason0;reason1;..."
 let _prevAnalysisFP = {}; // posKey → meaningful-state fingerprint from last render
 let _autoRerunAt    = {}; // posKey → Date.now() of last auto-rerun
-const _AUTO_RERUN_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+const _AUTO_RERUN_COOLDOWN_MS = 20 * 60 * 1000; // 20 minutes
 
 // ── Live price polling state ─────────────────────────────────────────────────
 let _prevUlPrices  = (() => { try { return JSON.parse(localStorage.getItem(_LS_PR_PRICES) || '{}'); } catch { return {}; } })();
@@ -3833,9 +4250,9 @@ function _flagFingerprint(p) {
 }
 
 function _analysisFP(p) {
-  // Buckets: flag tier (ok/warn/danger), delta ±0.05, underlying ±$0.50
+  // Buckets: flag tier (ok/warn/danger), delta ±0.1, underlying ±$0.50
   const tier = !p.flagged ? 0 : (p.reasons||[]).length >= 3 ? 2 : 1;
-  const dBkt = (Math.round((p.delta||0) * 20) / 20).toFixed(2);
+  const dBkt = (Math.round((p.delta||0) * 10) / 10).toFixed(2);
   const uBkt = (Math.round((p.underlying||0) * 2) / 2).toFixed(1);
   return tier + '|' + dBkt + '|' + uBkt;
 }
@@ -5903,6 +6320,15 @@ def run_web_dashboard(token: str, account_id: str) -> None:
     _analysis_inflight: set[str] = set()
     _cache_lock = threading.Lock()
 
+    # In-memory-only (not persisted): NotebookLM follow-up answers waiting to
+    # be picked up by the client's next poll. /api/notebooklm-ask and
+    # /api/notebooklm-ask-unborn are background-thread + 202, unlike
+    # Claude/Luna's synchronous ask endpoints (NB's own upload+ask round
+    # trip is too slow for a direct request/response) — this is what lets a
+    # poll-by-repost pick up the answer once ready without resubmitting the
+    # same question as a brand new (duplicate, costly) NB call.
+    _notebooklm_ask_pending: dict[str, dict] = {}
+
     def _load_cache() -> dict:
         try:
             with open(_CACHE_FILE, "r", encoding="utf-8") as f:
@@ -5964,6 +6390,27 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         except Exception as exc:
             log.warning("[fed-calendar] startup ensure-source failed: %s", exc)
     threading.Thread(target=_startup_ensure_fed_source, daemon=True).start()
+
+    def _startup_purge_stale_ticker_sources():
+        # A restart can kill an in-flight NB background thread mid-query
+        # (daemon threads have no graceful shutdown), leaving that ticker's
+        # uploaded chain CSV orphaned in the notebook — see
+        # _STALE_TICKER_SOURCE_MAX_AGE's comment. Sweeping this at startup
+        # means a restart self-heals within one cycle instead of waiting up
+        # to _STALE_TICKER_SOURCE_MAX_AGE for the next per-ticker upload to
+        # trigger the same cleanup.
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            return
+        try:
+            from notebooklm import NotebookLMClient
+            async def _run():
+                async with NotebookLMClient.from_storage() as client:
+                    await _purge_stale_ticker_sources(client, notebook_id)
+            asyncio.run(_run())
+        except Exception as exc:
+            log.warning("[cleanup] startup purge-stale-sources failed: %s", exc)
+    threading.Thread(target=_startup_purge_stale_ticker_sources, daemon=True).start()
 
     # Re-evaluate recommendations on load so any previously mis-classified
     # entries (e.g. ROLL when primary was HOLD) get corrected immediately
@@ -6544,6 +6991,93 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             with _cache_lock:
                 chain_candidates_text = _analysis_cache.get(pos_key, {}).get("chain_candidates_text")
             result = openai_advisor.query_openai_advisor(context, chain_candidates_text)
+
+            # Same deterministic PnL guard the main analysis flow applies to
+            # Luna's ROLL recommendation — this on-demand path used to skip
+            # it entirely (same gap NB's own "Compare with Notebook" button
+            # had, fixed earlier), so a ROLL produced here never got the
+            # money-losing-roll check NOR the confirmed sto_* fields the
+            # "Enter Test Trade" button needs. Needs its own fresh chain
+            # fetch since this route otherwise only reuses the cached
+            # chain_candidates_text (pre-formatted prompt text, not
+            # structured rows _parse_recommended_option can match against).
+            result["sto_chain_price"] = result["sto_strike"] = None
+            result["sto_expiry"] = result["sto_option_type"] = None
+            if result.get("recommendation") == "ROLL" and result.get("text"):
+                try:
+                    _cur_strike_oc = float(pos.get("strike"))
+                except (TypeError, ValueError):
+                    _cur_strike_oc = None
+                _cur_type_oc = str(pos.get("option_type", "")).upper()
+                _cur_expiry_oc = pos.get("expiry")
+                _cutoff_oc = datetime.date.today() + datetime.timedelta(days=90)
+                _all_exp_oc = get_expirations(fresh_token, account_id, ticker)
+                _expirations_oc = [
+                    e for e in _all_exp_oc
+                    if (d := (datetime.date.fromisoformat(e) if e else None)) and d <= _cutoff_oc
+                ][:40] or _all_exp_oc[:10]
+                _roll_side_oc = "calls" if _cur_type_oc == "CALL" else "puts"
+                _all_rows_oc: list[dict] = []
+                for _exp_date in _expirations_oc:
+                    _chain_data_oc = get_option_chain(fresh_token, account_id, ticker, _exp_date)
+                    if not _chain_data_oc:
+                        continue
+                    for _contract in _chain_data_oc.get(_roll_side_oc, []):
+                        _all_rows_oc.append(contract_to_row(_contract, _cur_type_oc, _exp_date))
+                _adapted_rows_oc = [
+                    {
+                        "strike": r["strike_price"], "expiry": r["expiration_date"],
+                        "option_type": r["option_type"], "symbol": ticker,
+                        "mid_price": r.get("mid_price"), "last": r.get("last"),
+                    }
+                    for r in _all_rows_oc
+                ]
+                _btc_chain_price_oc = None
+                for _r in _adapted_rows_oc:
+                    try:
+                        _r_strike = float(_r.get("strike") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if (_r.get("option_type") == _cur_type_oc and _r_strike == _cur_strike_oc
+                            and _r.get("expiry") == _cur_expiry_oc):
+                        try:
+                            _btc_chain_price_oc = float(_r.get("mid_price") or _r.get("last") or 0) or None
+                        except (TypeError, ValueError):
+                            _btc_chain_price_oc = None
+                        break
+                with _cache_lock:
+                    _chain_oc = get_chain_net_cash(
+                        _analysis_cache.get(pos_key, {}).get("spread_id"),
+                        fallback_pos_id=_analysis_cache.get(pos_key, {}).get("position_id"),
+                    )
+                _pos_qty_oc = abs(int(pos.get("net_qty") or 0))
+                _pnl_oc = _project_roll_pnl(
+                    result["text"], _adapted_rows_oc, _cur_type_oc, _cur_expiry_oc, _cur_strike_oc,
+                    _btc_chain_price_oc, pos.get("current_price"), _chain_oc, _pos_qty_oc, ticker,
+                )
+                result["sto_chain_price"] = _pnl_oc["sto_chain_price"]
+                result["sto_strike"]      = _pnl_oc["sto_strike"]
+                result["sto_expiry"]      = _pnl_oc["sto_expiry"]
+                result["sto_option_type"] = _pnl_oc["sto_option_type"]
+                _projected_pnl_oc = _pnl_oc["projected_roll_pnl"]
+                if _projected_pnl_oc is not None and _projected_pnl_oc < 0:
+                    result["recommendation"] = "HOLD"
+                    log.warning(
+                        "Overriding Luna ROLL→HOLD for %s: deterministic projected chain PnL "
+                        "%.2f < 0 (recommended premium ~$%.2f)",
+                        ticker, _projected_pnl_oc, _pnl_oc["sto_chain_price"]
+                    )
+                    result["text"] = (
+                        f"**Overridden: HOLD, not ROLL.** The reasoning below recommends "
+                        f"rolling this position, but the actual chain-cash math on that "
+                        f"specific roll comes out to a **${_projected_pnl_oc:,.2f} loss** "
+                        f"(not the ~${_pnl_oc['sto_chain_price']:.2f}/share premium the "
+                        f"reasoning cites) once the real cost to close the current leg and "
+                        f"the cost to eventually close the new leg are included — so this "
+                        f"roll doesn't pay for itself, and the recommendation has been "
+                        f"changed to HOLD pending a candidate that actually nets a "
+                        f"credit.\n\n---\n\n"
+                    ) + result["text"]
         except Exception as exc:
             log.exception("[openai-compare] failed for %s", pos_key)
             result = {"error": str(exc), "recommendation": None, "text": ""}
@@ -6559,6 +7093,14 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             entry["openai_error"] = result.get("error")
             entry["openai_run_at"] = result["_run_at"]
             entry["openai_qa_thread"] = []  # fresh compare invalidates any prior follow-up thread
+            entry["openai_sto_chain_price"] = result.get("sto_chain_price")
+            entry["openai_sto_strike"]      = result.get("sto_strike")
+            entry["openai_sto_expiry"]      = result.get("sto_expiry")
+            entry["openai_sto_option_type"] = result.get("sto_option_type")
+            # So the JS can decide whether to render "Enter Test Trade"
+            # without a page reload — see openaiCompare()'s matching comment.
+            result["btc_chain_price"] = entry.get("btc_chain_price")
+            result["position_id"]     = entry.get("position_id")
             _save_cache(_analysis_cache)
 
         return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
@@ -6617,10 +7159,33 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     "text": existing.get("notebooklm_text"),
                     "error": existing.get("notebooklm_error"),
                     "_run_at": existing.get("notebooklm_run_at"),
+                    # So the JS can decide whether to render "Enter Test
+                    # Trade" without a page reload — see notebooklmCompare()'s
+                    # matching comment for why this was missing before.
+                    "sto_chain_price": existing.get("notebooklm_sto_chain_price"),
+                    "sto_strike":      existing.get("notebooklm_sto_strike"),
+                    "sto_expiry":      existing.get("notebooklm_sto_expiry"),
+                    "sto_option_type": existing.get("notebooklm_sto_option_type"),
+                    "btc_chain_price": existing.get("btc_chain_price"),
+                    "position_id":     existing.get("position_id"),
                 }), mimetype="application/json")
             _analysis_inflight.add(pos_key)
 
         def _run():
+            # Someone else (the main automatic run, or another on-demand
+            # click) may have already produced a result while this thread
+            # was queued behind the shared NB lock — confirmed live on GDX
+            # (unborn case, same underlying race applies here): skip
+            # entirely if fresh data already exists, unless explicitly
+            # forced. See the matching comment on
+            # /api/notebooklm-compare-unborn's _run() for the full story.
+            if not force:
+                with _cache_lock:
+                    _fresh = _analysis_cache.get(pos_key) or {}
+                if _fresh.get("notebooklm_text") or _fresh.get("notebooklm_error"):
+                    with _cache_lock:
+                        _analysis_inflight.discard(pos_key)
+                    return
             try:
                 fresh_token = _get_valid_token()
                 open_positions = get_all_open_positions(ticker)
@@ -6660,15 +7225,17 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     e for e in all_expirations
                     if (d := (datetime.date.fromisoformat(e) if e else None)) and d <= cutoff
                 ][:40] or all_expirations[:10]
+                # Rolls never change instrument type — only fetch/upload the
+                # position's own CALL or PUT side. See run_roll_for_position's
+                # matching comment (confirmed live on GLD).
+                _roll_side = "calls" if opt_type.upper() == "CALL" else "puts"
                 all_rows: list[dict] = []
                 for exp_date in expirations:
                     chain_data = get_option_chain(fresh_token, account_id, ticker, exp_date)
                     if not chain_data:
                         continue
-                    for contract in chain_data.get("calls", []):
-                        all_rows.append(contract_to_row(contract, "CALL", exp_date))
-                    for contract in chain_data.get("puts", []):
-                        all_rows.append(contract_to_row(contract, "PUT", exp_date))
+                    for contract in chain_data.get(_roll_side, []):
+                        all_rows.append(contract_to_row(contract, opt_type.upper(), exp_date))
 
                 # 600s: matches _run_notebooklm_roll's own worst case (200s
                 # lock-wait + 380s query work — see _NOTEBOOKLM_LOCK_TIMEOUT/
@@ -6678,13 +7245,82 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 rec, text, error = asyncio.run(
                     asyncio.wait_for(
                         _run_notebooklm_roll(ticker, notebook_id, key_dates, vix, ul_cost_basis,
-                                              open_positions, chain, current_leg_price, all_rows),
+                                              open_positions, chain, current_leg_price, all_rows,
+                                              tail_text=existing.get("tail_text")),
                         timeout=600,
                     )
                 )
             except Exception as exc:
                 log.exception("[notebooklm-compare] failed for %s", pos_key)
                 rec, text, error = None, None, str(exc)
+
+            # Same deterministic PnL guard run_roll_for_position applies to
+            # NB's recommendation inline — this on-demand path used to skip
+            # it entirely (it only ever wrote recommendation/text/error),
+            # which meant a ROLL triggered here NEVER got the money-losing-
+            # roll check NOR the confirmed sto_* fields the "Enter Test
+            # Trade" button requires. Confirmed live on BKR: NB recommended
+            # ROLL to a specific, clearly-stated strike/expiry, but because
+            # this result came from this on-demand button rather than the
+            # main analysis, no button ever appeared.
+            _nb_sto_chain_price = _nb_sto_chain_desc = None
+            _nb_sto_strike = _nb_sto_expiry = _nb_sto_option_type = None
+            if rec == "ROLL" and text:
+                try:
+                    _cur_strike_od = float(matched_pos.get("strike"))
+                except (TypeError, ValueError):
+                    _cur_strike_od = None
+                _cur_type_od = str(matched_pos.get("option_type", "")).upper()
+                _cur_expiry_od = matched_pos.get("expiry")
+                _adapted_rows_od = [
+                    {
+                        "strike": r["strike_price"], "expiry": r["expiration_date"],
+                        "option_type": r["option_type"], "symbol": ticker,
+                        "mid_price": r.get("mid_price"), "last": r.get("last"),
+                    }
+                    for r in all_rows
+                ]
+                _btc_chain_price_od = None
+                for _r in _adapted_rows_od:
+                    try:
+                        _r_strike = float(_r.get("strike") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if (_r.get("option_type") == _cur_type_od and _r_strike == _cur_strike_od
+                            and _r.get("expiry") == _cur_expiry_od):
+                        try:
+                            _btc_chain_price_od = float(_r.get("mid_price") or _r.get("last") or 0) or None
+                        except (TypeError, ValueError):
+                            _btc_chain_price_od = None
+                        break
+                _pos_qty_od = abs(int(matched_pos.get("net_qty") or 0))
+                _nb_pnl_od = _project_roll_pnl(
+                    text, _adapted_rows_od, _cur_type_od, _cur_expiry_od, _cur_strike_od,
+                    _btc_chain_price_od, current_leg_price, chain, _pos_qty_od, ticker,
+                )
+                _nb_sto_chain_price = _nb_pnl_od["sto_chain_price"]
+                _nb_sto_chain_desc  = _nb_pnl_od["sto_chain_desc"]
+                _nb_sto_strike      = _nb_pnl_od["sto_strike"]
+                _nb_sto_expiry      = _nb_pnl_od["sto_expiry"]
+                _nb_sto_option_type = _nb_pnl_od["sto_option_type"]
+                _nb_projected_pnl   = _nb_pnl_od["projected_roll_pnl"]
+                if _nb_projected_pnl is not None and _nb_projected_pnl < 0:
+                    rec = "HOLD"
+                    log.warning(
+                        "Overriding NotebookLM ROLL→HOLD for %s: deterministic projected chain PnL "
+                        "%.2f < 0 (recommended premium ~$%.2f)",
+                        ticker, _nb_projected_pnl, _nb_sto_chain_price
+                    )
+                    text = (
+                        f"**Overridden: HOLD, not ROLL.** The reasoning below recommends "
+                        f"rolling this position, but the actual chain-cash math on that "
+                        f"specific roll comes out to a **${_nb_projected_pnl:,.2f} loss** "
+                        f"(not the ~${_nb_sto_chain_price:.2f}/share premium the reasoning "
+                        f"cites) once the real cost to close the current leg and the cost "
+                        f"to eventually close the new leg are included — so this roll "
+                        f"doesn't pay for itself, and the recommendation has been changed "
+                        f"to HOLD pending a candidate that actually nets a credit.\n\n---\n\n"
+                    ) + text
 
             # Discard from in-flight and write the fresh result in the SAME
             # locked block — split across two separate `with _cache_lock`
@@ -6700,7 +7336,103 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 entry["notebooklm_text"] = text
                 entry["notebooklm_error"] = error
                 entry["notebooklm_run_at"] = run_at
+                entry["notebooklm_sto_chain_price"] = _nb_sto_chain_price
+                entry["notebooklm_sto_chain_desc"]  = _nb_sto_chain_desc
+                entry["notebooklm_sto_strike"]      = _nb_sto_strike
+                entry["notebooklm_sto_expiry"]      = _nb_sto_expiry
+                entry["notebooklm_sto_option_type"] = _nb_sto_option_type
                 _save_cache(_analysis_cache)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                        status=202, mimetype="application/json")
+
+    @app.route("/api/notebooklm-ask", methods=["POST"])
+    @require_auth
+    def api_notebooklm_ask():
+        """
+        Follow-up question against NotebookLM's most recent analysis for an
+        EXISTING position — see ask_notebooklm_followup's docstring for why
+        this re-fetches the chain and re-uploads it rather than reusing
+        anything from the original query (the source was already deleted).
+        Same background-thread + 202 pattern as /api/notebooklm-compare —
+        this involves its own upload+ask round trip, not a quick API call
+        like Claude/Luna's ask endpoints.
+        """
+        body = flask_request.get_json(force=True, silent=True) or {}
+        pos_key = body.get("position_key", "")
+        question = (body.get("question") or "").strip()
+        if not pos_key or not question:
+            return Response(json.dumps({"error": "Missing position_key or question"}), status=400, mimetype="application/json")
+        parts = pos_key.split("|")
+        if len(parts) != 4:
+            return Response(json.dumps({"error": f"Bad position_key: {pos_key}"}), status=400, mimetype="application/json")
+        sym, opt_type, strike_str, expiry = parts
+        ticker = sym.upper()
+
+        with _cache_lock:
+            cached = _analysis_cache.get(pos_key)
+        if not cached or not cached.get("notebooklm_text"):
+            return Response(json.dumps({"error": "No NotebookLM analysis yet for this position — click Compare with Notebook first."}), status=404, mimetype="application/json")
+
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            return Response(json.dumps({"error": "NOTEBOOKLM_NOTEBOOK_ID not set"}), status=500, mimetype="application/json")
+
+        with _cache_lock:
+            if pos_key in _analysis_inflight:
+                return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                                status=202, mimetype="application/json")
+            # Poll-by-repost: the client resends the same question on every
+            # poll (see the JS's forceNow-style hoisting), so a pending
+            # answer left by the background thread must be picked up here
+            # BEFORE treating this as a brand new submission — otherwise
+            # every poll after completion would fire another (duplicate,
+            # costly) NB call instead of ever returning the real answer.
+            pending = _notebooklm_ask_pending.pop(pos_key, None)
+            if pending is not None:
+                return Response(json.dumps(_sanitize(pending), default=_serial), mimetype="application/json")
+            _analysis_inflight.add(pos_key)
+
+        def _run():
+            try:
+                fresh_token = _get_valid_token()
+                all_expirations = get_expirations(fresh_token, account_id, ticker)
+                cutoff = datetime.date.today() + datetime.timedelta(days=90)
+                expirations = [
+                    e for e in all_expirations
+                    if (d := (datetime.date.fromisoformat(e) if e else None)) and d <= cutoff
+                ][:40] or all_expirations[:10]
+                # See run_roll_for_position's matching comment — rolls never
+                # change instrument type, so only fetch the position's own side.
+                _roll_side = "calls" if opt_type.upper() == "CALL" else "puts"
+                all_rows: list[dict] = []
+                for exp_date in expirations:
+                    chain_data = get_option_chain(fresh_token, account_id, ticker, exp_date)
+                    if not chain_data:
+                        continue
+                    for contract in chain_data.get(_roll_side, []):
+                        all_rows.append(contract_to_row(contract, opt_type.upper(), exp_date))
+
+                result = asyncio.run(
+                    asyncio.wait_for(
+                        ask_notebooklm_followup(ticker, notebook_id, all_rows, question),
+                        timeout=500,
+                    )
+                )
+            except Exception as exc:
+                log.exception("[notebooklm-ask] failed for %s", pos_key)
+                result = {"answer": "", "error": str(exc)}
+
+            with _cache_lock:
+                _analysis_inflight.discard(pos_key)
+                _notebooklm_ask_pending[pos_key] = result
+                if not result.get("error"):
+                    entry = _analysis_cache.setdefault(pos_key, {})
+                    thread = entry.get("notebooklm_qa_thread") or []
+                    thread.append({"q": question, "a": result["answer"]})
+                    entry["notebooklm_qa_thread"] = thread
+                    _save_cache(_analysis_cache)
 
         threading.Thread(target=_run, daemon=True).start()
         return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
@@ -6796,6 +7528,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                  len(_unborn_cache_raw) - len(_unborn_cache))
         _save_unborn_cache(_unborn_cache)
     _unborn_inflight: set[str] = set()
+    # See _notebooklm_ask_pending's comment — same purpose, kept separate to
+    # match the existing _analysis_inflight/_unborn_inflight split.
+    _notebooklm_ask_pending_unborn: dict[str, dict] = {}
 
     @app.route("/api/unborn", methods=["POST"])
     @require_auth
@@ -7055,21 +7790,39 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             _unborn_inflight.add(ub_key)
 
         def _run():
+            # Someone else (the main automatic run, or another on-demand
+            # click) may have already produced a result while this thread
+            # was queued behind the shared NB lock — confirmed live on GDX:
+            # a stray on-demand click got stuck waiting for the lock, and by
+            # the time it got in, the main analysis had already finished and
+            # populated a fresh result, but this thread ran the same NB work
+            # again anyway, leaving the main table's spinner stuck for
+            # several extra minutes for no benefit. Skip entirely if fresh
+            # data already exists (unless explicitly forced).
+            if not force:
+                with _cache_lock:
+                    _fresh = _unborn_cache.get(ub_key) or {}
+                if _fresh.get("notebooklm_text") or _fresh.get("notebooklm_error"):
+                    with _cache_lock:
+                        _unborn_inflight.discard(ub_key)
+                    return
             try:
                 fresh_token = _get_valid_token()
                 all_expirations = get_expirations(fresh_token, account_id, ticker)
                 today = datetime.date.today()
                 all_expirations = [e for e in all_expirations if (datetime.date.fromisoformat(e) - today).days >= 7]
                 expirations = all_expirations[:20]
+                # See run_unborn_for_ticker's matching comment — CC only
+                # wants calls, CSP only wants puts.
+                _unborn_side = "calls" if strat == "CC" else "puts"
+                _unborn_type = "CALL" if strat == "CC" else "PUT"
                 all_rows: list[dict] = []
                 for exp_date in expirations:
                     chain_data = get_option_chain(fresh_token, account_id, ticker, exp_date)
                     if not chain_data:
                         continue
-                    for contract in chain_data.get("calls", []):
-                        all_rows.append(contract_to_row(contract, "CALL", exp_date))
-                    for contract in chain_data.get("puts", []):
-                        all_rows.append(contract_to_row(contract, "PUT", exp_date))
+                    for contract in chain_data.get(_unborn_side, []):
+                        all_rows.append(contract_to_row(contract, _unborn_type, exp_date))
 
                 ul_price = get_underlying_price(ticker)
                 opt_type_filter = "CALL" if strat == "CC" else "PUT"
@@ -7095,7 +7848,8 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 rec, text, error = asyncio.run(
                     asyncio.wait_for(
                         _run_notebooklm_unborn(ticker, notebook_id, strat, key_dates, vix,
-                                                ul_cost_basis, qty, all_rows, display_rows),
+                                                ul_cost_basis, qty, all_rows, display_rows,
+                                                tail_text=cached.get("tail_text")),
                         timeout=600,
                     )
                 )
@@ -7162,6 +7916,90 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 _save_unborn_cache(_unborn_cache)
 
         return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
+
+    @app.route("/api/notebooklm-ask-unborn", methods=["POST"])
+    @require_auth
+    def api_notebooklm_ask_unborn():
+        """
+        Follow-up question against NotebookLM's most recent analysis for a
+        NEW/unborn position — see ask_notebooklm_followup's docstring and
+        the matching comment on /api/notebooklm-ask for why this is
+        background-thread + 202 (unlike Claude/Luna's synchronous ask
+        endpoints) and how the poll-by-repost pending-result dict works.
+        """
+        body = flask_request.get_json(force=True, silent=True) or {}
+        ub_key = body.get("ub_key", "")
+        question = (body.get("question") or "").strip()
+        if not ub_key or not question:
+            return Response(json.dumps({"error": "Missing ub_key or question"}), status=400, mimetype="application/json")
+
+        with _cache_lock:
+            cached = _unborn_cache.get(ub_key)
+            if cached is None:
+                resolved_key, cached = _resolve_unborn_prefix_match(ub_key, _unborn_cache)
+                if resolved_key is not None:
+                    ub_key = resolved_key
+        if not cached or not cached.get("notebooklm_text"):
+            return Response(json.dumps({"error": "No NotebookLM analysis yet for this ticker — click Compare with Notebook first."}), status=404, mimetype="application/json")
+
+        notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
+        if not notebook_id:
+            return Response(json.dumps({"error": "NOTEBOOKLM_NOTEBOOK_ID not set"}), status=500, mimetype="application/json")
+
+        ticker = cached.get("ticker", "")
+        strat = cached.get("strat", "CC")
+
+        with _cache_lock:
+            if ub_key in _unborn_inflight:
+                return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                                status=202, mimetype="application/json")
+            pending = _notebooklm_ask_pending_unborn.pop(ub_key, None)
+            if pending is not None:
+                return Response(json.dumps(_sanitize(pending), default=_serial), mimetype="application/json")
+            _unborn_inflight.add(ub_key)
+
+        def _run():
+            try:
+                fresh_token = _get_valid_token()
+                all_expirations = get_expirations(fresh_token, account_id, ticker)
+                today = datetime.date.today()
+                all_expirations = [e for e in all_expirations if (datetime.date.fromisoformat(e) - today).days >= 7]
+                expirations = all_expirations[:20]
+                # See run_unborn_for_ticker's matching comment — CC only
+                # wants calls, CSP only wants puts.
+                _unborn_side = "calls" if strat == "CC" else "puts"
+                _unborn_type = "CALL" if strat == "CC" else "PUT"
+                all_rows: list[dict] = []
+                for exp_date in expirations:
+                    chain_data = get_option_chain(fresh_token, account_id, ticker, exp_date)
+                    if not chain_data:
+                        continue
+                    for contract in chain_data.get(_unborn_side, []):
+                        all_rows.append(contract_to_row(contract, _unborn_type, exp_date))
+
+                result = asyncio.run(
+                    asyncio.wait_for(
+                        ask_notebooklm_followup(ticker, notebook_id, all_rows, question),
+                        timeout=500,
+                    )
+                )
+            except Exception as exc:
+                log.exception("[notebooklm-ask-unborn] failed for %s", ub_key)
+                result = {"answer": "", "error": str(exc)}
+
+            with _cache_lock:
+                _unborn_inflight.discard(ub_key)
+                _notebooklm_ask_pending_unborn[ub_key] = result
+                if not result.get("error"):
+                    entry = _unborn_cache.setdefault(ub_key, dict(cached))
+                    thread = entry.get("notebooklm_qa_thread") or []
+                    thread.append({"q": question, "a": result["answer"]})
+                    entry["notebooklm_qa_thread"] = thread
+                    _save_unborn_cache(_unborn_cache)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return Response(json.dumps({"status": "in_progress", "retry_after": 5}),
+                        status=202, mimetype="application/json")
 
     _UNBORN_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unborn_rows.json")
 
@@ -7537,19 +8375,31 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             else:
                 notebooklm_card_html = '<div id="notebooklm-card"></div>'
 
-            # Button shown whenever there's no SUCCESSFUL NB result yet —
-            # covers both "never attempted" and "attempted automatically but
-            # errored/timed out" (NB is best-effort and legitimately times
-            # out sometimes; the trader should be able to retry it, not get
-            # stuck with a permanent error and no way to ask again short of
-            # a full re-analysis). Once there's real text, the card above
-            # shows it and this button goes away.
-            notebooklm_badge_html = (
-                '' if notebooklm_text_val else
-                '<button onclick="notebooklmCompareUnborn(this)" '
-                'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#f59e0b;color:#000;'
-                'border:none;border-radius:4px;cursor:pointer">Compare with Notebook</button>'
-            )
+            # Badge shown whenever NB has a SUCCESSFUL parsed recommendation
+            # (mirrors Luna's badge/agree-disagree pattern above), else the
+            # retry/first-run button — covers both "never attempted" and
+            # "attempted automatically but errored/timed out" (NB is
+            # best-effort and legitimately times out sometimes; the trader
+            # should be able to retry it, not get stuck with a permanent
+            # error and no way to ask again short of a full re-analysis).
+            notebooklm_rec = cached.get("notebooklm_recommendation")
+            if notebooklm_rec:
+                _nb_cls = "ok" if notebooklm_rec == "SELL" else "warn"
+                _nb_matches = (notebooklm_rec == "SELL") == (_main_action == "SELL")
+                if _nb_matches:
+                    _nb_agree_tag = '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
+                else:
+                    _nb_agree_tag = '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>'
+                notebooklm_badge_html = (
+                    f'<span class="badge badge-{_nb_cls}" style="font-size:11px;padding:3px 10px;margin-left:8px" '
+                    f'title="NotebookLM third opinion">NB: {html_mod.escape(notebooklm_rec)}</span>{_nb_agree_tag}'
+                )
+            else:
+                notebooklm_badge_html = (
+                    '<button onclick="notebooklmCompareUnborn(this)" '
+                    'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#f59e0b;color:#000;'
+                    'border:none;border-radius:4px;cursor:pointer">Compare with Notebook</button>'
+                )
 
             primary_ask_html = (
                 '<div class="ask-section">'
@@ -7571,6 +8421,19 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 '<div id="openai-ask-spinner"></div>'
                 '</div></div></div>'
             )
+            # Only shown once there's an actual NB result to ask follow-ups
+            # against — same reasoning as the badge button: no point offering
+            # an ask box for an advisor that hasn't said anything yet.
+            notebooklm_ask_html = (
+                '<div class="ask-section" style="margin-top:20px">'
+                '<div class="ask-thread" id="notebooklm-ask-thread"></div>'
+                '<div class="ask-input">'
+                '<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask NotebookLM a follow-up question… (can take a few minutes)"></textarea>'
+                '<div class="ask-input-row">'
+                '<button onclick="submitNotebooklmAskUnborn()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask NotebookLM</button>'
+                '<div id="notebooklm-ask-spinner"></div>'
+                '</div></div></div>'
+            ) if notebooklm_text_val else ''
 
             body_html = (
                 f'<div style="margin-bottom:16px">'
@@ -7584,6 +8447,15 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 f'{openai_card_html}'
                 f'{openai_ask_html}'
                 f'{notebooklm_card_html}'
+                # Stable wrapper (always in the DOM, even when empty at page
+                # load) so notebooklmCompareUnborn()'s on-demand JS has
+                # somewhere to inject the ask box into after a successful
+                # compare — without this, a result produced via that button
+                # (rather than the automatic main-analysis run) never gets
+                # an ask box until the page is reloaded, since the box was
+                # never in the initial HTML for JS to find. Confirmed live:
+                # reported missing after using "Compare with Notebook" on BKR.
+                f'<div id="notebooklm-ask-slot">{notebooklm_ask_html}</div>'
             )
 
         _main_action_js = None
@@ -7640,6 +8512,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   .ask-a{{background:#12151f;border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);white-space:pre-wrap;line-height:1.6}}
   .ask-a::before{{content:'Claude: ';color:var(--ok);font-weight:600}}
   .ask-a.openai-ask-a::before{{content:'Luna: ';color:#10a37f}}
+  .ask-a.notebooklm-ask-a::before{{content:'NotebookLM: ';color:#f59e0b}}
   .ask-a.err{{color:var(--danger)}}
   .ask-input{{display:flex;flex-direction:column;gap:8px}}
   .ask-input textarea{{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;font-family:inherit;resize:vertical;min-height:64px;outline:none}}
@@ -7659,6 +8532,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
 const _POS_KEY = {json.dumps(resolved_ub_key)};
 const _MAIN_ACTION = {json.dumps(_main_action_js)};
 const _OPENAI_SAVED_QA = {json.dumps(cached.get("openai_qa_thread", []) if cached else [])};
+const _NOTEBOOKLM_SAVED_QA = {json.dumps(cached.get("notebooklm_qa_thread", []) if cached else [])};
 function esc(s) {{
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }}
@@ -7742,6 +8616,7 @@ async function notebooklmCompareUnborn(btn) {{
   try {{
     let d;
     let forceNow = true;
+    let badPolls = 0;
     while (true) {{
       const r = await fetch('/api/notebooklm-compare-unborn', {{
         method: 'POST',
@@ -7753,21 +8628,48 @@ async function notebooklmCompareUnborn(btn) {{
       // is dangerous: a fast-completing retry could bypass the "already has
       // a result" short-circuit forever instead of ever returning it.
       forceNow = false;
-      d = await r.json();
+      try {{
+        d = await r.json();
+      }} catch (parseErr) {{
+        // A poll landing during a transient Cloudflare/tunnel gateway
+        // hiccup (502/524 etc.) gets back an HTML error page, not JSON —
+        // confirmed live: "Unexpected token '<', \"<!DOCTYPE \"... is not
+        // valid JSON" killed the whole multi-minute wait on what was
+        // otherwise a normal in-progress NB run (the server-side analysis
+        // keeps going regardless of any one poll's transport failure).
+        // Retry like a 202 instead of aborting, bounded so a genuinely
+        // permanent failure doesn't loop forever.
+        badPolls = (badPolls || 0) + 1;
+        if (badPolls >= 10) {{
+          throw new Error('Server returned an unexpected (non-JSON) response ' +
+            badPolls + ' times in a row — likely a tunnel/gateway issue. ' +
+            'The analysis may still complete in the background; check back shortly.');
+        }}
+        await new Promise(res => setTimeout(res, 5000));
+        continue;
+      }}
       if (r.status === 202 && d.status === 'in_progress') {{
         await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
         continue;
       }}
       break;
     }}
-    if (slot) slot.innerHTML = '';
     if (d.error) {{
+      if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(d.error)}}</span>`;
       const card = document.getElementById('notebooklm-card');
       if (card) card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
         + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>`
         + `<span class="chain-working" style="color:var(--muted);display:block;margin-top:6px">Not available this run: ${{esc(d.error)}}</span>`
         + `</div>`;
       return;
+    }}
+    if (slot) {{
+      const cls = d.recommendation === 'SELL' ? 'ok' : 'warn';
+      const matches = _MAIN_ACTION && ((d.recommendation === 'SELL') === (_MAIN_ACTION === 'SELL'));
+      const agreeTag = !_MAIN_ACTION ? '' : matches
+        ? '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
+        : '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>';
+      slot.innerHTML = `<span class="badge badge-${{cls}}" style="font-size:11px;padding:3px 10px;margin-left:8px" title="NotebookLM third opinion">NB: ${{esc(d.recommendation||'?')}}</span>${{agreeTag}}`;
     }}
     const card = document.getElementById('notebooklm-card');
     if (card) {{
@@ -7776,6 +8678,22 @@ async function notebooklmCompareUnborn(btn) {{
         + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion)</span>`
         + `<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">${{body}}</span>`
         + `</div>`;
+    }}
+    // A result produced via this on-demand button (rather than the
+    // automatic main-analysis run) never had the ask box rendered into
+    // the page at load time — inject it now so a follow-up question can
+    // be asked without reloading. Only fills the slot if it's still
+    // empty, so re-comparing doesn't wipe out an in-progress Q&A thread.
+    const askSlot = document.getElementById('notebooklm-ask-slot');
+    if (askSlot && !askSlot.querySelector('.ask-section')) {{
+      askSlot.innerHTML = `<div class="ask-section" style="margin-top:20px">`
+        + `<div class="ask-thread" id="notebooklm-ask-thread"></div>`
+        + `<div class="ask-input">`
+        + `<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask NotebookLM a follow-up question… (can take a few minutes)"></textarea>`
+        + `<div class="ask-input-row">`
+        + `<button onclick="submitNotebooklmAskUnborn()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask NotebookLM</button>`
+        + `<div id="notebooklm-ask-spinner"></div>`
+        + `</div></div></div>`;
     }}
   }} catch(e) {{
     if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(e.message)}}</span>`;
@@ -7793,6 +8711,13 @@ const _SAVED_QA = {json.dumps(cached.get("qa_thread", []) if cached else [])};
   for (const item of _OPENAI_SAVED_QA) {{
     const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; openaiThread.appendChild(qEl);
     const aEl = document.createElement('div'); aEl.className='ask-a openai-ask-a'; aEl.innerHTML=renderAdvisorMarkdown(item.a); openaiThread.appendChild(aEl);
+  }}
+  const notebooklmThread = document.getElementById('notebooklm-ask-thread');
+  if (notebooklmThread) {{
+    for (const item of _NOTEBOOKLM_SAVED_QA) {{
+      const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; notebooklmThread.appendChild(qEl);
+      const aEl = document.createElement('div'); aEl.className='ask-a notebooklm-ask-a'; aEl.innerHTML=renderAdvisorMarkdown(item.a); notebooklmThread.appendChild(aEl);
+    }}
   }}
 }})();
 async function submitAsk() {{
@@ -7848,6 +8773,45 @@ async function submitOpenaiAskUnborn() {{
 }}
 document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
   if (e.key==='Enter' && !e.shiftKey) {{ e.preventDefault(); submitOpenaiAskUnborn(); }}
+}});
+
+async function submitNotebooklmAskUnborn() {{
+  const ta = document.getElementById('notebooklm-ask-q');
+  const q = ta.value.trim();
+  if (!q) return;
+  const thread = document.getElementById('notebooklm-ask-thread');
+  const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=q; thread.appendChild(qEl);
+  ta.value = '';
+  document.getElementById('notebooklm-ask-spinner').style.display = 'block';
+  const aEl = document.createElement('div'); aEl.className='ask-a notebooklm-ask-a'; aEl.textContent='… (can take a few minutes)'; thread.appendChild(aEl);
+  aEl.scrollIntoView({{behavior:'smooth'}});
+  try {{
+    let d;
+    let forceQ = q;  // resent unchanged on every poll — the server treats an
+                      // in-flight or already-pending request as a poll, not
+                      // a new submission, regardless of body content
+    while (true) {{
+      const r = await fetch('/api/notebooklm-ask-unborn', {{
+        method:'POST', headers:{{'Content-Type':'application/json'}},
+        body: JSON.stringify({{ub_key: _POS_KEY, question: forceQ}})
+      }});
+      d = await r.json();
+      if (r.status === 202 && d.status === 'in_progress') {{
+        await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
+        continue;
+      }}
+      break;
+    }}
+    if (d.error) {{ aEl.className='ask-a notebooklm-ask-a err'; aEl.textContent=d.error; }}
+    else {{ aEl.innerHTML=renderAdvisorMarkdown(d.answer || ''); }}
+  }} catch(e) {{ aEl.className='ask-a notebooklm-ask-a err'; aEl.textContent=e.message; }}
+  finally {{
+    document.getElementById('notebooklm-ask-spinner').style.display='none';
+    aEl.scrollIntoView({{behavior:'smooth'}});
+  }}
+}}
+document.getElementById('notebooklm-ask-q')?.addEventListener('keydown', e => {{
+  if (e.key==='Enter' && !e.shiftKey) {{ e.preventDefault(); submitNotebooklmAskUnborn(); }}
 }});
 </script>
 </body></html>"""
@@ -7933,6 +8897,139 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
                     _save_cache(_analysis_cache)
 
         return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
+
+    @app.route("/api/enter-test-roll", methods=["POST"])
+    @require_auth
+    def api_enter_test_roll():
+        """
+        "Enter Test Trade" button on a suggested ROLL — books the FULL
+        projected chain (BTC current leg + STO new leg + eventual BTC of
+        the new leg at 40% of its own premium, i.e. the standard 60%-
+        profit-capture exit this whole system already assumes everywhere
+        else — see _project_roll_pnl's roll_close_price/roll_close_cost,
+        which this route mirrors exactly) into the trade journal as a TEST
+        roll (is_test=1). The first two legs go through the journal's
+        existing /api/positions/<id>/roll endpoint (closes the old leg,
+        opens the new one under a shared spread_id); the third (closing
+        the brand-new leg) is a follow-up call to the journal's existing
+        /api/positions/<id>/trades endpoint against that same new position.
+        Test trades don't affect real P&L tracking, but do feed
+        sim_chain_cash so the "if I actually did this, all the way
+        through" projection shows up next to the real chain PnL — without
+        the third leg, sim_chain_cash would only reflect the initial roll
+        credit, not the full round-trip the projected_roll_pnl math (and
+        the recommendation text itself) is actually promising.
+
+        `advisor` selects WHICH advisor's own suggested roll to book —
+        "claude" (default), "openai" (Luna), or "notebooklm". Each advisor
+        can recommend a different new leg, so each gets its own confirmed
+        STO price/strike/expiry/type fields (see run_roll_for_position's
+        three independent _project_roll_pnl calls) and its own
+        already-entered tracking key, so entering one advisor's test trade
+        doesn't block entering another's.
+        """
+        body    = flask_request.get_json(force=True, silent=True) or {}
+        pos_key = body.get("position_key", "")
+        advisor = (body.get("advisor") or "claude").lower()
+        if advisor not in ("claude", "openai", "notebooklm"):
+            return Response(json.dumps({"error": f"Unknown advisor: {advisor}"}), status=400, mimetype="application/json")
+        if not pos_key:
+            return Response(json.dumps({"error": "Missing position_key"}), status=400, mimetype="application/json")
+
+        _prefix = "" if advisor == "claude" else f"{advisor}_"
+        _done_key = "test_trade_new_position_id" if advisor == "claude" else f"{advisor}_test_trade_new_position_id"
+
+        with _cache_lock:
+            cached = _analysis_cache.get(pos_key)
+        if not cached:
+            return Response(json.dumps({"error": "No analysis cached for this position — analyze it first."}),
+                            status=404, mimetype="application/json")
+
+        if cached.get(_done_key):
+            return Response(json.dumps({
+                "error": None,
+                "already_entered": True,
+                "new_position_id": cached[_done_key],
+            }), mimetype="application/json")
+
+        missing = [
+            f for f in ("position_id", "btc_chain_price", f"{_prefix}sto_chain_price",
+                        f"{_prefix}sto_strike", f"{_prefix}sto_expiry", f"{_prefix}sto_option_type", "pos_qty")
+            if cached.get(f) is None
+        ]
+        if missing:
+            return Response(json.dumps({
+                "error": f"Missing confirmed roll data ({', '.join(missing)}) — this advisor's "
+                         "suggestion doesn't have a fully-parsed roll to test."
+            }), status=400, mimetype="application/json")
+
+        ticker      = cached["ticker"]
+        pos_qty     = int(cached["pos_qty"])
+        btc_price   = float(cached["btc_chain_price"])
+        sto_price   = float(cached[f"{_prefix}sto_chain_price"])
+        today_str   = datetime.date.today().isoformat()
+
+        close_leg = {
+            "trade_date": today_str, "action": "buy", "quantity": pos_qty, "price": btc_price,
+            "commission": auto_comm("buy", btc_price, pos_qty, is_close=True),
+            "fees": auto_fees("buy", btc_price, pos_qty, ticker),
+            "notes": f"Test trade — from {advisor}'s suggested roll",
+        }
+        new_leg = {
+            "option_type": cached[f"{_prefix}sto_option_type"].lower(),
+            "strike": cached[f"{_prefix}sto_strike"],
+            "expiry": cached[f"{_prefix}sto_expiry"],
+            "trade_date": today_str, "action": "sell", "quantity": pos_qty, "price": sto_price,
+            "commission": auto_comm("sell", sto_price, pos_qty, is_close=False),
+            "fees": auto_fees("sell", sto_price, pos_qty, ticker),
+            "notes": f"Test trade — from {advisor}'s suggested roll",
+        }
+
+        try:
+            import requests as _req
+            resp = _req.post(
+                f"http://localhost:5001/api/positions/{int(cached['position_id'])}/roll",
+                json={"is_test": True, "close": close_leg, "new": new_leg},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+
+            # Third leg: eventual BTC of the brand-new position at 40% of its
+            # own STO premium (the 60%-profit exit assumed throughout this
+            # system) — same math as _project_roll_pnl's roll_close_price,
+            # recomputed here rather than read from the cache since only
+            # Claude's own roll_close_price is stored today (see the return
+            # dict in run_roll_for_position); it's a pure function of
+            # sto_price so there's nothing advisor-specific to look up.
+            new_pos_id = result.get("new_position_id")
+            if new_pos_id:
+                close_new_price = round(sto_price * 0.40, 4)
+                resp2 = _req.post(
+                    f"http://localhost:5001/api/positions/{int(new_pos_id)}/trades",
+                    json={
+                        "trade_date": today_str, "action": "buy", "quantity": pos_qty,
+                        "price": close_new_price,
+                        "commission": auto_comm("buy", close_new_price, pos_qty, is_close=True),
+                        "fees": auto_fees("buy", close_new_price, pos_qty, ticker),
+                        "notes": f"Test trade — simulated 60% profit close of {advisor}'s suggested roll",
+                        "is_test": True,
+                    },
+                    timeout=15,
+                )
+                resp2.raise_for_status()
+        except Exception as exc:
+            log.exception("[enter-test-roll] failed for %s (advisor=%s)", pos_key, advisor)
+            return Response(json.dumps({"error": str(exc)}), status=502, mimetype="application/json")
+
+        with _cache_lock:
+            entry = _analysis_cache.setdefault(pos_key, {})
+            entry[_done_key] = result.get("new_position_id")
+            _save_cache(_analysis_cache)
+
+        log.info("[enter-test-roll] %s → closed pos %s, opened test pos %s",
+                  pos_key, result.get("closed_position_id"), result.get("new_position_id"))
+        return Response(json.dumps({"error": None, "already_entered": False, **result}), mimetype="application/json")
 
     @app.route("/api/reset-cache-entry", methods=["POST"])
     @require_auth
@@ -8339,10 +9436,16 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
                 if sto_chain_price is not None:
                     _sto_desc = html_mod.escape(sto_chain_desc) if sto_chain_desc else "new leg"
                     _price_parts.append(f"STO leg ({_sto_desc}) @ ${sto_chain_price:.2f}")
+                # "Enter Test Trade" — only offered once the full candidate
+                # (both legs, journal position id) is confirmed. Already-
+                # entered state persists in the cache so reloading the page
+                # (or clicking again) doesn't book a second test roll.
+                test_trade_html = _test_trade_button_html(cached, "claude")
                 confirmed_html = (
                     f'<div class="chain-pnl" style="margin-top:14px">'
                     f'<span class="chain-label">Confirmed Prices &nbsp;'
                     f'<span style="font-weight:normal;color:var(--muted)">(from the chain used for this analysis)</span></span>'
+                    f'{test_trade_html}'
                     f'<span class="chain-working">{" &nbsp;|&nbsp; ".join(_price_parts)}</span>'
                     f'</div>'
                 )
@@ -8461,9 +9564,16 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
                     f'&nbsp;&nbsp;<span style="font-weight:normal;color:var(--muted);font-size:11px">'
                     f'Updated {html_mod.escape(openai_run_at)}</span>' if openai_run_at else ""
                 )
+                # Luna's own suggested roll gets its own "Enter Test Trade" —
+                # see _test_trade_button_html's docstring for why each
+                # advisor is tracked independently.
+                _openai_test_trade_html = (
+                    _test_trade_button_html(cached, "openai", "openai_") if openai_rec == "ROLL" else ""
+                )
                 openai_card_html = (
                     f'<div id="openai-card" class="chain-pnl" style="margin-top:14px;border-color:#10a37f">'
                     f'<span class="chain-label" style="color:#10a37f">Luna’s Take (GPT-5.6, second opinion){_ai2_updated}</span>'
+                    f'{_openai_test_trade_html}'
                     f'<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">{_ai2_body}</span>'
                     f'</div>'
                 )
@@ -8491,9 +9601,17 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
                     f'&nbsp;&nbsp;<span style="font-weight:normal;color:var(--muted);font-size:11px">'
                     f'Updated {html_mod.escape(notebooklm_run_at_val)}</span>' if notebooklm_run_at_val else ""
                 )
+                # NotebookLM's own suggested roll gets its own "Enter Test
+                # Trade" — see _test_trade_button_html's docstring for why
+                # each advisor is tracked independently.
+                _nb_test_trade_html = (
+                    _test_trade_button_html(cached, "notebooklm", "notebooklm_")
+                    if cached.get("notebooklm_recommendation") == "ROLL" else ""
+                )
                 notebooklm_card_html = (
                     f'<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">'
                     f'<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion){_nb_updated}</span>'
+                    f'{_nb_test_trade_html}'
                     f'<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">{_nb_body}</span>'
                     f'</div>'
                 )
@@ -8508,19 +9626,32 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
             else:
                 notebooklm_card_html = '<div id="notebooklm-card"></div>'
 
-            # Button shown whenever there's no SUCCESSFUL NB result yet —
-            # covers both "never attempted" and "attempted automatically but
-            # errored/timed out" (NB is best-effort and legitimately times
-            # out sometimes; the trader should be able to retry it, not get
-            # stuck with a permanent error and no way to ask again short of
-            # a full re-analysis). Once there's real text, the card above
-            # shows it and this button goes away.
-            notebooklm_badge_html = (
-                '' if notebooklm_text_val else
-                '<button onclick="notebooklmCompare(this)" '
-                'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#f59e0b;color:#000;'
-                'border:none;border-radius:4px;cursor:pointer">Compare with Notebook</button>'
-            )
+            # Badge shown whenever NB has a SUCCESSFUL parsed recommendation
+            # (mirrors Luna's badge/agree-disagree pattern above), else the
+            # retry/first-run button — covers both "never attempted" and
+            # "attempted automatically but errored/timed out" (NB is
+            # best-effort and legitimately times out sometimes; the trader
+            # should be able to retry it, not get stuck with a permanent
+            # error and no way to ask again short of a full re-analysis).
+            notebooklm_rec = cached.get("notebooklm_recommendation")
+            if notebooklm_rec:
+                _nb_cls = {"ROLL": "warn", "ASSIGNMENT": "danger", "HOLD": "hold"}.get(notebooklm_rec, "ok")
+                if not rec:
+                    _nb_agree_tag = ""
+                elif notebooklm_rec == rec:
+                    _nb_agree_tag = '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
+                else:
+                    _nb_agree_tag = '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>'
+                notebooklm_badge_html = (
+                    f'<span class="badge badge-{_nb_cls}" style="font-size:11px;padding:3px 10px;margin-left:8px" '
+                    f'title="NotebookLM third opinion">NB: {html_mod.escape(notebooklm_rec)}</span>{_nb_agree_tag}'
+                )
+            else:
+                notebooklm_badge_html = (
+                    '<button onclick="notebooklmCompare(this)" '
+                    'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#f59e0b;color:#000;'
+                    'border:none;border-radius:4px;cursor:pointer">Compare with Notebook</button>'
+                )
 
             primary_ask_html = (
                 '<div class="ask-section">'
@@ -8542,6 +9673,19 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
                 '<div id="openai-ask-spinner"></div>'
                 '</div></div></div>'
             )
+            # Only shown once there's an actual NB result to ask follow-ups
+            # against — same reasoning as the badge button: no point offering
+            # an ask box for an advisor that hasn't said anything yet.
+            notebooklm_ask_html = (
+                '<div class="ask-section" style="margin-top:20px">'
+                '<div class="ask-thread" id="notebooklm-ask-thread"></div>'
+                '<div class="ask-input">'
+                '<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask NotebookLM a follow-up question… (can take a few minutes)"></textarea>'
+                '<div class="ask-input-row">'
+                '<button onclick="submitNotebooklmAsk()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask NotebookLM</button>'
+                '<div id="notebooklm-ask-spinner"></div>'
+                '</div></div></div>'
+            ) if notebooklm_text_val else ''
 
             body_html = (
                 f'<div style="margin-bottom:16px">'
@@ -8558,6 +9702,10 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
                 f'{openai_card_html}'
                 f'{openai_ask_html}'
                 f'{notebooklm_card_html}'
+                # Stable wrapper — see the matching comment on
+                # unborn_detail()'s body_html for why this must always be
+                # in the DOM, even when empty at page load.
+                f'<div id="notebooklm-ask-slot">{notebooklm_ask_html}</div>'
             )
 
         page = f"""<!DOCTYPE html>
@@ -8623,6 +9771,7 @@ document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
   .ask-a{{background:#12151f;border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);white-space:pre-wrap;line-height:1.6}}
   .ask-a::before{{content:'Claude: ';color:var(--ok);font-weight:600}}
   .ask-a.openai-ask-a::before{{content:'Luna: ';color:#10a37f}}
+  .ask-a.notebooklm-ask-a::before{{content:'NotebookLM: ';color:#f59e0b}}
   .ask-a.err{{color:var(--danger)}}
   .ask-input{{display:flex;flex-direction:column;gap:8px}}
   .ask-input textarea{{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;font-family:inherit;resize:vertical;min-height:64px;outline:none}}
@@ -8645,8 +9794,30 @@ const _POS_KEY = {json.dumps(pos_key)};
 const _MAIN_REC = {json.dumps(rec)};
 const _SAVED_QA = {json.dumps(cached.get("qa_thread", []) if cached else [])};
 const _OPENAI_SAVED_QA = {json.dumps(cached.get("openai_qa_thread", []) if cached else [])};
+const _NOTEBOOKLM_SAVED_QA = {json.dumps(cached.get("notebooklm_qa_thread", []) if cached else [])};
 function esc(s) {{
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}}
+async function enterTestRoll(btn, advisor) {{
+  advisor = advisor || 'claude';
+  if (btn) {{ btn.disabled = true; btn.textContent = 'Entering…'; }}
+  const slotId = advisor === 'claude' ? 'enter-test-roll-slot' : `enter-test-roll-slot-${{advisor}}`;
+  const slot = document.getElementById(slotId);
+  try {{
+    const r = await fetch('/api/enter-test-roll', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{position_key: _POS_KEY, advisor: advisor}})
+    }});
+    const d = await r.json();
+    if (d.error) {{
+      if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:12px;margin-left:10px">Test trade failed: ${{esc(d.error)}}</span>`;
+      return;
+    }}
+    if (slot) slot.innerHTML = `<span style="color:var(--ok);font-size:12px;margin-left:10px">&#10003; Test trade entered (journal position #${{esc(d.new_position_id)}})</span>`;
+  }} catch(e) {{
+    if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:12px;margin-left:10px">Test trade failed: ${{esc(e.message)}}</span>`;
+  }}
 }}
 function _openaiBadgeCls(rec) {{
   return rec === 'ROLL' ? 'warn' : rec === 'ASSIGNMENT' ? 'danger' : rec === 'HOLD' ? 'hold' : 'ok';
@@ -8713,8 +9884,21 @@ async function openaiCompare(btn) {{
     }}
     if (card) {{
       const body = renderAdvisorMarkdown(d.text || '');
+      // "Enter Test Trade" for Luna's own suggestion — this on-demand
+      // compare used to never render it at all (only the automatic main-
+      // analysis flow did), same class of bug as NotebookLM's own compare
+      // button; see notebooklmCompare()'s matching comment.
+      const canTestOpenai = d.recommendation === 'ROLL' && d.position_id != null
+        && d.btc_chain_price != null && d.sto_chain_price != null
+        && d.sto_strike != null && d.sto_expiry != null && d.sto_option_type != null;
+      const testTradeOpenai = canTestOpenai
+        ? `<span id="enter-test-roll-slot-openai"><button onclick="enterTestRoll(this, 'openai')" `
+          + `style="margin-left:10px;font-size:12px;padding:4px 10px;background:#6366f1;color:#fff;`
+          + `border:none;border-radius:4px;cursor:pointer">Enter Test Trade</button></span>`
+        : `<span id="enter-test-roll-slot-openai"></span>`;
       card.outerHTML = `<div id="openai-card" class="chain-pnl" style="margin-top:14px;border-color:#10a37f">`
         + `<span class="chain-label" style="color:#10a37f">Luna’s Take (GPT-5.6, second opinion)</span>`
+        + testTradeOpenai
         + `<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">${{body}}</span>`
         + `</div>`;
     }}
@@ -8732,6 +9916,7 @@ async function notebooklmCompare(btn) {{
   try {{
     let d;
     let forceNow = true;
+    let badPolls = 0;
     while (true) {{
       const r = await fetch('/api/notebooklm-compare', {{
         method: 'POST',
@@ -8743,15 +9928,34 @@ async function notebooklmCompare(btn) {{
       // is dangerous: a fast-completing retry could bypass the "already has
       // a result" short-circuit forever instead of ever returning it.
       forceNow = false;
-      d = await r.json();
+      try {{
+        d = await r.json();
+      }} catch (parseErr) {{
+        // A poll landing during a transient Cloudflare/tunnel gateway
+        // hiccup (502/524 etc.) gets back an HTML error page, not JSON —
+        // confirmed live: "Unexpected token '<', \"<!DOCTYPE \"... is not
+        // valid JSON" killed the whole multi-minute wait on what was
+        // otherwise a normal in-progress NB run (the server-side analysis
+        // keeps going regardless of any one poll's transport failure).
+        // Retry like a 202 instead of aborting, bounded so a genuinely
+        // permanent failure doesn't loop forever.
+        badPolls = (badPolls || 0) + 1;
+        if (badPolls >= 10) {{
+          throw new Error('Server returned an unexpected (non-JSON) response ' +
+            badPolls + ' times in a row — likely a tunnel/gateway issue. ' +
+            'The analysis may still complete in the background; check back shortly.');
+        }}
+        await new Promise(res => setTimeout(res, 5000));
+        continue;
+      }}
       if (r.status === 202 && d.status === 'in_progress') {{
         await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
         continue;
       }}
       break;
     }}
-    if (slot) slot.innerHTML = '';
     if (d.error) {{
+      if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(d.error)}}</span>`;
       const card = document.getElementById('notebooklm-card');
       if (card) card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
         + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>`
@@ -8759,13 +9963,52 @@ async function notebooklmCompare(btn) {{
         + `</div>`;
       return;
     }}
+    if (slot) {{
+      const cls = _openaiBadgeCls(d.recommendation);
+      const agreeTag = !_MAIN_REC
+        ? ''
+        : d.recommendation === _MAIN_REC
+        ? '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
+        : '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>';
+      slot.innerHTML = `<span class="badge badge-${{cls}}" style="font-size:11px;padding:3px 10px;margin-left:8px" title="NotebookLM third opinion">NB: ${{esc(d.recommendation||'?')}}</span>${{agreeTag}}`;
+    }}
     const card = document.getElementById('notebooklm-card');
     if (card) {{
       const body = renderAdvisorMarkdown(d.text || '');
+      // "Enter Test Trade" for NB's own suggestion — this on-demand compare
+      // used to never render it (only the automatic main-analysis flow
+      // did), so a ROLL produced via this button had no button until the
+      // page was reloaded. Confirmed live: reported missing on HAL.
+      const canTestNb = d.recommendation === 'ROLL' && d.position_id != null
+        && d.btc_chain_price != null && d.sto_chain_price != null
+        && d.sto_strike != null && d.sto_expiry != null && d.sto_option_type != null;
+      const testTradeNb = canTestNb
+        ? `<span id="enter-test-roll-slot-notebooklm"><button onclick="enterTestRoll(this, 'notebooklm')" `
+          + `style="margin-left:10px;font-size:12px;padding:4px 10px;background:#6366f1;color:#fff;`
+          + `border:none;border-radius:4px;cursor:pointer">Enter Test Trade</button></span>`
+        : `<span id="enter-test-roll-slot-notebooklm"></span>`;
       card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
         + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion)</span>`
+        + testTradeNb
         + `<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">${{body}}</span>`
         + `</div>`;
+    }}
+    // A result produced via this on-demand button (rather than the
+    // automatic main-analysis run) never had the ask box rendered into
+    // the page at load time — inject it now so a follow-up question can
+    // be asked without reloading. Only fills the slot if it's still
+    // empty, so re-comparing doesn't wipe out an in-progress Q&A thread.
+    // Confirmed live: reported missing after "Compare with Notebook" on BKR.
+    const askSlot = document.getElementById('notebooklm-ask-slot');
+    if (askSlot && !askSlot.querySelector('.ask-section')) {{
+      askSlot.innerHTML = `<div class="ask-section" style="margin-top:20px">`
+        + `<div class="ask-thread" id="notebooklm-ask-thread"></div>`
+        + `<div class="ask-input">`
+        + `<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask NotebookLM a follow-up question… (can take a few minutes)"></textarea>`
+        + `<div class="ask-input-row">`
+        + `<button onclick="submitNotebooklmAsk()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask NotebookLM</button>`
+        + `<div id="notebooklm-ask-spinner"></div>`
+        + `</div></div></div>`;
     }}
   }} catch(e) {{
     if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(e.message)}}</span>`;
@@ -8782,6 +10025,13 @@ async function notebooklmCompare(btn) {{
   for (const item of _OPENAI_SAVED_QA) {{
     const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; openaiThread.appendChild(qEl);
     const aEl = document.createElement('div'); aEl.className='ask-a openai-ask-a'; aEl.innerHTML=renderAdvisorMarkdown(item.a); openaiThread.appendChild(aEl);
+  }}
+  const notebooklmThread = document.getElementById('notebooklm-ask-thread');
+  if (notebooklmThread) {{
+    for (const item of _NOTEBOOKLM_SAVED_QA) {{
+      const qEl = document.createElement('div'); qEl.className='ask-q'; qEl.textContent=item.q; notebooklmThread.appendChild(qEl);
+      const aEl = document.createElement('div'); aEl.className='ask-a notebooklm-ask-a'; aEl.innerHTML=renderAdvisorMarkdown(item.a); notebooklmThread.appendChild(aEl);
+    }}
   }}
 }})();
 async function submitOpenaiAsk() {{
@@ -8818,6 +10068,50 @@ async function submitOpenaiAsk() {{
 }}
 document.getElementById('openai-ask-q').addEventListener('keydown', e => {{
   if (e.key === 'Enter' && !e.shiftKey) {{ e.preventDefault(); submitOpenaiAsk(); }}
+}});
+
+async function submitNotebooklmAsk() {{
+  const ta = document.getElementById('notebooklm-ask-q');
+  const q = ta.value.trim();
+  if (!q) return;
+  const thread = document.getElementById('notebooklm-ask-thread');
+  const qEl = document.createElement('div');
+  qEl.className = 'ask-q';
+  qEl.textContent = q;
+  thread.appendChild(qEl);
+  ta.value = '';
+  document.getElementById('notebooklm-ask-spinner').style.display = 'block';
+  const aEl = document.createElement('div');
+  aEl.className = 'ask-a notebooklm-ask-a';
+  aEl.textContent = '… (can take a few minutes)';
+  thread.appendChild(aEl);
+  aEl.scrollIntoView({{behavior:'smooth'}});
+  try {{
+    let d;
+    while (true) {{
+      const r = await fetch('/api/notebooklm-ask', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{position_key: _POS_KEY, question: q}})
+      }});
+      d = await r.json();
+      if (r.status === 202 && d.status === 'in_progress') {{
+        await new Promise(res => setTimeout(res, (d.retry_after || 5) * 1000));
+        continue;
+      }}
+      break;
+    }}
+    if (d.error) {{ aEl.className = 'ask-a notebooklm-ask-a err'; aEl.textContent = d.error; }}
+    else {{ aEl.innerHTML = renderAdvisorMarkdown(d.answer || ''); }}
+  }} catch(e) {{
+    aEl.className = 'ask-a notebooklm-ask-a err'; aEl.textContent = e.message;
+  }} finally {{
+    document.getElementById('notebooklm-ask-spinner').style.display = 'none';
+    aEl.scrollIntoView({{behavior:'smooth'}});
+  }}
+}}
+document.getElementById('notebooklm-ask-q')?.addEventListener('keydown', e => {{
+  if (e.key === 'Enter' && !e.shiftKey) {{ e.preventDefault(); submitNotebooklmAsk(); }}
 }});
 async function submitAsk() {{
   const ta = document.getElementById('ask-q');
@@ -9390,6 +10684,34 @@ def print_key_dates(ticker: str, dates: dict) -> None:
     print_box(lines, title=f"  {ticker} — Key Dates  ")
 
 
+async def _list_sources_with_retry(client, notebook_id: str, max_attempts: int = 3) -> list:
+    """
+    client.sources.list() wraps the GET_NOTEBOOK RPC, which has been
+    observed to fail transiently with "RPCError: RPC rLM1Ne returned null
+    result with status code 3 (Invalid argument)" — confirmed live: 4/4
+    consecutive raw calls failed this way, while the notebooklm-py CLI's
+    own `source list` command (which resolves the notebook via
+    client.notebooks.list() first) succeeded immediately after with the
+    exact same underlying client.sources.list() call. Whatever the precise
+    cause, a short retry is cheap here (this is a quick metadata RPC, not
+    a multi-minute LLM call) and every caller previously treated any
+    failure as fatal-for-this-run, silently skipping stale-source cleanup
+    on what may just be a passing hiccup — exactly the kind of gap that
+    lets ticker CSV sources and other cruft quietly accumulate over time.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await client.sources.list(notebook_id)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                log.warning("[sources.list] attempt %d/%d failed, retrying — %s",
+                            attempt + 1, max_attempts, exc)
+                await asyncio.sleep(3)
+    raise last_exc
+
+
 async def _ensure_fed_calendar_source(client, notebook_id: str) -> None:
     """
     Keep a NEXT-month NY Fed Economic Indicators Calendar source in the
@@ -9408,7 +10730,7 @@ async def _ensure_fed_calendar_source(client, notebook_id: str) -> None:
     correct_url = claude_advisor.fed_month_url(next_month)
 
     try:
-        sources = await client.sources.list(notebook_id)
+        sources = await _list_sources_with_retry(client, notebook_id)
     except Exception as exc:
         log.warning("[fed-calendar] Could not list sources: %s", exc)
         return
@@ -9449,19 +10771,22 @@ async def _purge_stale_ticker_sources(client, notebook_id: str, uploading_ticker
     """
     Before uploading a new ticker CSV, remove any existing sources for that
     same ticker (prevents same-ticker dupes). Also age out any other ticker
-    CSV sources that are more than 1 day old (catches leaked sources whose
-    post-query delete failed).
+    CSV sources older than _STALE_TICKER_SOURCE_MAX_AGE (catches leaked
+    sources whose post-query delete failed — see that constant's comment).
+    Also called at --web startup with uploading_ticker=None so a restart
+    that killed an in-flight NB background thread self-heals immediately
+    instead of waiting for the next per-ticker upload to trigger this.
 
     A "ticker source" is identified by:
       • filename ends with .csv
       • filename stem (left of the first '.') is all-uppercase, 1–5 characters
     """
     now    = datetime.datetime.now(datetime.timezone.utc)
-    cutoff = now - datetime.timedelta(days=1)
+    cutoff = now - _STALE_TICKER_SOURCE_MAX_AGE
     target = (uploading_ticker or "").upper()
 
     try:
-        sources = await client.sources.list(notebook_id)
+        sources = await _list_sources_with_retry(client, notebook_id)
     except Exception as exc:
         log.warning("[cleanup] Could not list sources: %s", exc)
         return
@@ -9501,7 +10826,7 @@ async def _purge_all_ticker_sources(notebook_id: str) -> None:
     from notebooklm import NotebookLMClient
     async with NotebookLMClient.from_storage() as client:
         try:
-            sources = await client.sources.list(notebook_id)
+            sources = await _list_sources_with_retry(client, notebook_id)
         except Exception as exc:
             print(f"ERROR: Could not list sources: {exc}")
             return
@@ -9519,7 +10844,19 @@ async def _purge_all_ticker_sources(notebook_id: str) -> None:
 async def upload_to_notebooklm(file_path: str, notebook_id: str) -> str | None:
     """Upload a file as a new source to the specified NotebookLM notebook.
 
-    Uses wait=False to avoid the GET_NOTEBOOK polling that causes timeouts.
+    Uses wait=False on add_file itself to avoid the GET_NOTEBOOK polling
+    that causes timeouts, but then separately confirms the source actually
+    finished processing via the source-scoped sources.wait_until_ready
+    (a different, bounded per-source poll — not the notebook-level one
+    that caused the original problem). Without this, a source that fails
+    to process server-side (NB's own UI shows a red "Error uploading
+    source, try again!" badge on it) looked identical to success here —
+    we'd get a source_id back immediately regardless — and the caller
+    would sleep 15s and query against a source with no real content,
+    surfacing minutes later as an opaque "ChatResponseParseError: No
+    parseable chunks in streaming chat response" with no indication the
+    upload itself was the actual failure. Confirmed live on GLD.
+
     Deletes any previously tracked source for this ticker before uploading
     a new one (avoids duplicates without needing sources.list()).
 
@@ -9527,7 +10864,7 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> str | None:
     Callers should sleep ~15s before querying to let the source process.
     """
     try:
-        from notebooklm import NotebookLMClient
+        from notebooklm import NotebookLMClient, SourceProcessingError, SourceTimeoutError
     except ImportError:
         log.error("notebooklm-py is not installed — pip install 'notebooklm-py[browser]'")
         raise ImportError("notebooklm-py is not installed")
@@ -9536,27 +10873,44 @@ async def upload_to_notebooklm(file_path: str, notebook_id: str) -> str | None:
     stem = base.split(".")[0].upper()
     uploading_ticker = stem if (1 <= len(stem) <= 5 and stem.isupper()) else None
 
-    log.info("Uploading %s to NotebookLM notebook %s ...", file_path, notebook_id)
-    try:
-        async with NotebookLMClient.from_storage() as client:
-            # Sweep any leaked source for this ticker (or aged-out sources from other
-            # tickers) before uploading. Catches dupes left behind when a previous
-            # run's delete-after-query never fired (process restart, crashed mid-query,
-            # etc.) — the in-memory _last_source_ids dict alone can't recover from that.
-            _last_source_ids.pop(uploading_ticker, None) if uploading_ticker else None
-            await _purge_stale_ticker_sources(client, notebook_id, uploading_ticker)
+    _MAX_UPLOAD_ATTEMPTS = 2  # NB's own UI literally says "Error uploading source, try again!"
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_UPLOAD_ATTEMPTS):
+        log.info("Uploading %s to NotebookLM notebook %s (attempt %d/%d) ...",
+                 file_path, notebook_id, attempt + 1, _MAX_UPLOAD_ATTEMPTS)
+        try:
+            async with NotebookLMClient.from_storage() as client:
+                # Sweep any leaked source for this ticker (or aged-out sources from other
+                # tickers) before uploading. Catches dupes left behind when a previous
+                # run's delete-after-query never fired (process restart, crashed mid-query,
+                # etc.) — the in-memory _last_source_ids dict alone can't recover from that.
+                _last_source_ids.pop(uploading_ticker, None) if uploading_ticker else None
+                await _purge_stale_ticker_sources(client, notebook_id, uploading_ticker)
 
-            # wait=False avoids the GET_NOTEBOOK polling that times out
-            source = await client.sources.add_file(notebook_id, file_path, wait=False)
+                # wait=False avoids the GET_NOTEBOOK polling that times out
+                source = await client.sources.add_file(notebook_id, file_path, wait=False)
+                if source is None:
+                    raise RuntimeError("add_file returned no source")
+                await client.sources.wait_until_ready(notebook_id, source.id, timeout=60)
 
-        source_id = source.id if source else None
-        if uploading_ticker and source_id:
-            _last_source_ids[uploading_ticker] = source_id
-        log.info("Upload complete: %s (source_id=%s)", os.path.basename(file_path), source_id)
-        return source_id
-    except Exception as exc:
-        log.error("Upload failed — %s", exc)
-        raise
+            source_id = source.id
+            if uploading_ticker and source_id:
+                _last_source_ids[uploading_ticker] = source_id
+            log.info("Upload complete: %s (source_id=%s)", os.path.basename(file_path), source_id)
+            return source_id
+        except (SourceProcessingError, SourceTimeoutError) as exc:
+            last_exc = exc
+            log.warning("Upload processing failed for %s (attempt %d/%d): %s",
+                        os.path.basename(file_path), attempt + 1, _MAX_UPLOAD_ATTEMPTS, exc)
+        except Exception as exc:
+            log.error("Upload failed — %s", exc)
+            raise
+    log.error("Upload processing failed for %s after %d attempts — %s",
+               os.path.basename(file_path), _MAX_UPLOAD_ATTEMPTS, last_exc)
+    raise RuntimeError(
+        f"NotebookLM failed to process the uploaded source after {_MAX_UPLOAD_ATTEMPTS} "
+        f"attempts: {last_exc}"
+    ) from last_exc
 
 
 async def delete_notebooklm_source(notebook_id: str, source_id: str | None) -> None:
@@ -9750,8 +11104,22 @@ async def query_notebooklm(
     ul_cost_basis: float | None = None,
     chain_data: dict | None = None,
     current_leg_price: float | None = None,
+    tail_text: str | None = None,
 ) -> str | None:
-    """Ask NotebookLM for the best CC or CSP choice given the ticker source."""
+    """
+    Ask NotebookLM for the best CC or CSP choice given the ticker source.
+
+    tail_text, when provided, is the exact same context block (T-Bill rate,
+    ATR, next major economic release, live candidate strikes with
+    precomputed bid_ask_pct/annualized_yield_pct) that Claude and Luna
+    receive from claude_advisor.build_position_context/build_unborn_context
+    — appended verbatim below so NB reasons over identical figures instead
+    of reconstructing/guessing its own (confirmed live on DFTX: without
+    this, NB cited "10-year Treasury 4.66%" as the hurdle rate instead of
+    the actual 13-week T-Bill rate given to the other two advisors, and
+    never flagged a 40.9% bid-ask spread Luna caught because it had no
+    precomputed spread column or threshold to check it against).
+    """
     try:
         from notebooklm import NotebookLMClient
     except ImportError:
@@ -10000,6 +11368,65 @@ async def query_notebooklm(
             f"as per the strategy manuals."
         )
 
+    if tail_text:
+        # tail_text (from claude_advisor.build_position_context/
+        # build_unborn_context) carries the header facts NB was previously
+        # missing (T-Bill rate, ATR, next major release) followed by a full
+        # "=== Live Candidate Strikes ===" CSV dump of every candidate in
+        # the chain. NB already has that same chain as its own uploaded CSV
+        # source — appending it a second time here just bloats the prompt
+        # with duplicate data. Confirmed live on GLD (a wide-strike-density
+        # ticker, 60+ candidate rows): including the full table pushed
+        # chat.ask()'s streamed response to come back empty (200 OK, body
+        # closed after ~2ms — the same failure signature as the
+        # RPCResponseTooLargeError seen elsewhere for oversized
+        # requests/responses), yielding "Empty response from NotebookLM"
+        # with no retry (the exception, whatever it was, didn't match any
+        # of the known transport-error keywords). Trim to just the header
+        # facts NB actually needed.
+        _tail_header = tail_text.split("\n\n=== Live Candidate Strikes", 1)[0]
+        # Drop the per-position "Assignment for this leg happens if..."
+        # sentence (~350 chars) — genuinely redundant for NB specifically:
+        # the general short-put/short-call assignment rule is already in
+        # this advisor's own system prompt, and the strike/expiry are
+        # already stated both in the question's inline position summary
+        # and in this same tail's "Position: ..." line. Claude/Luna still
+        # get the full sentence via the unmodified tail_text (this split
+        # only affects what's sent to NB). Confirmed live: even with the
+        # candidate-strikes table already stripped above, a real MO prompt
+        # (4851 chars) was rejected by NB's new notebook.google.com host as
+        # "too large/malformed" (status 3) while the same content split
+        # into two ~2.3-2.6KB halves each succeeded independently — the
+        # host enforces a per-message cap well under what the old host
+        # tolerated, somewhere between ~3.7KB and ~4.85KB. This trim plus
+        # the shortened wrapper sentence below claws back ~550-700 chars.
+        _tail_header = "\n".join(
+            line for line in _tail_header.split("\n")
+            if not line.startswith("Assignment for this leg happens")
+        )
+        # Drop the weekly plan's verbatim day-by-day window excerpt
+        # (claude_advisor._weekly_calendar_windows_note) — it can run to
+        # 2-3KB on its own, which alone pushed the COPX prompt to 7.8KB,
+        # well past the ~4.85KB cap documented above. NB doesn't need it
+        # forwarded a second time: unlike Claude/Luna, NB has the actual
+        # PLAN PDF as its own uploaded source and can read this same
+        # narrative directly. Confirmed live: this block's addition broke
+        # every ticker's NB query, not just COPX's, the moment it started
+        # being included here.
+        _tail_header = re.sub(
+            r"\n?This week's plan's own day-by-day trading-window guidance"
+            r".*?(?=\nNo existing option position on this ticker|\nCurrent option price:|\Z)",
+            "",
+            _tail_header,
+            flags=re.DOTALL,
+        )
+        question += (
+            "\n\n=== Exact live figures (use verbatim — T-Bill rate, ATR, next major "
+            "release) rather than recalculating; also check bid-ask spread in your "
+            "uploaded chain source — over ~10-15% of premium is a liquidity red flag ===\n"
+            f"{_tail_header}"
+        )
+
     log.info(
         "[query_notebooklm] prompt for %s (copy/paste ready):\n%s\n%s\n%s",
         ticker,
@@ -10079,7 +11506,42 @@ async def query_notebooklm(
             except Exception as exc:
                 last_exc = exc
                 msg = str(exc).lower()
-                if "rate" in msg or "limit" in msg or "429" in msg or "reject" in msg:
+                if "too large" in msg or "malformed" in msg or "over-long" in msg or "size limit" in msg:
+                    # notebooklm-py's own ChatError for a bare grpc status-3
+                    # (INVALID_ARGUMENT) rejection — see its wire.py
+                    # _raise_chat_rejection docstring. Distinct from actual
+                    # account throttling and must not be classified as one:
+                    # confirmed live, this fired identically on GLD/GDX/MO/BKR
+                    # after two dashboard restarts killed in-flight NB
+                    # background threads mid-query (daemon threads have no
+                    # graceful shutdown), each leaving that ticker's uploaded
+                    # chain CSV undeleted in the notebook (the "finally:
+                    # delete_notebooklm_source" cleanup never got to run).
+                    # The notebook swelled to 25 accumulated sources and every
+                    # fresh chat.ask() then got rejected as too-large by the
+                    # server — nothing to do with the literal question length
+                    # (a ~2KB prompt) or the account being rate limited.
+                    # Deleting the orphaned sources fixed it immediately, and
+                    # waiting out a cooldown would not have — so this must
+                    # raise its own accurate remedy, not fall into the
+                    # rate-limit branch below (whose message previously
+                    # matched via the "reject"/"limit" substrings and told
+                    # the user to wait 15-30 minutes, which does nothing for
+                    # notebook bloat).
+                    log.warning(
+                        "[query_notebooklm] request rejected as too large/malformed (attempt %d/%d): %s",
+                        attempt + 1, _MAX_ATTEMPTS, exc,
+                    )
+                    raise RuntimeError(
+                        "NotebookLM rejected the request as too large or malformed "
+                        "(not a rate limit). This usually means the notebook has "
+                        "accumulated too many/too-large sources — e.g. leftover "
+                        "per-ticker chain CSVs from a run interrupted mid-query — "
+                        "rather than one oversized question. Check the notebook's "
+                        "source list and delete anything that isn't a core manual, "
+                        "the current PLAN/REVIEW, or the Fed calendar."
+                    ) from exc
+                elif "rate" in msg or "429" in msg or "reject" in msg:
                     if attempt == 0:
                         log.warning("[query_notebooklm] rate limited, waiting 20s before one retry (exc: %s)", exc)
                         await asyncio.sleep(20)
@@ -10103,10 +11565,39 @@ async def query_notebooklm(
                             "NotebookLM may be overloaded — try again in a few minutes."
                         ) from exc
                 else:
+                    # An exception whose message doesn't match any known
+                    # rate-limit/transport keyword — previously this gave up
+                    # silently on the FIRST attempt with no retry and no log
+                    # line at all, surfacing only as the generic "Empty
+                    # response from NotebookLM" the caller synthesizes when
+                    # this returns None. Confirmed live on GLD: the actual
+                    # chat.ask() call returned HTTP 200 with the response
+                    # body closing after ~2ms (i.e. essentially empty) —
+                    # notebooklm-py's own parsing of that then raises
+                    # something (exact type/message never got logged,
+                    # exactly the gap this closes) that doesn't happen to
+                    # contain "timeout"/"rpc"/etc. A retry moments later on
+                    # a DIFFERENT position (ALM) succeeded immediately, and
+                    # a third GLD attempt eventually succeeds too — this is
+                    # a transient NB flake, not a permanent failure mode,
+                    # so it deserves the same retry treatment as the
+                    # recognized transport errors, not an instant give-up.
+                    log.warning(
+                        "[query_notebooklm] unrecognized error (attempt %d/%d): %s: %s",
+                        attempt + 1, _MAX_ATTEMPTS, type(exc).__name__, exc,
+                    )
+                    if attempt < _MAX_ATTEMPTS - 1:
+                        wait = _TRANSPORT_BACKOFF[min(attempt, len(_TRANSPORT_BACKOFF) - 1)]
+                        log.warning("[query_notebooklm] retrying in %ds", wait)
+                        await asyncio.sleep(wait)
+                        continue
                     if not silent:
                         print(f"ERROR: Query failed — {exc}", file=sys.stderr)
                         sys.exit(1)
-                    return None
+                    raise RuntimeError(
+                        f"NotebookLM returned an unrecognized error after {_MAX_ATTEMPTS} "
+                        f"attempts: {type(exc).__name__}: {exc}"
+                    ) from exc
         else:
             if not silent:
                 print(f"ERROR: Query failed after retries — {last_exc}", file=sys.stderr)

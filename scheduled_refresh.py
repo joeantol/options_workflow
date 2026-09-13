@@ -168,7 +168,6 @@ def main():
         log.info("--- Pass 1: skipped (--skipunborn) ---")
     else:
         log.info("--- Pass 1: unborn display rows (%d) ---", len(unborn_rows))
-        updated_unborn = dict(unborn_rows)  # copy; we'll update in-place and save at end
         for row_key, row in unborn_rows.items():
             ticker = row["symbol"].upper()
             strat = row_key.split("|")[1] if "|" in row_key else "CC"
@@ -177,40 +176,30 @@ def main():
             qty = int(row.get("_qty") or 1)
             cb  = float(row.get("_ul_cost_basis") or 0)
             log.info("  %s  strat=%s qty=%d cb=%.2f", ticker, strat, qty, cb)
-            result, status = _post_and_poll_result(
+            _, status = _post_and_poll_result(
                 f"{BASE_URL}/api/unborn",
                 {"ticker": ticker, "qty": qty, "strat": strat, "cost_basis": cb, "force": True},
             )
             log.info("    → /api/unborn HTTP %d", status)
-            # display_chain (when present) reflects the highest-priority
-            # SELL/WAIT across Claude/Luna/NotebookLM, not just Claude's own
-            # — see run_unborn_for_ticker's docstring in option_dashboard.py.
-            # This write runs AFTER the server's own _persist_unborn_display_row
-            # (which already prefers display_chain), so using the plain
-            # Claude-only "chain" here would silently clobber it back.
-            chain = result.get("display_chain") or result.get("chain") or []
-            if chain:
-                now_et = _dt.datetime.now(_dt.timezone.utc).astimezone(
-                    _dt.timezone(_dt.timedelta(hours=-4))  # ET (EDT)
-                )
-                run_at = now_et.strftime("%-m/%-d %-I:%M %p ET")
-                updated_unborn[row_key] = dict(chain[0], **{
-                    "_qty": qty,
-                    "_ul_cost_basis": row.get("_ul_cost_basis"),
-                    "_ubKey": row.get("_ubKey"),
-                    "_run_at": run_at,
-                })
-                log.info("    updated display row for %s → %s", ticker, run_at)
-        # Persist updated display rows so the browser picks them up on next refresh
-        try:
-            resp = requests.post(
-                f"{BASE_URL}/api/unborn-rows",
-                json=updated_unborn,
-                timeout=HTTP_TIMEOUT,
-            )
-            log.info("Saved updated unborn rows → HTTP %d", resp.status_code)
-        except Exception as exc:
-            log.error("Failed to save unborn rows: %s", exc)
+            # The server persists the fresh row into unborn_rows.json in
+            # real time the moment its own background thread completes (see
+            # _persist_unborn_display_row in option_dashboard.py) —
+            # independent of whether this script's own poll is still
+            # watching or has already given up. This used to ALSO collect a
+            # local snapshot here and blind-POST the whole dict back to
+            # /api/unborn-rows at the end of Pass 1 — but /api/unborn-rows
+            # does a full-file overwrite, not a merge, so that blindly
+            # reverted any ticker whose poll timed out here back to
+            # whatever this snapshot looked like at the START of the run.
+            # Confirmed live: every ticker hit this script's 750s poll
+            # ceiling on 2026-08-13 (NB alone can take several minutes), and
+            # the end-of-pass overwrite reverted UAMY's genuinely-completed,
+            # same-day server-side update back to the PREVIOUS day's data.
+            # Removed entirely rather than continue fighting the server's
+            # own, more-authoritative real-time persistence.
+            if status == 202:
+                log.warning("    %s still running past this script's own %ds patience — "
+                            "the server will finish and persist it on its own", ticker, POLL_MAX)
 
     # ── Pass 2: Re-analyze flagged (warning) positions ────────────────────────
     # /api/analyze now runs Claude, then Luna, then NotebookLM inline in
