@@ -58,6 +58,27 @@ except ImportError:
 BASE_URL = "https://api.public.com"
 AUTH_URL = "https://api.public.com/userapiauthservice/personal/access-tokens"
 
+# Public.com allows 10 req/s per account across ALL endpoints. One analysis's
+# sequential chain loop alone runs ~5 req/s, so any two overlapping (browser
+# auto-reruns fire several at once) blew the limit — 2,400+ chain fetches
+# 429'd and were silently dropped, handing the advisors partial chains.
+# Every Public.com call must go through _public_throttle(); 8/s leaves
+# headroom for request-timing jitter on their side.
+_PUBLIC_MIN_INTERVAL = 1 / 8
+_public_throttle_lock = threading.Lock()
+_public_next_slot = 0.0
+
+
+def _public_throttle() -> None:
+    import time
+    global _public_next_slot
+    with _public_throttle_lock:
+        now = time.monotonic()
+        slot = max(now, _public_next_slot)
+        _public_next_slot = slot + _PUBLIC_MIN_INTERVAL
+    if slot > now:
+        time.sleep(slot - now)
+
 # Which backend produces the automatic THIRD opinion (Claude and Luna are
 # always on) — "grok" (default) or "notebooklm". query_notebooklm and all
 # its upload/source-management machinery are left fully in place below, so
@@ -217,6 +238,7 @@ _STALE_TICKER_SOURCE_MAX_AGE = datetime.timedelta(minutes=20)
 def get_access_token(secret: str, validity_minutes: int = 60) -> str:
     import requests
     """Exchange a long-lived Secret Token for a short-lived Access Token (JWT)."""
+    _public_throttle()
     response = requests.post(
         AUTH_URL,
         headers={"Content-Type": "application/json"},
@@ -257,6 +279,7 @@ def get_account_id(token: str) -> str:
     """Retrieve the first brokerage account ID for the authenticated user."""
     import requests
     url = f"{BASE_URL}/userapigateway/trading/account"
+    _public_throttle()
     response = requests.get(url, headers=get_headers(token))
     if response.status_code == 401:
         raise RuntimeError("Unauthorized fetching account — check PUBLIC_API_SECRET.")
@@ -283,6 +306,7 @@ def get_expirations(token: str, account_id: str, ticker: str) -> list[str]:
             "type": "EQUITY",
         }
     }
+    _public_throttle()
     response = requests.post(url, headers=get_headers(token), json=payload)
     if response.status_code != 200:
         raise RuntimeError(
@@ -307,6 +331,7 @@ def get_option_chain(token: str, account_id: str, ticker: str, expiration_date: 
         },
         "expirationDate": expiration_date,
     }
+    _public_throttle()
     response = requests.post(url, headers=get_headers(token), json=payload)
     if response.status_code != 200:
         print(
@@ -876,6 +901,7 @@ def get_equity_quotes_batch(token: str, account_id: str, tickers: list[str]) -> 
     url = f"{BASE_URL}/userapigateway/marketdata/{account_id}/quotes"
     result: dict[str, float | None] = {}
     try:
+        _public_throttle()
         resp = requests.post(url, headers=get_headers(token), json={"instruments": instruments})
         if resp.status_code == 200:
             raw = resp.json()
@@ -934,6 +960,7 @@ def get_option_quotes(token: str, account_id: str, positions: list[dict]) -> dic
         return {}
 
     url = f"{BASE_URL}/userapigateway/marketdata/{account_id}/quotes"
+    _public_throttle()
     response = requests.post(
         url,
         headers=get_headers(token),
@@ -968,6 +995,7 @@ def get_option_greeks_batch(token: str, account_id: str, osi_symbols: list[str])
     url = f"{BASE_URL}/userapigateway/option-details/{account_id}/greeks"
     # osiSymbols is a repeated query parameter
     params = [("osiSymbols", sym) for sym in osi_symbols]
+    _public_throttle()
     response = requests.get(url, headers=get_headers(token), params=params)
     if response.status_code != 200:
         print(
@@ -4386,10 +4414,14 @@ function _flagFingerprint(p) {
 }
 
 function _analysisFP(p) {
-  // Buckets: flag tier (ok/warn/danger), delta ±0.1, underlying ±$0.50
+  // Buckets: flag tier (ok/warn/danger), delta ±0.1, underlying in 2% steps.
+  // A flat $0.50 underlying bucket was a 0.1% move on MSFT (~$500), so
+  // high-priced names re-analyzed on routine noise every cooldown, all on the
+  // same refresh tick — the main source of Public.com 429 bursts.
   const tier = !p.flagged ? 0 : (p.reasons||[]).length >= 3 ? 2 : 1;
   const dBkt = (Math.round((p.delta||0) * 10) / 10).toFixed(2);
-  const uBkt = (Math.round((p.underlying||0) * 2) / 2).toFixed(1);
+  const u = p.underlying || 0;
+  const uBkt = u > 0 ? String(Math.round(Math.log(u) / Math.log(1.02))) : '0';
   return tier + '|' + dBkt + '|' + uBkt;
 }
 // ─────────────────────────────────────────────────────────────────────────────
