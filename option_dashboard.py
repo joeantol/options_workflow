@@ -45,6 +45,7 @@ from pathlib import Path
 import greeks_pricing
 import claude_advisor
 import openai_advisor
+import grok_advisor
 import iv_history
 
 try:
@@ -56,6 +57,18 @@ except ImportError:
 
 BASE_URL = "https://api.public.com"
 AUTH_URL = "https://api.public.com/userapiauthservice/personal/access-tokens"
+
+# Which backend produces the automatic THIRD opinion (Claude and Luna are
+# always on) — "grok" (default) or "notebooklm". query_notebooklm and all
+# its upload/source-management machinery are left fully in place below, so
+# reverting to NotebookLM is exactly this one env var, e.g.
+# `THIRD_OPINION_PROVIDER=notebooklm` in .env, then a dashboard restart —
+# no code changes. _THIRD_OPINION_LABEL/_THIRD_OPINION_SHORT drive every
+# on-screen label (card headers, badges, buttons, ask box) so the UI never
+# says "NotebookLM" while actually showing Grok's answer, or vice versa.
+_THIRD_OPINION_PROVIDER = os.environ.get("THIRD_OPINION_PROVIDER", "grok").strip().lower()
+_THIRD_OPINION_LABEL = "Grok" if _THIRD_OPINION_PROVIDER == "grok" else "NotebookLM"
+_THIRD_OPINION_SHORT = "GR" if _THIRD_OPINION_PROVIDER == "grok" else "NB"
 
 # Journal DB lives one level up from the script's directory
 JOURNAL_DB = os.path.join(
@@ -2204,6 +2217,23 @@ async def _run_notebooklm_roll(
     Returns (recommendation, text, error) — exactly one of (text, error) is
     set on any given call.
     """
+    if _THIRD_OPINION_PROVIDER == "grok":
+        # Grok is stateless (no uploaded notebook to fall back on), so it
+        # needs the exact same tail_text Claude/Luna already reasoned over —
+        # if the caller has none (e.g. Claude itself failed this run), there
+        # is nothing for Grok to answer either. No CSV upload, no shared
+        # lock: unlike NotebookLM's single-notebook-at-a-time constraint,
+        # Grok calls don't contend for anything and can run concurrently.
+        if not tail_text:
+            return None, None, "No cached analysis context available for Grok yet"
+        result = grok_advisor.query_grok_advisor(tail_text)
+        if result.get("error"):
+            return None, None, result["error"]
+        text = result.get("text") or ""
+        if not text:
+            return None, None, "Empty response from Grok"
+        return result.get("recommendation"), text, None
+
     if not _notebooklm_lock.acquire(timeout=_NOTEBOOKLM_LOCK_TIMEOUT):
         # Another analysis is mid-NotebookLM-call and didn't free the lock in
         # time — skip NB this run rather than wait indefinitely (a bounded
@@ -2774,6 +2804,13 @@ async def run_roll_for_position(
                         f"credit.\n\n---\n\n"
                     ) + openai_result["text"]
 
+        # Per-advisor completion line, mirroring the outer "[web] Analysis
+        # complete" line logged for Claude's own rec — lets historical
+        # ROLL/ASSIGNMENT/HOLD rates be compared across advisors the same
+        # way Claude's have been (grep the logs/ directory), instead of only
+        # being visible in whatever's currently cached for open positions.
+        log.info("[web] Luna complete for %s → %s", ticker, openai_result.get("recommendation"))
+
         # NotebookLM — best-effort THIRD opinion, always attempted after
         # Claude and Luna above but never allowed to block or fail the
         # overall result. See _run_notebooklm_roll's docstring.
@@ -2818,6 +2855,8 @@ async def run_roll_for_position(
                     f"changed to HOLD pending a candidate that actually nets a "
                     f"credit.\n\n---\n\n"
                 ) + notebooklm_text_val
+
+        log.info("[web] %s complete for %s → %s", _THIRD_OPINION_LABEL, ticker, notebooklm_rec)
 
         # Main dashboard table's Action badge: highest-priority recommendation
         # across all three advisors, not just Claude's own — see
@@ -2900,6 +2939,21 @@ async def _run_notebooklm_unborn(
     Returns (recommendation, text, error) — exactly one of (text, error) is
     set on any given call.
     """
+    if _THIRD_OPINION_PROVIDER == "grok":
+        # See _run_notebooklm_roll's matching branch — same reasoning,
+        # mirrored here for the unborn case. Trusts _call_grok's own
+        # "Recommendation: SELL/WAIT" regex, same as Luna's unborn path
+        # (query_openai_unborn_advisor) — no extra classifier fallback.
+        if not tail_text:
+            return None, None, "No cached analysis context available for Grok yet"
+        result = grok_advisor.query_grok_unborn_advisor(tail_text)
+        if result.get("error"):
+            return None, None, result["error"]
+        text = result.get("text") or ""
+        if not text:
+            return None, None, "Empty response from Grok"
+        return result.get("recommendation"), text, None
+
     if not _notebooklm_lock.acquire(timeout=_NOTEBOOKLM_LOCK_TIMEOUT):
         return None, None, "NotebookLM busy with another analysis — skipped this run"
     try:
@@ -3070,6 +3124,73 @@ async def ask_notebooklm_followup(ticker: str, notebook_id: str, all_rows: list[
         _notebooklm_lock.release()
 
 
+def _apply_cc_cost_basis_guard(
+    rec: str | None, text: str | None, strat: str, ul_cost_basis: float | None,
+    display_rows: list[dict],
+) -> tuple[str | None, str | None]:
+    """
+    Deterministic guard for the 'unborn' (open a NEW position) SELL/WAIT
+    decision, mirroring _project_roll_pnl's role for ROLL: an advisor's own
+    SELL recommendation on a covered call is only as good as whether it
+    actually honored the cost-basis instruction baked into its prompt
+    (claude_advisor.build_unborn_context's cost-basis clause). Confirmed
+    live on LEU: a fast non-reasoning model correctly worked through every
+    other filter (delta/DTE/yield/liquidity/earnings/calendar) while
+    silently dropping the one constraint that mattered most, recommending
+    a covered-call strike below cost basis — guaranteed to lock in a loss
+    on assignment. Applied identically to all three advisors (called once
+    per advisor, both in the automatic pipeline and the on-demand compare
+    endpoints) so none of them, not just whichever one slipped this time,
+    can put a below-basis strike in front of the trader as a live
+    recommendation.
+
+    Resolves "the strike this advisor picked" the same way the display
+    layer already does (_parse_recommended_option, falling back to
+    _fallback_chain_pick) so the guard can never disagree with what's
+    actually shown as the candidate — an unparseable pick still gets
+    checked against whatever the fallback would display. Called with
+    trust_any_date=True (unlike the display layer's own calls) so this
+    still works from Luna's on-demand compare endpoint, which — unlike the
+    automatic pipeline and NB's on-demand endpoint — doesn't refetch a
+    fresh chain and so has no display_rows to validate the stated expiry
+    against; trusting whatever date the advisor's own text names is
+    sufficient here since the guard only needs the dollar strike, not a
+    fully chain-matched row.
+
+    Returns (rec, text) unchanged unless this is a CC SELL with a known
+    cost basis and the resolved strike is below it, in which case rec
+    becomes "WAIT" and text gets an "Overridden" preamble, matching the
+    ROLL guard's convention.
+    """
+    if rec != "SELL" or strat != "CC" or not ul_cost_basis or not text:
+        return rec, text
+    picked = (
+        _parse_recommended_option(text, display_rows, trust_any_date=True)
+        or _fallback_chain_pick(display_rows, strat)
+    )
+    if not picked:
+        return rec, text
+    try:
+        strike = float(picked.get("strike"))
+    except (TypeError, ValueError):
+        return rec, text
+    if strike >= ul_cost_basis:
+        return rec, text
+    log.warning(
+        "Overriding SELL->WAIT: recommended $%.2f covered call strike is below "
+        "the $%.2f cost basis (would lock in a loss on assignment)",
+        strike, ul_cost_basis,
+    )
+    new_text = (
+        f"**Overridden: WAIT, not SELL.** The reasoning below recommends selling "
+        f"a covered call at the ${strike:.2f} strike, but that is below your "
+        f"${ul_cost_basis:.2f} cost basis — assignment at this strike would lock "
+        f"in a loss on the shares. The recommendation has been changed to WAIT "
+        f"pending a candidate strike at or above cost basis.\n\n---\n\n"
+    ) + text
+    return "WAIT", new_text
+
+
 async def run_unborn_for_ticker(
     token: str,
     account_id: str,
@@ -3193,6 +3314,9 @@ async def run_unborn_for_ticker(
                     "text": "", "ticker": ticker, "strat": strat, "chain": display_rows}
         text = claude_result["text"]
         tail_text = claude_result.get("tail_text")
+        claude_rec, text = _apply_cc_cost_basis_guard(
+            claude_result.get("recommendation"), text, strat, ul_cost_basis, display_rows,
+        )
 
         # Luna (GPT-5.6) — second opinion, runs automatically right after
         # Claude on every analysis now (same rich context, no separate
@@ -3201,6 +3325,12 @@ async def run_unborn_for_ticker(
         # error — an empty/failed Luna call just leaves these fields unset,
         # same as if the on-demand button had failed.
         openai_result = openai_advisor.query_openai_unborn_advisor(claude_context, chain_candidates_text)
+        openai_result["recommendation"], openai_result["text"] = _apply_cc_cost_basis_guard(
+            openai_result.get("recommendation"), openai_result.get("text"), strat, ul_cost_basis, display_rows,
+        )
+        # See run_roll_for_position's matching comment — same per-advisor
+        # completion line, mirrored here for the unborn (SELL/WAIT) case.
+        log.info("[unborn] Luna %s → %s", ticker, openai_result.get("recommendation"))
         import time as _time
         _advisor_run_at = _time.strftime("%-m/%-d %-I:%M %p ET", _time.localtime())
 
@@ -3209,8 +3339,10 @@ async def run_unborn_for_ticker(
         # claude_advisor._call_claude) — no text-classification heuristics
         # needed. "HOLD" is this dict's established vocabulary for the
         # don't-act case (matching the existing-position return shape), even
-        # though claude_advisor's own SELL/WAIT terminology differs.
-        _do_nothing = (claude_result.get("recommendation") != "SELL")
+        # though claude_advisor's own SELL/WAIT terminology differs. Reads
+        # the cost-basis-guarded claude_rec, not claude_result's raw field
+        # directly, so a guarded override actually takes effect here.
+        _do_nothing = (claude_rec != "SELL")
         rec = "HOLD" if _do_nothing else "SELL"
         if _do_nothing:
             # Return a placeholder row — option details are blank, ideal_entry = DO NOTHING
@@ -3242,6 +3374,10 @@ async def run_unborn_for_ticker(
             ticker, notebook_id, strat, key_dates, vix, ul_cost_basis, qty, all_rows, display_rows,
             tail_text=tail_text,
         )
+        notebooklm_rec, notebooklm_text_val = _apply_cc_cost_basis_guard(
+            notebooklm_rec, notebooklm_text_val, strat, ul_cost_basis, display_rows,
+        )
+        log.info("[unborn] %s %s → %s", _THIRD_OPINION_LABEL, ticker, notebooklm_rec)
 
         # Main dashboard table's row: highest-priority recommendation across
         # all three advisors, not just Claude's own — mirrors
@@ -7373,7 +7509,34 @@ def run_web_dashboard(token: str, account_id: str) -> None:
         with _cache_lock:
             cached = _analysis_cache.get(pos_key)
         if not cached or not cached.get("notebooklm_text"):
-            return Response(json.dumps({"error": "No NotebookLM analysis yet for this position — click Compare with Notebook first."}), status=404, mimetype="application/json")
+            return Response(json.dumps({"error": f"No {_THIRD_OPINION_LABEL} analysis yet for this position — click Compare with {_THIRD_OPINION_LABEL} first."}), status=404, mimetype="application/json")
+
+        if _THIRD_OPINION_PROVIDER == "grok":
+            # Grok is stateless — no re-upload round trip needed, so this
+            # answers synchronously like Claude/Luna's ask endpoints rather
+            # than the background-thread+202 pattern NotebookLM's own
+            # re-upload dance (ask_notebooklm_followup) requires.
+            qa_thread = cached.get("notebooklm_qa_thread") or []
+            try:
+                result = grok_advisor.ask_position_followup(
+                    cached.get("tail_text") or "",
+                    cached["notebooklm_text"],
+                    qa_thread,
+                    question,
+                )
+            except Exception as exc:
+                log.exception("[grok-ask] failed for %s", pos_key)
+                result = {"error": str(exc), "answer": ""}
+
+            if not result.get("error"):
+                with _cache_lock:
+                    entry = _analysis_cache.setdefault(pos_key, {})
+                    thread = entry.get("notebooklm_qa_thread") or []
+                    thread.append({"q": question, "a": result["answer"]})
+                    entry["notebooklm_qa_thread"] = thread
+                    _save_cache(_analysis_cache)
+
+            return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
 
         notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
         if not notebook_id:
@@ -7707,6 +7870,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
             context = openai_advisor.build_unborn_context(ticker, strat, ul_price, ul_cost_basis, vix, atr, key_dates, get_tbill_rate())
             chain_candidates_text = cached.get("chain_candidates_text")
             result = openai_advisor.query_openai_unborn_advisor(context, chain_candidates_text)
+            result["recommendation"], result["text"] = _apply_cc_cost_basis_guard(
+                result.get("recommendation"), result.get("text"), strat, ul_cost_basis, [],
+            )
         except Exception as exc:
             log.exception("[openai-compare-unborn] failed for %s", ub_key)
             result = {"error": str(exc), "recommendation": None, "text": ""}
@@ -7853,6 +8019,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                         timeout=600,
                     )
                 )
+                rec, text = _apply_cc_cost_basis_guard(rec, text, strat, ul_cost_basis, display_rows)
             except Exception as exc:
                 log.exception("[notebooklm-compare-unborn] failed for %s", ub_key)
                 rec, text, error = None, None, str(exc)
@@ -7940,7 +8107,32 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 if resolved_key is not None:
                     ub_key = resolved_key
         if not cached or not cached.get("notebooklm_text"):
-            return Response(json.dumps({"error": "No NotebookLM analysis yet for this ticker — click Compare with Notebook first."}), status=404, mimetype="application/json")
+            return Response(json.dumps({"error": f"No {_THIRD_OPINION_LABEL} analysis yet for this ticker — click Compare with {_THIRD_OPINION_LABEL} first."}), status=404, mimetype="application/json")
+
+        if _THIRD_OPINION_PROVIDER == "grok":
+            # See api_notebooklm_ask's matching branch — synchronous, no
+            # re-upload round trip needed for a stateless Grok call.
+            qa_thread = cached.get("notebooklm_qa_thread") or []
+            try:
+                result = grok_advisor.ask_unborn_followup(
+                    cached.get("tail_text") or "",
+                    cached["notebooklm_text"],
+                    qa_thread,
+                    question,
+                )
+            except Exception as exc:
+                log.exception("[grok-ask-unborn] failed for %s", ub_key)
+                result = {"error": str(exc), "answer": ""}
+
+            if not result.get("error"):
+                with _cache_lock:
+                    entry = _unborn_cache.setdefault(ub_key, dict(cached))
+                    thread = entry.get("notebooklm_qa_thread") or []
+                    thread.append({"q": question, "a": result["answer"]})
+                    entry["notebooklm_qa_thread"] = thread
+                    _save_unborn_cache(_unborn_cache)
+
+            return Response(json.dumps(_sanitize(result), default=_serial), mimetype="application/json")
 
         notebook_id = os.environ.get("NOTEBOOKLM_NOTEBOOK_ID")
         if not notebook_id:
@@ -8360,14 +8552,14 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 )
                 notebooklm_card_html = (
                     f'<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">'
-                    f'<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion){_nb_updated}</span>'
+                    f'<span class="chain-label" style="color:#f59e0b">{_THIRD_OPINION_LABEL}’s Take (third opinion){_nb_updated}</span>'
                     f'<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">{_nb_body}</span>'
                     f'</div>'
                 )
             elif notebooklm_error_val:
                 notebooklm_card_html = (
                     f'<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">'
-                    f'<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>'
+                    f'<span class="chain-label" style="color:#f59e0b">{_THIRD_OPINION_LABEL}’s Take</span>'
                     f'<span class="chain-working" style="color:var(--muted);display:block;margin-top:6px">'
                     f'Not available this run: {html_mod.escape(notebooklm_error_val)}</span>'
                     f'</div>'
@@ -8392,13 +8584,13 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                     _nb_agree_tag = '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>'
                 notebooklm_badge_html = (
                     f'<span class="badge badge-{_nb_cls}" style="font-size:11px;padding:3px 10px;margin-left:8px" '
-                    f'title="NotebookLM third opinion">NB: {html_mod.escape(notebooklm_rec)}</span>{_nb_agree_tag}'
+                    f'title="{_THIRD_OPINION_LABEL} third opinion">{_THIRD_OPINION_SHORT}: {html_mod.escape(notebooklm_rec)}</span>{_nb_agree_tag}'
                 )
             else:
                 notebooklm_badge_html = (
                     '<button onclick="notebooklmCompareUnborn(this)" '
                     'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#f59e0b;color:#000;'
-                    'border:none;border-radius:4px;cursor:pointer">Compare with Notebook</button>'
+                    f'border:none;border-radius:4px;cursor:pointer">Compare with {_THIRD_OPINION_LABEL}</button>'
                 )
 
             primary_ask_html = (
@@ -8428,9 +8620,9 @@ def run_web_dashboard(token: str, account_id: str) -> None:
                 '<div class="ask-section" style="margin-top:20px">'
                 '<div class="ask-thread" id="notebooklm-ask-thread"></div>'
                 '<div class="ask-input">'
-                '<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask NotebookLM a follow-up question… (can take a few minutes)"></textarea>'
+                f'<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask {_THIRD_OPINION_LABEL} a follow-up question… (can take a few minutes)"></textarea>'
                 '<div class="ask-input-row">'
-                '<button onclick="submitNotebooklmAskUnborn()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask NotebookLM</button>'
+                f'<button onclick="submitNotebooklmAskUnborn()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask {_THIRD_OPINION_LABEL}</button>'
                 '<div id="notebooklm-ask-spinner"></div>'
                 '</div></div></div>'
             ) if notebooklm_text_val else ''
@@ -8512,7 +8704,7 @@ def run_web_dashboard(token: str, account_id: str) -> None:
   .ask-a{{background:#12151f;border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);white-space:pre-wrap;line-height:1.6}}
   .ask-a::before{{content:'Claude: ';color:var(--ok);font-weight:600}}
   .ask-a.openai-ask-a::before{{content:'Luna: ';color:#10a37f}}
-  .ask-a.notebooklm-ask-a::before{{content:'NotebookLM: ';color:#f59e0b}}
+  .ask-a.notebooklm-ask-a::before{{content:'{_THIRD_OPINION_LABEL}: ';color:#f59e0b}}
   .ask-a.err{{color:var(--danger)}}
   .ask-input{{display:flex;flex-direction:column;gap:8px}}
   .ask-input textarea{{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;font-family:inherit;resize:vertical;min-height:64px;outline:none}}
@@ -8655,10 +8847,10 @@ async function notebooklmCompareUnborn(btn) {{
       break;
     }}
     if (d.error) {{
-      if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(d.error)}}</span>`;
+      if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">{_THIRD_OPINION_LABEL} error: ${{esc(d.error)}}</span>`;
       const card = document.getElementById('notebooklm-card');
       if (card) card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
-        + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>`
+        + `<span class="chain-label" style="color:#f59e0b">{_THIRD_OPINION_LABEL}’s Take</span>`
         + `<span class="chain-working" style="color:var(--muted);display:block;margin-top:6px">Not available this run: ${{esc(d.error)}}</span>`
         + `</div>`;
       return;
@@ -8669,13 +8861,13 @@ async function notebooklmCompareUnborn(btn) {{
       const agreeTag = !_MAIN_ACTION ? '' : matches
         ? '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
         : '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>';
-      slot.innerHTML = `<span class="badge badge-${{cls}}" style="font-size:11px;padding:3px 10px;margin-left:8px" title="NotebookLM third opinion">NB: ${{esc(d.recommendation||'?')}}</span>${{agreeTag}}`;
+      slot.innerHTML = `<span class="badge badge-${{cls}}" style="font-size:11px;padding:3px 10px;margin-left:8px" title="{_THIRD_OPINION_LABEL} third opinion">{_THIRD_OPINION_SHORT}: ${{esc(d.recommendation||'?')}}</span>${{agreeTag}}`;
     }}
     const card = document.getElementById('notebooklm-card');
     if (card) {{
       const body = renderAdvisorMarkdown(d.text || '');
       card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
-        + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion)</span>`
+        + `<span class="chain-label" style="color:#f59e0b">{_THIRD_OPINION_LABEL}’s Take (third opinion)</span>`
         + `<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">${{body}}</span>`
         + `</div>`;
     }}
@@ -8689,15 +8881,15 @@ async function notebooklmCompareUnborn(btn) {{
       askSlot.innerHTML = `<div class="ask-section" style="margin-top:20px">`
         + `<div class="ask-thread" id="notebooklm-ask-thread"></div>`
         + `<div class="ask-input">`
-        + `<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask NotebookLM a follow-up question… (can take a few minutes)"></textarea>`
+        + `<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask {_THIRD_OPINION_LABEL} a follow-up question… (can take a few minutes)"></textarea>`
         + `<div class="ask-input-row">`
-        + `<button onclick="submitNotebooklmAskUnborn()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask NotebookLM</button>`
+        + `<button onclick="submitNotebooklmAskUnborn()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask {_THIRD_OPINION_LABEL}</button>`
         + `<div id="notebooklm-ask-spinner"></div>`
         + `</div></div></div>`;
     }}
   }} catch(e) {{
-    if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(e.message)}}</span>`;
-    if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with Notebook'; }}
+    if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">{_THIRD_OPINION_LABEL} error: ${{esc(e.message)}}</span>`;
+    if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with {_THIRD_OPINION_LABEL}'; }}
   }}
 }}
 const _SAVED_QA = {json.dumps(cached.get("qa_thread", []) if cached else [])};
@@ -9610,7 +9802,7 @@ document.getElementById('notebooklm-ask-q')?.addEventListener('keydown', e => {{
                 )
                 notebooklm_card_html = (
                     f'<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">'
-                    f'<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion){_nb_updated}</span>'
+                    f'<span class="chain-label" style="color:#f59e0b">{_THIRD_OPINION_LABEL}’s Take (third opinion){_nb_updated}</span>'
                     f'{_nb_test_trade_html}'
                     f'<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">{_nb_body}</span>'
                     f'</div>'
@@ -9618,7 +9810,7 @@ document.getElementById('notebooklm-ask-q')?.addEventListener('keydown', e => {{
             elif notebooklm_error_val:
                 notebooklm_card_html = (
                     f'<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">'
-                    f'<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>'
+                    f'<span class="chain-label" style="color:#f59e0b">{_THIRD_OPINION_LABEL}’s Take</span>'
                     f'<span class="chain-working" style="color:var(--muted);display:block;margin-top:6px">'
                     f'Not available this run: {html_mod.escape(notebooklm_error_val)}</span>'
                     f'</div>'
@@ -9644,13 +9836,13 @@ document.getElementById('notebooklm-ask-q')?.addEventListener('keydown', e => {{
                     _nb_agree_tag = '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>'
                 notebooklm_badge_html = (
                     f'<span class="badge badge-{_nb_cls}" style="font-size:11px;padding:3px 10px;margin-left:8px" '
-                    f'title="NotebookLM third opinion">NB: {html_mod.escape(notebooklm_rec)}</span>{_nb_agree_tag}'
+                    f'title="{_THIRD_OPINION_LABEL} third opinion">{_THIRD_OPINION_SHORT}: {html_mod.escape(notebooklm_rec)}</span>{_nb_agree_tag}'
                 )
             else:
                 notebooklm_badge_html = (
                     '<button onclick="notebooklmCompare(this)" '
                     'style="font-size:11px;padding:3px 10px;margin-left:8px;background:#f59e0b;color:#000;'
-                    'border:none;border-radius:4px;cursor:pointer">Compare with Notebook</button>'
+                    f'border:none;border-radius:4px;cursor:pointer">Compare with {_THIRD_OPINION_LABEL}</button>'
                 )
 
             primary_ask_html = (
@@ -9680,9 +9872,9 @@ document.getElementById('notebooklm-ask-q')?.addEventListener('keydown', e => {{
                 '<div class="ask-section" style="margin-top:20px">'
                 '<div class="ask-thread" id="notebooklm-ask-thread"></div>'
                 '<div class="ask-input">'
-                '<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask NotebookLM a follow-up question… (can take a few minutes)"></textarea>'
+                f'<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask {_THIRD_OPINION_LABEL} a follow-up question… (can take a few minutes)"></textarea>'
                 '<div class="ask-input-row">'
-                '<button onclick="submitNotebooklmAsk()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask NotebookLM</button>'
+                f'<button onclick="submitNotebooklmAsk()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask {_THIRD_OPINION_LABEL}</button>'
                 '<div id="notebooklm-ask-spinner"></div>'
                 '</div></div></div>'
             ) if notebooklm_text_val else ''
@@ -9771,7 +9963,7 @@ document.getElementById('notebooklm-ask-q')?.addEventListener('keydown', e => {{
   .ask-a{{background:#12151f;border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);white-space:pre-wrap;line-height:1.6}}
   .ask-a::before{{content:'Claude: ';color:var(--ok);font-weight:600}}
   .ask-a.openai-ask-a::before{{content:'Luna: ';color:#10a37f}}
-  .ask-a.notebooklm-ask-a::before{{content:'NotebookLM: ';color:#f59e0b}}
+  .ask-a.notebooklm-ask-a::before{{content:'{_THIRD_OPINION_LABEL}: ';color:#f59e0b}}
   .ask-a.err{{color:var(--danger)}}
   .ask-input{{display:flex;flex-direction:column;gap:8px}}
   .ask-input textarea{{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;font-family:inherit;resize:vertical;min-height:64px;outline:none}}
@@ -9955,10 +10147,10 @@ async function notebooklmCompare(btn) {{
       break;
     }}
     if (d.error) {{
-      if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(d.error)}}</span>`;
+      if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">{_THIRD_OPINION_LABEL} error: ${{esc(d.error)}}</span>`;
       const card = document.getElementById('notebooklm-card');
       if (card) card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
-        + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take</span>`
+        + `<span class="chain-label" style="color:#f59e0b">{_THIRD_OPINION_LABEL}’s Take</span>`
         + `<span class="chain-working" style="color:var(--muted);display:block;margin-top:6px">Not available this run: ${{esc(d.error)}}</span>`
         + `</div>`;
       return;
@@ -9970,7 +10162,7 @@ async function notebooklmCompare(btn) {{
         : d.recommendation === _MAIN_REC
         ? '<span style="color:var(--ok);font-size:11px;margin-left:6px">&#10003; agrees</span>'
         : '<span style="color:var(--warn);font-size:11px;margin-left:6px">&#9888; disagrees</span>';
-      slot.innerHTML = `<span class="badge badge-${{cls}}" style="font-size:11px;padding:3px 10px;margin-left:8px" title="NotebookLM third opinion">NB: ${{esc(d.recommendation||'?')}}</span>${{agreeTag}}`;
+      slot.innerHTML = `<span class="badge badge-${{cls}}" style="font-size:11px;padding:3px 10px;margin-left:8px" title="{_THIRD_OPINION_LABEL} third opinion">{_THIRD_OPINION_SHORT}: ${{esc(d.recommendation||'?')}}</span>${{agreeTag}}`;
     }}
     const card = document.getElementById('notebooklm-card');
     if (card) {{
@@ -9988,7 +10180,7 @@ async function notebooklmCompare(btn) {{
           + `border:none;border-radius:4px;cursor:pointer">Enter Test Trade</button></span>`
         : `<span id="enter-test-roll-slot-notebooklm"></span>`;
       card.outerHTML = `<div id="notebooklm-card" class="chain-pnl" style="margin-top:14px;border-color:#f59e0b">`
-        + `<span class="chain-label" style="color:#f59e0b">NotebookLM’s Take (third opinion)</span>`
+        + `<span class="chain-label" style="color:#f59e0b">{_THIRD_OPINION_LABEL}’s Take (third opinion)</span>`
         + testTradeNb
         + `<span class="chain-working" style="white-space:normal;line-height:1.6;display:block;margin-top:6px">${{body}}</span>`
         + `</div>`;
@@ -10004,15 +10196,15 @@ async function notebooklmCompare(btn) {{
       askSlot.innerHTML = `<div class="ask-section" style="margin-top:20px">`
         + `<div class="ask-thread" id="notebooklm-ask-thread"></div>`
         + `<div class="ask-input">`
-        + `<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask NotebookLM a follow-up question… (can take a few minutes)"></textarea>`
+        + `<textarea id="notebooklm-ask-q" rows="3" placeholder="Ask {_THIRD_OPINION_LABEL} a follow-up question… (can take a few minutes)"></textarea>`
         + `<div class="ask-input-row">`
-        + `<button onclick="submitNotebooklmAsk()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask NotebookLM</button>`
+        + `<button onclick="submitNotebooklmAsk()" style="background:#f59e0b;border-color:#f59e0b;color:#000">Ask {_THIRD_OPINION_LABEL}</button>`
         + `<div id="notebooklm-ask-spinner"></div>`
         + `</div></div></div>`;
     }}
   }} catch(e) {{
-    if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">NotebookLM error: ${{esc(e.message)}}</span>`;
-    if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with Notebook'; }}
+    if (slot) slot.innerHTML = `<span style="color:var(--danger);font-size:11px;margin-left:8px">{_THIRD_OPINION_LABEL} error: ${{esc(e.message)}}</span>`;
+    if (btn) {{ btn.disabled = false; btn.textContent = 'Compare with {_THIRD_OPINION_LABEL}'; }}
   }}
 }}
 (function() {{
