@@ -1,7 +1,7 @@
 """
 claude_advisor.py
 
-A second, independent roll/hold/assignment opinion via Claude Haiku, for
+A second, independent roll/hold/assignment opinion via Claude Sonnet, for
 comparison against NotebookLM's recommendation on the analyze page — not a
 replacement. Deliberately does its own PnL/premium arithmetic for NOTHING;
 it's told to treat any numbers in the position data as authoritative, same
@@ -39,7 +39,7 @@ _WEEKLY_WINDOWS_CACHE_FILE = Path(__file__).parent / ".weekly_windows_cache.json
 # economic-events source, not two different ones that could disagree on dates.
 _FED_CALENDAR_URL = "https://www.newyorkfed.org/research/calendars/nationalecon_cal"
 
-_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+_ANTHROPIC_MODEL = "claude-sonnet-5"
 
 
 def _extract_pdf_text(path: Path) -> str:
@@ -354,6 +354,69 @@ _SYSTEM_PROMPT = (
     "clears the window, the release-timing question is closed; WAIT must "
     "rest on some OTHER factor (liquidity, spread, delta/DTE fit) if one "
     "exists, not on the release itself.\n\n"
+    "A related misreading targets windows stated with TWO boundaries "
+    "instead of one — e.g. 'Monday at the Open and Tuesday After 8:30 AM: "
+    "The Covered Call Window,' following a paragraph that already frames "
+    "the whole span as tradeable ('nothing scheduled stands between "
+    "Monday's open and Tuesday's [release]... that's the trade here'). "
+    "This names ONE continuous window running from the first boundary "
+    "through the second, not two isolated instants you must catch exactly "
+    "— every moment from Monday's open through Tuesday's post-release "
+    "time is inside it, including Monday mid-morning and Monday "
+    "afternoon, not just the literal opening bell or the literal instant "
+    "after 8:30 AM. A trader reported exactly this failure on GDX: an "
+    "analysis correctly quoted this exact two-boundary header, then "
+    "concluded Monday at 12:25 PM was 'outside' the window because it "
+    "wasn't literally 'at the open,' and recommended waiting until "
+    "Tuesday morning or after Wednesday's Fed decision — a second and "
+    "third advisor given the identical plan text both correctly read the "
+    "same header as covering the whole Monday-through-Tuesday span and "
+    "factored it in as a live, currently-open window. Read '{Day1} "
+    "at/from {time1} and {Day2} after/before {time2}: window name' the "
+    "same way as the single-boundary case above: as the window's start "
+    "and its end, not as two separate trigger points you have to land on "
+    "exactly.\n\n"
+    "A plan's day-by-day guidance is not limited to a single window for "
+    "the whole week — it routinely defines SEVERAL independent windows, "
+    "one per setup/instrument, each with its own boundary (e.g. a "
+    "Monday-Tuesday covered-call window, a separate Wednesday put window, "
+    "and a separate Thursday window tied to a different expiration cycle, "
+    "all in the same plan). Finding and evaluating the FIRST such window "
+    "header is not the end of the search: if that one has already closed, "
+    "keep reading for OTHER window headers later in the same document "
+    "before concluding no window applies — a later window does not stop "
+    "existing just because an earlier one in the week already closed. A "
+    "trader reported exactly this failure on SLV: an analysis correctly "
+    "quoted and evaluated 'Monday at the Open and Tuesday After 8:30 AM: "
+    "The Covered Call Window,' correctly concluded that window had closed "
+    "by Thursday, and stopped there — never noticing the same plan also "
+    "named 'Thursday From 9:00 AM: The October Window' further down, "
+    "which was live at the exact time being evaluated. A second and third "
+    "advisor given the identical plan text both found and applied that "
+    "later window. Treat every '{Day} at/from {time}[...]: window name' "
+    "header in the document as its own independent window to check "
+    "against today's actual date/time, not just whichever one you "
+    "encounter or rule out first.\n\n"
+    "Finding the right later window is not enough on its own, either: do "
+    "not then demote it by inventing a qualifier the plan's text never "
+    "states — e.g. deciding a later window must be 'for longer-dated "
+    "positions only' or 'not the primary entry window' and therefore "
+    "doesn't authorize what the earlier, now-closed window would have. "
+    "Unless the plan's own words actually restrict a window to a specific "
+    "use, a window that names your setup's strikes (calls, for a covered "
+    "call decision; puts, for a CSP decision) governs entries for that "
+    "setup at that time exactly as fully as any other window in the "
+    "document — it is not a lesser or secondary version of the first "
+    "window you found. A trader reported exactly this failure on COPX: an "
+    "analysis correctly quoted all three of the week's windows, including "
+    "'Thursday From 9:00 AM: The October Window' directly beneath a "
+    "discussion of that window's own call-strike candidates, then still "
+    "recommended WAIT by reasoning that this window was 'for longer-dated "
+    "positions' and that only the Monday-Tuesday window was the 'primary "
+    "covered-call entry window' — a distinction invented by the analysis, "
+    "not stated anywhere in the plan. Quoting the correct window is not "
+    "the end of this check if the conclusion then talks itself back out "
+    "of it.\n\n"
     "Important — whose positions are whose: the core strategy manuals and "
     "the weekly plan/review are training data for METHODOLOGY ONLY — how "
     "this trader thinks, what rules they apply, what a good decision looks "
@@ -737,17 +800,17 @@ def _post_to_claude(api_key: str, system_prompt: str, messages: list) -> "reques
                 },
                 json={
                     "model": _ANTHROPIC_MODEL,
-                    # Confirmed live: a real ROLL analysis got cut off
-                    # mid-sentence ("New delta: -0.") at the old 1500-token
-                    # cap — the multi-"Pass" structured reasoning this system
-                    # prompt now asks for genuinely runs long. Extra
-                    # headroom costs ~$0.0075/call at Haiku's $5/MTok output
-                    # rate, trivial next to truncating a real recommendation.
-                    "max_tokens": 3000,
+                    # Thinking tokens count against max_tokens — 3000 was
+                    # enough for Haiku's visible answer alone but would
+                    # truncate once Sonnet reasons first.
+                    "max_tokens": 16000,
+                    # Sonnet 5 rejects temperature/top_p/top_k with a 400, so
+                    # the old temperature=0 determinism knob is gone.
+                    "thinking": {"type": "adaptive"},
                     "system": system_prompt,
                     "messages": messages,
                 },
-                timeout=60,
+                timeout=180,
             )
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             last_exc = exc
@@ -890,7 +953,7 @@ def ask_unborn_followup(
 
 def query_claude_advisor(position_context: str, chain_candidates_text: str | None = None) -> dict:
     """
-    Ask Claude (Haiku) for a roll/hold/assignment recommendation on an
+    Ask Claude (Sonnet) for a roll/hold/assignment recommendation on an
     EXISTING position. Returns {"recommendation": "ROLL"|"HOLD"|"ASSIGNMENT"
     |None, "text": str, "error": str|None, "tail_text": str} — tail_text is
     the exact uncached prompt tail used, worth storing so a later
@@ -1034,6 +1097,69 @@ _UNBORN_SYSTEM_PROMPT = (
     "clears the window, the release-timing question is closed; WAIT must "
     "rest on some OTHER factor (liquidity, spread, delta/DTE fit) if one "
     "exists, not on the release itself.\n\n"
+    "A related misreading targets windows stated with TWO boundaries "
+    "instead of one — e.g. 'Monday at the Open and Tuesday After 8:30 AM: "
+    "The Covered Call Window,' following a paragraph that already frames "
+    "the whole span as tradeable ('nothing scheduled stands between "
+    "Monday's open and Tuesday's [release]... that's the trade here'). "
+    "This names ONE continuous window running from the first boundary "
+    "through the second, not two isolated instants you must catch exactly "
+    "— every moment from Monday's open through Tuesday's post-release "
+    "time is inside it, including Monday mid-morning and Monday "
+    "afternoon, not just the literal opening bell or the literal instant "
+    "after 8:30 AM. A trader reported exactly this failure on GDX: an "
+    "analysis correctly quoted this exact two-boundary header, then "
+    "concluded Monday at 12:25 PM was 'outside' the window because it "
+    "wasn't literally 'at the open,' and recommended waiting until "
+    "Tuesday morning or after Wednesday's Fed decision — a second and "
+    "third advisor given the identical plan text both correctly read the "
+    "same header as covering the whole Monday-through-Tuesday span and "
+    "factored it in as a live, currently-open window. Read '{Day1} "
+    "at/from {time1} and {Day2} after/before {time2}: window name' the "
+    "same way as the single-boundary case above: as the window's start "
+    "and its end, not as two separate trigger points you have to land on "
+    "exactly.\n\n"
+    "A plan's day-by-day guidance is not limited to a single window for "
+    "the whole week — it routinely defines SEVERAL independent windows, "
+    "one per setup/instrument, each with its own boundary (e.g. a "
+    "Monday-Tuesday covered-call window, a separate Wednesday put window, "
+    "and a separate Thursday window tied to a different expiration cycle, "
+    "all in the same plan). Finding and evaluating the FIRST such window "
+    "header is not the end of the search: if that one has already closed, "
+    "keep reading for OTHER window headers later in the same document "
+    "before concluding no window applies — a later window does not stop "
+    "existing just because an earlier one in the week already closed. A "
+    "trader reported exactly this failure on SLV: an analysis correctly "
+    "quoted and evaluated 'Monday at the Open and Tuesday After 8:30 AM: "
+    "The Covered Call Window,' correctly concluded that window had closed "
+    "by Thursday, and stopped there — never noticing the same plan also "
+    "named 'Thursday From 9:00 AM: The October Window' further down, "
+    "which was live at the exact time being evaluated. A second and third "
+    "advisor given the identical plan text both found and applied that "
+    "later window. Treat every '{Day} at/from {time}[...]: window name' "
+    "header in the document as its own independent window to check "
+    "against today's actual date/time, not just whichever one you "
+    "encounter or rule out first.\n\n"
+    "Finding the right later window is not enough on its own, either: do "
+    "not then demote it by inventing a qualifier the plan's text never "
+    "states — e.g. deciding a later window must be 'for longer-dated "
+    "positions only' or 'not the primary entry window' and therefore "
+    "doesn't authorize what the earlier, now-closed window would have. "
+    "Unless the plan's own words actually restrict a window to a specific "
+    "use, a window that names your setup's strikes (calls, for a covered "
+    "call decision; puts, for a CSP decision) governs entries for that "
+    "setup at that time exactly as fully as any other window in the "
+    "document — it is not a lesser or secondary version of the first "
+    "window you found. A trader reported exactly this failure on COPX: an "
+    "analysis correctly quoted all three of the week's windows, including "
+    "'Thursday From 9:00 AM: The October Window' directly beneath a "
+    "discussion of that window's own call-strike candidates, then still "
+    "recommended WAIT by reasoning that this window was 'for longer-dated "
+    "positions' and that only the Monday-Tuesday window was the 'primary "
+    "covered-call entry window' — a distinction invented by the analysis, "
+    "not stated anywhere in the plan. Quoting the correct window is not "
+    "the end of this check if the conclusion then talks itself back out "
+    "of it.\n\n"
     "Important — whose positions are whose: the core strategy manuals and "
     "the weekly plan/review are training data for METHODOLOGY ONLY — how "
     "this trader thinks, what rules they apply, what a good decision looks "
@@ -1139,7 +1265,7 @@ _UNBORN_SYSTEM_PROMPT = (
 
 def query_claude_unborn_advisor(context: str, chain_candidates_text: str | None = None) -> dict:
     """
-    Ask Claude (Haiku) whether to open a NEW covered-call/CSP position on a
+    Ask Claude (Sonnet) whether to open a NEW covered-call/CSP position on a
     ticker with no existing position — the 'unborn'/former-position case.
     Returns {"recommendation": "SELL"|"WAIT"|None, "text": str, "error":
     str|None, "tail_text": str} — tail_text is the exact uncached prompt
@@ -1285,8 +1411,14 @@ def _next_major_release_note() -> str:
 
 
 _WEEKLY_WINDOW_HEADER_PAT = re.compile(
-    r'(Monday|Tuesday|Wednesday|Thursday|Friday) from [^\n:]{0,40}:', re.IGNORECASE
+    r'(Monday|Tuesday|Wednesday|Thursday|Friday) (?:from|after) [^\n:]{0,40}:', re.IGNORECASE
 )
+_WEEKLY_WINDOW_TIMED_PAT = re.compile(
+    r'(Monday|Tuesday|Wednesday|Thursday|Friday) (?:from|after|at) '
+    r'(\d{1,2})(?::(\d{2}))?\s*([AP])\.?M\.?\s*:\s*([^\n]*)',
+    re.IGNORECASE,
+)
+_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 _WEEKLY_CANDIDATE_LINE_PAT = re.compile(
     r'^[A-Z]{1,6}\s*\$[\d.]+[CP]\s*\[|^(Aggressive|Balanced|Conservative)\s*[—-]'
 )
@@ -1377,6 +1509,82 @@ def _weekly_calendar_windows_note() -> str:
         return result
     except Exception:
         return ""
+
+
+def _fmt_clock(minutes: int) -> str:
+    h, m = divmod(minutes, 60)
+    return f"{(h - 1) % 12 + 1}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def _current_trading_window_line(now=None) -> str:
+    """
+    Which of this week's plan windows is open right now, computed in Python
+    from the "{Day} from/after {time}: {title}" headers instead of left for
+    the model to derive. Haiku repeatedly placed Monday 12:00 PM "outside"
+    a "Monday From 10:00 AM" window despite many prompt-level corrections;
+    the garbled PDF extraction (headers split across lines, paragraphs out
+    of order) made that derivation harder than it should be.
+
+    A window is treated as running until the next header's start (the last
+    one until Friday's close). Prose carve-outs ("avoid the hour before
+    Tuesday's 10:00 AM reports") aren't headers, so the line tells the model
+    those can still narrow it. Returns "" on weekends or when no timed
+    headers parse, leaving the verbatim excerpt as the only source.
+    """
+    import datetime
+    excerpt = _weekly_calendar_windows_note()
+    if not excerpt:
+        return ""
+    now = now or datetime.datetime.now()
+    if now.weekday() >= 5:
+        return ""
+
+    windows: dict[tuple[int, int], str] = {}
+    for m in _WEEKLY_WINDOW_TIMED_PAT.finditer(excerpt):
+        day = _WEEKDAYS.index(m.group(1).capitalize())
+        hour = int(m.group(2)) % 12 + (12 if m.group(4).upper() == "P" else 0)
+        key = (day, hour * 60 + int(m.group(3) or 0))
+        title = m.group(5).strip().rstrip(",")
+        windows.setdefault(key, title)
+    if not windows:
+        return ""
+
+    def _desc(key):
+        return f"'{_WEEKDAYS[key[0]]} {_fmt_clock(key[1])}: {windows[key]}'"
+
+    def _when(key):
+        return f"{_WEEKDAYS[key[0]]} at {_fmt_clock(key[1])}"
+
+    now_min = now.hour * 60 + now.minute
+    now_key = (now.weekday(), now_min)
+    ordered = sorted(windows)
+    opened = [k for k in ordered if k <= now_key]
+    upcoming = [k for k in ordered if k > now_key]
+    stamp = f"{_WEEKDAYS[now.weekday()]} {_fmt_clock(now_min)}"
+    market_note = "" if 9 * 60 + 30 <= now_min < 16 * 60 else (
+        " Note the market itself is closed at this hour, so any order waits for the next session."
+    )
+    prefix = (
+        "TRADING WINDOW CHECK (computed in code from this week's plan window "
+        f"headers against the current day/time — treat as settled, do not re-derive): It is {stamp}. "
+    )
+    if not opened:
+        return (
+            prefix + f"No window in this week's plan has opened yet. The first, {_desc(upcoming[0])}, "
+            f"opens {_when(upcoming[0])}." + market_note
+        )
+    current = opened[-1]
+    if upcoming:
+        tail = f" It stays open until the next window, {_desc(upcoming[0])}, opens {_when(upcoming[0])}."
+    else:
+        tail = " It is the week's last window and stays open through Friday's close."
+    return (
+        prefix + f"The window {_desc(current)} opened {_when(current)} and is OPEN NOW." + tail
+        + " The only thing that overrides this is explicit plan prose that ends this window "
+        "earlier or carves out specific hours (e.g. 'avoid the hour before Tuesday's 10:00 AM "
+        "reports'); if you rely on such a carve-out, quote it verbatim and confirm the current "
+        "time actually falls inside it." + market_note
+    )
 
 
 def _earnings_coverage_note(expiry: str | None, key_dates: dict | None) -> str:
@@ -1532,6 +1740,7 @@ def build_unborn_context(ticker: str, strat: str, ul_price: float | None,
     lines = [
         f"Today's date: {datetime.date.today().isoformat()} ({datetime.date.today().strftime('%A')})",
         f"Current time: {datetime.datetime.now().strftime('%-I:%M %p ET')}",
+        *([w] if (w := _current_trading_window_line()) else []),
         f"VIX: {_fmt(vix)}",
         f"13-week T-Bill yield (risk-free hurdle rate): {_fmt(tbill_rate)}%",
         "",
@@ -1566,6 +1775,7 @@ def build_position_context(pos: dict, vix: float | None, key_dates: dict | None 
     lines = [
         f"Today's date: {datetime.date.today().isoformat()} ({datetime.date.today().strftime('%A')})",
         f"Current time: {datetime.datetime.now().strftime('%-I:%M %p ET')}",
+        *([w] if (w := _current_trading_window_line()) else []),
         f"VIX: {_fmt(vix, 2)}",
         f"13-week T-Bill yield (risk-free hurdle rate): {_fmt(tbill_rate, 2)}%",
         "",
